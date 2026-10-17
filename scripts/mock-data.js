@@ -283,29 +283,101 @@ const DEFERRED_AFTER_GATE = [
 ];
 
 /* ---------- 会话历史 ---------- */
+/* 时间用「距今多少分钟」表达，渲染时交给 Intl.RelativeTimeFormat ——
+   不硬编码 "1 小时前" 这类文案，随语言环境自动变化。 */
 const SESSIONS = [
   {
     id: "s1", active: true, title: "SSE 断线重连实现",
-    branch: "feat/stream-reconnect", time: "刚刚", files: 3, add: 79, del: 3,
-    model: "gpt-5.4-codex", turns: 9, tokens: "38.2k",
+    branch: "feat/stream-reconnect", tsMin: 0, files: 3, add: 79, del: 3,
+    model: "gpt-5.4-codex", turns: 9, tokens: 38200,
   },
   {
     id: "s2", title: "审批策略空值兜底",
-    branch: "fix/approval-null", time: "1 小时前", files: 2, add: 11, del: 6,
-    model: "gpt-5.4-codex", turns: 5, tokens: "12.7k",
+    branch: "fix/approval-null", tsMin: 62, files: 2, add: 11, del: 6,
+    model: "gpt-5.4-codex", turns: 5, tokens: 12700,
   },
   {
     id: "s3", title: "worktree 隔离清理",
-    branch: "chore/worktree-gc", time: "昨天", files: 7, add: 63, del: 41,
-    model: "gpt-5.4-mini", turns: 14, tokens: "51.9k",
+    branch: "chore/worktree-gc", tsMin: 1440, files: 7, add: 63, del: 41,
+    model: "gpt-5.4-mini", turns: 14, tokens: 51900,
   },
   {
     id: "s4", title: "协议事件类型对齐",
-    branch: "refactor/event-kinds", time: "2 天前", files: 4, add: 38, del: 52,
-    model: "gpt-5.4-codex", turns: 11, tokens: "44.1k",
+    branch: "refactor/event-kinds", tsMin: 2880, files: 4, add: 38, del: 52,
+    model: "gpt-5.4-codex", turns: 11, tokens: 44100,
   },
 ];
 
+/* ---------- 斜杠命令（对齐 Codex 的 TUI 命令集）---------- */
+const SLASH_COMMANDS = [
+  { cmd: "/plan",        desc: "先出执行计划，不动代码" },
+  { cmd: "/resume",      desc: "续接上一次会话" },
+  { cmd: "/permissions", desc: "切换审批策略" },
+  { cmd: "/mcp",         desc: "管理 MCP 服务" },
+  { cmd: "/status",      desc: "查看 token 消耗与窗口余量" },
+  { cmd: "/goal",        desc: "进入目标自证模式（Worker + Evaluator）" },
+  { cmd: "/compact",     desc: "压缩上下文，保留结构化工作记忆" },
+];
+
+/* ---------- 终端命令的模拟输出 ---------- */
+const TERM_RESPONSES = [
+  {
+    match: /^git\s+status/,
+    lines: [
+      { t: "out", text: "On branch feat/stream-reconnect" },
+      { t: "out", text: "Your branch is ahead of 'origin/main' by 3 commits." },
+      { t: "out", text: "" },
+      { t: "out", text: "Changes not staged for commit:" },
+      { t: "out", text: "  modified:   src/transport/sse-client.ts" },
+      { t: "out", text: "  modified:   harness/approval.py" },
+      { t: "out", text: "" },
+      { t: "out", text: "Untracked files:" },
+      { t: "out-hi", text: "  src/transport/reconnect.ts" },
+      { t: "out-hi", text: "  tests/e2e_reconnect.py" },
+      { t: "dim", text: "no changes added to commit (use \"git add\")" },
+    ],
+  },
+  {
+    match: /^(npx\s+)?tsc\b|typecheck/,
+    lines: [{ t: "dim", text: "(无输出 —— 类型检查通过，0 错误)" }],
+  },
+  {
+    match: /^npm\s+(test|t)\b|^pytest/,
+    lines: [
+      { t: "pass", text: "✓ 抖动作用在延迟而非 attempt (2 ms)" },
+      { t: "pass", text: "✓ 指数上限收敛到 8s (0 ms)" },
+      { t: "pass", text: "✓ 重连期间 tool_result 保持原 seq (11 ms)" },
+      { t: "pass", text: "✓ response_complete 不触发重试 (1 ms)" },
+      { t: "dim", text: "12 passed (4.82s)" },
+    ],
+  },
+  {
+    match: /^ls\b|^dir\b/,
+    lines: [
+      { t: "out", text: "AGENTS.md        harness/     package.json   src/" },
+      { t: "out", text: ".codexignore     node_modules/ tests/        tsconfig.json" },
+    ],
+  },
+  {
+    match: /^codex\b|^crucible\b/,
+    lines: [
+      { t: "out", text: "crucible 0.1.0 · 沙箱 workspace-write · 审批 on-request" },
+      { t: "dim", text: "用法：crucible [prompt]  或  按 Ctrl+K 打开命令面板" },
+    ],
+  },
+];
+
+/* ---------- 状态栏 ---------- */
+const STATUSBAR = {
+  model: "gpt-5.4-codex",
+  tokenUsed: 38.2, tokenCap: 200,
+  sandbox: "workspace-write",
+  approval: "on-request",
+  index: "已索引",
+  diagnostics: { errors: 0, warnings: 2 },
+  encoding: "UTF-8",
+  indent: "2 spaces",
+};
 /* ---------- 计划视图 ---------- */
 const PLAN = {
   goal: "让 SSE 客户端在断线后自动重连，且重连期间不丢失事件顺序。",
@@ -317,7 +389,44 @@ const PLAN = {
   ],
 };
 
-/* ---------- 终端 ---------- */
+/* ---------- 键盘快捷键总览（? 打开；命令面板也读它）---------- */
+const SHORTCUTS = [
+  { group: "通用", items: [
+    { keys: ["Ctrl", "K"], desc: "打开命令面板" },
+    { keys: ["Ctrl", "B"], desc: "显示 / 隐藏 Agent 面板" },
+    { keys: ["Ctrl", "`"], desc: "显示 / 隐藏终端" },
+    { keys: ["Ctrl", "Shift", "E"], desc: "聚焦资源管理器" },
+    { keys: ["Ctrl", "Shift", "F"], desc: "在工作区内搜索" },
+    { keys: ["Ctrl", "S"], desc: "保存当前文件" },
+    { keys: ["?"], desc: "打开本快捷键总览" },
+  ]},
+  { group: "Agent", items: [
+    { keys: ["Enter"], desc: "发送指令" },
+    { keys: ["Shift", "Enter"], desc: "换行" },
+    { keys: ["Shift", "Tab"], desc: "切到计划模式" },
+    { keys: ["Esc"], desc: "中断当前运行 / 关闭浮层" },
+  ]},
+  { group: "编辑器与标签", items: [
+    { keys: ["Ctrl", "W"], desc: "关闭当前标签" },
+    { keys: ["Ctrl", "PageUp"], desc: "上一个标签" },
+    { keys: ["Ctrl", "PageDown"], desc: "下一个标签" },
+    { keys: ["中键"], desc: "关闭被点击的标签" },
+    { keys: ["双击"], desc: "重命名文件" },
+  ]},
+  { group: "侧栏与文件树", items: [
+    { keys: ["↑", "↓"], desc: "在文件树中移动" },
+    { keys: ["→"], desc: "展开目录" },
+    { keys: ["←"], desc: "折叠目录" },
+    { keys: ["Home", "End"], desc: "跳到首 / 末项" },
+    { keys: ["Enter"], desc: "打开选中项" },
+  ]},
+  { group: "终端", items: [
+    { keys: ["↑", "↓"], desc: "翻阅命令历史" },
+    { keys: ["Ctrl", "L"], desc: "清空屏幕" },
+  ]},
+];
+
+/* ---------- 终端初始回显 ---------- */
 const TERMINAL_LINES = [
   { t: "cmd", text: "$ git status --short" },
   { t: "out", text: " M src/transport/sse-client.ts" },
@@ -350,15 +459,3 @@ const MCP_TOOLS = [
   { name: "postgres", desc: "数据库查询", enabled: false },
   { name: "playwright", desc: "浏览器自动化", enabled: false },
 ];
-
-/* ---------- 状态栏 ---------- */
-const STATUSBAR = {
-  model: "gpt-5.4-codex",
-  tokenUsed: 38.2, tokenCap: 200,
-  sandbox: "workspace-write",
-  approval: "on-request",
-  index: "已索引",
-  diagnostics: { errors: 0, warnings: 2 },
-  encoding: "UTF-8",
-  indent: "2 spaces",
-};

@@ -1,0 +1,44 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>body{margin:0;background:#111;color:#ddd;font:12px monospace}iframe{border:0}pre{padding:10px;background:#000;color:#0f0;white-space:pre-wrap}</style>
+</head><body>
+<iframe id="f" src="/index.html" width="1500" height="950"></iframe><pre id="r">…</pre>
+<script>
+document.getElementById("f").addEventListener("load",function(){
+var w=this.contentWindow,d=this.contentDocument;
+setTimeout(function(){
+var L=[];
+L.push(".workbench 元素数 = "+d.querySelectorAll(".workbench").length);
+L.push(".terminal 元素数 = "+d.querySelectorAll(".terminal").length);
+var wb=d.querySelector(".workbench"),term=d.querySelector(".terminal");
+L.push("wb 内联 = "+JSON.stringify(wb.getAttribute("style")));
+L.push("term 内联 = "+JSON.stringify(term.getAttribute("style")));
+L.push("term.matches(collapsed .terminal) = "+term.matches(".workbench.is-term-collapsed .terminal"));
+wb.classList.add("is-term-collapsed");
+void wb.offsetHeight;
+L.push("加类后 term.matches = "+term.matches(".workbench.is-term-collapsed .terminal"));
+L.push("加类后 term vis = "+w.getComputedStyle(term).visibility);
+L.push("加类后 wb rows = "+w.getComputedStyle(wb).gridTemplateRows);
+// 查 rules 里是否还有别的地方设置 terminal 的 visibility 或 workbench 的 rows
+L.push("");
+L.push("--- 全表搜索 terminal 的 visibility / workbench 的 rows ---");
+for(var i=0;i<d.styleSheets.length;i++){
+  var rules; try{rules=d.styleSheets[i].cssRules;}catch(e){continue;}
+  for(var j=0;j<rules.length;j++){
+    var r=rules[j];
+    var list=[[r.selectorText,r.style]];
+    if(r.media&&r.cssRules){for(var k=0;k<r.cssRules.length;k++)list.push([r.cssRules[k].selectorText,r.cssRules[k].style]);}
+    list.forEach(function(p){
+      if(!p[0])return;
+      if(/visibility/.test(p[1].cssText) && /terminal/.test(p[0]))
+        L.push("  [vis] "+p[0]+" => "+p[1].cssText);
+      if(/grid-template-rows/.test(p[1].cssText) && /workbench/.test(p[0]))
+        L.push("  [rows] "+p[0]+" => "+p[1].cssText);
+    });
+  }
+}
+// 打印 workbench 的完整计算值，看是哪条赢
+L.push("");
+L.push("wb 全部相关计算值：display="+w.getComputedStyle(wb).display+" rows="+w.getComputedStyle(wb).gridTemplateRows);
+document.getElementById("r").textContent=L.join("\n");
+},1200);});
+</script></body></html>

@@ -1,0 +1,29 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>body{margin:0;background:#111;color:#ddd;font:12px monospace}iframe{border:0}pre{padding:10px;background:#000;color:#0f0;white-space:pre-wrap}</style>
+</head><body>
+<iframe id="f" src="/index.html" width="1500" height="950"></iframe><pre id="r">…</pre>
+<script>
+document.getElementById("f").addEventListener("load",function(){
+var w=this.contentWindow,d=this.contentDocument;
+setTimeout(function(){
+var L=[];
+var wb=d.querySelector(".workbench"),term=d.querySelector(".terminal");
+function snap(tag){
+  void wb.offsetHeight;
+  L.push(tag+": class="+wb.className+" rows="+w.getComputedStyle(wb).gridTemplateRows+" termH="+Math.round(term.getBoundingClientRect().height)+" vis="+w.getComputedStyle(term).visibility);
+}
+snap("初始");
+wb.classList.add("is-term-collapsed");
+snap("加类后");
+L.push("matches="+wb.matches(".workbench.is-term-collapsed"));
+wb.classList.remove("is-term-collapsed");
+snap("移除后");
+// 走真实按钮
+d.querySelector("#btn-term-toggle").click();
+snap("点按钮后");
+L.push("btn aria-expanded="+d.querySelector("#btn-term-toggle").getAttribute("aria-expanded"));
+d.querySelector("#btn-term-toggle").click();
+snap("再点后");
+document.getElementById("r").textContent=L.join("\n");
+},1200);});
+</script></body></html>

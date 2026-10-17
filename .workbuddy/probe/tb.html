@@ -1,0 +1,16 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>tb</title>
+<style>body{margin:0;background:#111;color:#ddd;font:12px monospace}iframe{border:0}pre{padding:10px;background:#000;color:#0f0;white-space:pre-wrap}</style></head>
+<body><iframe id="f" src="/index.html" width="1500" height="950"></iframe><pre id="r">…</pre>
+<script>
+document.getElementById("f").addEventListener("load",function(){
+var w=this.contentWindow,d=this.contentDocument;
+setTimeout(function(){
+var L=[];var wb=d.querySelector(".workbench"),term=d.querySelector(".terminal");
+L.push("before h="+Math.round(term.getBoundingClientRect().height)+" vis="+w.getComputedStyle(term).visibility);
+wb.classList.add("is-term-collapsed");
+void term.offsetHeight;
+L.push("after  h="+Math.round(term.getBoundingClientRect().height)+" vis="+w.getComputedStyle(term).visibility);
+L.push("rows="+w.getComputedStyle(wb).gridTemplateRows);
+document.getElementById("r").textContent=L.join("\n");
+},1000);});
+</script></body></html>

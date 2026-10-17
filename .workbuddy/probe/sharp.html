@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>sharp</title>
+<style>body{margin:0;background:#111;color:#ddd;font:12px monospace}iframe{border:0}pre{padding:10px;background:#000;color:#0f0;white-space:pre-wrap}</style></head>
+<body>
+<iframe id="f" src="/index.html" width="1500" height="950"></iframe>
+<pre id="r">…</pre>
+<script>
+document.getElementById("f").addEventListener("load", function () {
+  var w = this.contentWindow, d = this.contentDocument;
+  setTimeout(function () {
+    var L = [];
+    var wb = d.querySelector(".workbench");
+    var term = d.querySelector(".terminal");
+    L.push("workbench 内联 style 属性 = " + JSON.stringify(wb.getAttribute("style")));
+    L.push("localStorage = " + (w.localStorage.getItem("crucible.ui.v1") || "空"));
+    L.push("html 内联 style = " + JSON.stringify(d.documentElement.getAttribute("style")));
+    L.push("--terminal-h = " + w.getComputedStyle(d.documentElement).getPropertyValue("--terminal-h"));
+    L.push("");
+    L.push("折叠前 rows = " + w.getComputedStyle(wb).gridTemplateRows);
+    L.push("折叠前 term h = " + Math.round(term.getBoundingClientRect().height));
+
+    wb.classList.add("is-term-collapsed");
+    L.push("加类后 rows = " + w.getComputedStyle(wb).gridTemplateRows);
+    L.push("加类后 term h = " + Math.round(term.getBoundingClientRect().height));
+    L.push("加类后 term vis = " + w.getComputedStyle(term).visibility);
+
+    // 手动加内联样式，看是否能生效（验证假设）
+    term.style.height = "0px";
+    L.push("手动 term.style.height=0 后 h = " + Math.round(term.getBoundingClientRect().height));
+    term.style.height = "";
+
+    // 干脆把 workbench 的 grid 也内联一次，看折叠规则能否赢
+    wb.style.gridTemplateRows = "minmax(0,1fr) auto 0";
+    L.push("手动内联 grid 后 rows = " + w.getComputedStyle(wb).gridTemplateRows +
+      " term h = " + Math.round(term.getBoundingClientRect().height));
+    wb.style.gridTemplateRows = "";
+
+    // 逐个列出匹配该元素的规则，按顺序打印
+    L.push("");
+    L.push("--- 匹配 .workbench 的规则（源码顺序）---");
+    try {
+      for (var i = 0; i < d.styleSheets.length; i++) {
+        var sh = d.styleSheets[i];
+        var rules;
+        try { rules = sh.cssRules; } catch (e) { L.push("sheet " + i + " 不可读"); continue; }
+        for (var j = 0; j < rules.length; j++) {
+          var r = rules[j];
+          if (r.selectorText && r.selectorText.indexOf("workbench") > -1) {
+            L.push("sheet" + i + " #" + j + "  " + r.selectorText + "  =>  " + r.style.cssText);
+          }
+          if (r.media && r.cssRules) {
+            for (var k = 0; k < r.cssRules.length; k++) {
+              var rr = r.cssRules[k];
+              if (rr.selectorText && rr.selectorText.indexOf("workbench") > -1) {
+                L.push("[media " + r.media.mediaText + "] " + rr.selectorText + " => " + rr.style.cssText);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) { L.push("列举规则失败: " + e.message); }
+
+    document.getElementById("r").textContent = L.join("\n");
+  }, 1200);
+});
+</script>
+</body></html>

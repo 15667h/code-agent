@@ -1,0 +1,173 @@
+/* ============================================================
+   Crucible — 设计令牌
+   工业仪表盘 / industrial control console
+   品牌色：黄铜 (brass) —— 刻意避开 AI 紫、酸性绿、VS Code 蓝
+   ============================================================ */
+
+:root {
+  /* ---- 色：底色（带冷蓝的炭黑，非纯黑）---- */
+  --bg:              #10141a;
+  --bg-inset:        #0c1015;
+  --surface:         #161b22;
+  --surface-raised:  #1c222b;
+  --surface-hover:   #212832;
+  --surface-active:  #262e39;
+
+  /* ---- 色：描边 ---- */
+  --border:          #28303b;
+  --border-strong:   #37414f;
+  --border-focus:    var(--brass);
+
+  /* ---- 色：文字 ---- */
+  --text:            #d6dce5;
+  --text-muted:      #8b95a5;
+  --text-faint:      #5e6776;
+  --text-inverse:    #10141a;
+
+  /* ---- 色：品牌 · 黄铜 ---- */
+  --brass:           #c09440;
+  --brass-bright:    #d9ab55;
+  --brass-dim:       #7a5f2a;
+  --brass-a12:       rgba(192, 148, 64, 0.12);
+  --brass-a20:       rgba(192, 148, 64, 0.20);
+  --brass-a40:       rgba(192, 148, 64, 0.40);
+
+  /* ---- 色：语义（刻意与品牌色分离）---- */
+  --jade:            #3e9e76;
+  --jade-a14:        rgba(62, 158, 118, 0.14);
+  --amber:           #e2a33c;
+  --amber-a14:       rgba(226, 163, 60, 0.14);
+  --vermilion:       #ce4e45;
+  --vermilion-a14:   rgba(206, 78, 69, 0.14);
+  --slate-blue:      #5a87b8;
+  --slate-blue-a14:  rgba(90, 135, 184, 0.14);
+
+  /* ---- 色：语法高亮（低调，服务于长时间阅读）---- */
+  --syn-keyword:     #c58fd4;
+  --syn-type:        #6fb3d2;
+  --syn-string:      #9ec97d;
+  --syn-number:      #d99a6c;
+  --syn-comment:     #5e6776;
+  --syn-func:        #d9ab55;
+  --syn-punct:       #8b95a5;
+
+  /* ---- 色：diff ---- */
+  --diff-add-bg:     rgba(62, 158, 118, 0.13);
+  --diff-add-bg-hi:  rgba(62, 158, 118, 0.26);
+  --diff-add-text:   #7fc9a5;
+  --diff-del-bg:     rgba(206, 78, 69, 0.12);
+  --diff-del-bg-hi:  rgba(206, 78, 69, 0.24);
+  --diff-del-text:   #e0857d;
+
+  /* ---- 字体 ---- */
+  --font-ui:   "IBM Plex Sans", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "Noto Sans Mono", ui-monospace, "Cascadia Code", monospace;
+
+  /* 型阶：1.200 Minor Third（与令牌同步，勿随手改） */
+  --fs-2xs: 11px;
+  --fs-xs:  12px;
+  --fs-sm:  13px;
+  --fs-md:  15px;
+  --fs-lg:  19px;
+  --fs-xl:  23px;
+  --fs-2xl: 28px;
+
+  --lh-tight: 1.25;
+  --lh-ui:    1.45;
+  --lh-code:  1.55;
+
+  /* ---- 空间：基数 4 ---- */
+  --sp-1:  4px;
+  --sp-2:  6px;
+  --sp-3:  8px;
+  --sp-4:  12px;
+  --sp-5:  16px;
+  --sp-6:  20px;
+  --sp-7:  24px;
+  --sp-8:  32px;
+
+  /* ---- 圆角：同心体系 outer = inner + padding ---- */
+  --r-sm:  4px;
+  --r-md:  6px;
+  --r-lg:  10px;
+  --r-pill: 999px;
+
+  /* ---- 分层阴影（非单层 rgba(0,0,0,.1)）---- */
+  --sh-1: 0 1px 2px rgba(0, 0, 0, 0.30);
+  --sh-2: 0 2px 6px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.24);
+  --sh-3: 0 8px 24px rgba(0, 0, 0, 0.42), 0 2px 6px rgba(0, 0, 0, 0.30);
+  --sh-inset: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+
+  /* ---- 动效：指数缓动，禁用弹跳 ---- */
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-out-expo:  cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast:  140ms;
+  --dur-base:  200ms;
+  --dur-slow:  320ms;
+
+  /* ---- 布局尺寸 ---- */
+  --actbar-w:   44px;
+  --rail-w:     248px;
+  --agent-w:    400px;
+  --statusbar-h: 26px;
+  --tabbar-h:   36px;
+  --terminal-h: 208px;
+
+  /* ---- 焦点环 ---- */
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--brass-a40);
+}
+
+/* 尊重系统偏好与明确标注的浅色模式 */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+  }
+}
+
+html {
+  color-scheme: dark;
+}
+
+/* 只在用户确有需求时启用浅色（演示态默认深色） */
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg:              #f2f0eb;
+  --bg-inset:        #e8e5df;
+  --surface:         #faf9f6;
+  --surface-raised:  #ffffff;
+  --surface-hover:   #f0ede7;
+  --surface-active:  #e6e2da;
+  --border:          #d9d5cb;
+  --border-strong:   #c2bdb0;
+  --text:            #1c1f24;
+  --text-muted:      #5c626c;
+  --text-faint:      #8b9099;
+  --text-inverse:    #faf9f6;
+  --brass:           #8a6a1f;
+  --brass-bright:    #a07c26;
+  --brass-dim:       #b8a06a;
+  --brass-a12:       rgba(138, 106, 31, 0.10);
+  --brass-a20:       rgba(138, 106, 31, 0.18);
+  --brass-a40:       rgba(138, 106, 31, 0.34);
+  --jade:            #22795a;
+  --amber:           #a8761a;
+  --vermilion:       #b23a31;
+  --slate-blue:      #3a6b9c;
+  --sh-1: 0 1px 2px rgba(28, 31, 36, 0.08);
+  --sh-2: 0 2px 6px rgba(28, 31, 36, 0.10), 0 1px 2px rgba(28, 31, 36, 0.06);
+  --sh-3: 0 8px 24px rgba(28, 31, 36, 0.14), 0 2px 6px rgba(28, 31, 36, 0.08);
+  --sh-inset: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  --syn-keyword: #8b3fa8;
+  --syn-type:    #1d6f96;
+  --syn-string:  #3d7a2c;
+  --syn-number:  #a85a2a;
+  --syn-comment: #8b9099;
+  --syn-func:    #8a6a1f;
+  --syn-punct:   #5c626c;
+  --diff-add-bg:    rgba(34, 121, 90, 0.11);
+  --diff-add-bg-hi: rgba(34, 121, 90, 0.22);
+  --diff-add-text:  #22795a;
+  --diff-del-bg:    rgba(178, 58, 49, 0.10);
+  --diff-del-bg-hi: rgba(178, 58, 49, 0.20);
+  --diff-del-text:  #b23a31;
+}

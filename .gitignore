@@ -43,3 +43,9 @@ temp/
 # ---- 本机工作区私有数据（保留 .workbuddy 目录本身，忽略其运行产物）----
 .workbuddy/memory/
 .workbuddy/cache/
+# 验证探针与截图属于临时产物，不入库（不复用、不需评审）
+.workbuddy/probe/
+.workbuddy/shots/
+.workbuddy/backups/
+.workbuddy/tools/
+.workbuddy/video-tools/

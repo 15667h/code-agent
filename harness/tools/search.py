@@ -21,6 +21,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from ..errors import tool_error
 from ..policy import Action, ActionKind
 from ..protocol import ToolResult
 from .fs import DEFAULT_IGNORE_DIRS, resolve_within, to_rel
@@ -33,7 +34,7 @@ MAX_FILE_BYTES = 4 * 1024 * 1024     # 跳过超大文件，避免拖垮搜索
 def grep(workspace: str, args: Dict[str, Any]) -> ToolResult:
     pattern = args.get("pattern", "")
     if not pattern:
-        return ToolResult.error("pattern 不能为空。", retryable=False, kind="bad_args")
+        return tool_error("grep", "bad_args", "pattern 参数为空。")
 
     flags = 0
     if args.get("case_insensitive"):
@@ -44,15 +45,13 @@ def grep(workspace: str, args: Dict[str, Any]) -> ToolResult:
         rx = re.compile(pattern, flags)
     except re.error as e:
         # 书 §5：错误变成模型的输入，且要**附上输入约束提示**
-        return ToolResult.error(
-            f"正则表达式无法编译：{e}。请检查语法（例如括号/方括号是否配对）。",
-            retryable=False, kind="bad_regex",
-        )
+        return tool_error("grep", "bad_regex",
+                          f"正则表达式无法编译：{e}")
 
     try:
         root = resolve_within(workspace, args.get("path") or ".")
     except ValueError as e:
-        return ToolResult.error(str(e), retryable=False, kind="bad_path")
+        return tool_error("grep", "bad_path", str(e))
 
     glob_pat = args.get("glob") or ""          # 只搜匹配的文件
     ctx_before = int(args.get("before") or 0)
@@ -155,9 +154,18 @@ def register_search_tools(reg: ToolRegistry, workspace: str) -> None:
             "用正则表达式搜索工作区内文件的**内容**，返回 `文件路径` 与 `行号: 内容`。\n"
             "什么时候用：要找某个函数名、变量名、错误消息、字符串字面量在哪出现时。"
             "支持完整 Python 正则语法。\n"
-            "边界：**只搜索文本内容，不匹配文件名**（找文件名请用 glob）；"
+            "边界：**只搜索文本内容，不匹配文件名**；"
             "自动跳过 .git/node_modules 等目录与二进制/超大文件；"
-            "一次最多返回 500 处命中，可用 glob 参数限定只搜某类文件。"
+            "一次最多返回 500 处命中，可用 glob 参数限定只搜某类文件。\n"
+            "**不要用它来做这些**：\n"
+            "· 想按**文件名**找文件 → 用 glob。grep 会逐个打开并扫描文件内容，慢得多，"
+            "而且它从来不匹配文件名\n"
+            "· 只想看某个已知文件的内容 → 用 read_file。grep 只给匹配行，"
+            "没有行号上下文之外的完整内容\n"
+            "· pattern 里想用通配符 `*` → grep 用的是 **Python 正则**，"
+            "`*` 是「前一个字符重复」而不是「任意字符」；要跨任意字符用 `.*`，"
+            "只做字面量匹配就把特殊字符转义\n"
+            "· 目标文件很大（>4MB）→ grep 会跳过它，改用 read_file 分段读"
         ),
         properties={
             "pattern": {"type": "string", "description": "正则表达式，例如 `def handle_.*|class \\w+Handler`"},

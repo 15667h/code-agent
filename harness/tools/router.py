@@ -18,6 +18,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
+from ..errors import tool_error
 from ..policy import Action, Decision, Policy, PolicyResult
 from ..protocol import (
     EventBus, EventType, ERR_TOOL, ToolCall, ToolResult, truncate_output,
@@ -95,11 +96,10 @@ class ToolRouter:
         if tool is None:
             # 书 §5：工具层错误**不终止会话，把错误变成模型的输入**。
             # 幻觉调用会收到「工具不存在」的结构化错误结果，由模型下一轮自行纠正。
-            res = ToolResult.error(
-                f"工具 `{call.name}` 不存在。可用工具：{', '.join(self.registry.names())}。"
-                "请改用列表中的工具，或先说明你需要什么能力。",
-                layer=ERR_TOOL, retryable=False, kind="unknown_tool",
-            )
+            res = tool_error(
+                call.name, "unknown_tool",
+                f"工具 `{call.name}` 不存在。可用工具："
+                f"{', '.join(self.registry.names())}。")
             self.bus.emit(EventType.TOOL_OUTPUT, call_id=call_id, tool=call.name,
                           ok=False, text=res.text, error_layer=ERR_TOOL)
             return res
@@ -108,10 +108,7 @@ class ToolRouter:
         try:
             action = tool.describe_action(call.args)
         except Exception as e:
-            res = ToolResult.error(
-                f"参数无法解析：{e}。请检查参数名与类型是否正确。",
-                layer=ERR_TOOL, retryable=False, kind="bad_args",
-            )
+            res = tool_error(call.name, "bad_args", f"参数无法解析：{e}")
             self.bus.emit(EventType.TOOL_OUTPUT, call_id=call_id, tool=call.name,
                           ok=False, text=res.text, error_layer=ERR_TOOL)
             return res
@@ -130,11 +127,9 @@ class ToolRouter:
 
         if verdict.decision is Decision.REFUSE:
             # 拒绝也作为**结构化工具结果**喂回模型（书 §5：错误变成模型的输入）
-            res = ToolResult.error(
-                f"操作被策略拒绝：{verdict.reason}",
-                layer=ERR_TOOL, retryable=False,
-                kind="refused", escalated_by=verdict.escalated_by,
-            )
+            res = tool_error(call.name, "refused",
+                             f"操作被策略拒绝：{verdict.reason}",
+                             escalated_by=verdict.escalated_by)
             self.bus.emit(EventType.TOOL_OUTPUT, call_id=call_id, tool=call.name,
                           ok=False, text=res.text, error_layer=ERR_TOOL)
             return res
@@ -142,10 +137,9 @@ class ToolRouter:
         if verdict.decision is Decision.ASK:
             ok = self._request_approval(call_id, tool, action, verdict)
             if not ok:
-                res = ToolResult.error(
-                    f"用户拒绝了这次执行（{verdict.reason}）。工作区未做任何改动。",
-                    layer=ERR_TOOL, retryable=False, kind="approval_rejected",
-                )
+                res = tool_error(
+                    call.name, "approval_rejected",
+                    f"用户拒绝了这次执行（{verdict.reason}）。工作区未做任何改动。")
                 self.bus.emit(EventType.TOOL_OUTPUT, call_id=call_id, tool=call.name,
                               ok=False, text=res.text, error_layer=ERR_TOOL)
                 return res
@@ -155,8 +149,8 @@ class ToolRouter:
         try:
             res = tool.handler(call.args)
         except Exception as e:
-            res = ToolResult.error(f"工具执行抛异常：{type(e).__name__}: {e}",
-                                   layer=ERR_TOOL, retryable=False, kind="exception")
+            res = tool_error(call.name, "exception",
+                             f"工具执行抛异常：{type(e).__name__}: {e}")
         dur = round(time.time() - t0, 3)
 
         # ── 5. 输出截断 + 落盘 ──

@@ -21,6 +21,7 @@ import posixpath
 import re
 from typing import Any, Dict, List, Optional
 
+from ..errors import tool_error
 from ..policy import Action, ActionKind
 from ..protocol import ToolResult, truncate_output
 from .registry import Tool, ToolRegistry
@@ -67,24 +68,18 @@ def read_file(workspace: str, args: Dict[str, Any]) -> ToolResult:
     try:
         full = resolve_within(workspace, rel)
     except ValueError as e:
-        return ToolResult.error(str(e), retryable=False, kind="bad_path")
+        return tool_error("read_file", "bad_path", str(e))
 
     if not os.path.exists(full):
-        return ToolResult.error(
-            f"文件不存在：{rel}。可以用 list_dir 查看目录内容，或用 glob 按名字查找。",
-            retryable=False, kind="not_found",
-        )
+        return tool_error("read_file", "not_found", f"文件不存在：{rel}")
     if os.path.isdir(full):
-        return ToolResult.error(
-            f"{rel} 是一个目录，不能直接读取。请用 list_dir 列出内容。",
-            retryable=False, kind="is_dir",
-        )
+        return tool_error("read_file", "is_dir", f"{rel} 是一个目录，不是文件。")
 
     try:
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             lines = f.read().splitlines()
     except OSError as e:
-        return ToolResult.error(f"读取失败：{e}", retryable=False, kind="io")
+        return tool_error("read_file", "io", f"打开 {rel} 失败：{e}")
 
     start = int(args.get("start_line") or 1)
     end = args.get("end_line")
@@ -93,8 +88,8 @@ def read_file(workspace: str, args: Dict[str, Any]) -> ToolResult:
     end = min(end, len(lines))
 
     if start > len(lines):
-        return ToolResult.error(
-            f"起始行 {start} 超出文件范围（共 {len(lines)} 行）。", retryable=False, kind="bad_range")
+        return tool_error("read_file", "bad_range",
+                          f"起始行 {start} 超出文件范围（该文件共 {len(lines)} 行）。")
 
     sel = lines[start - 1: end]
     # 行号宽度按最大行号对齐，模型看着更整齐、也更容易精确引用
@@ -123,16 +118,16 @@ def list_dir(workspace: str, args: Dict[str, Any]) -> ToolResult:
     try:
         full = resolve_within(workspace, rel)
     except ValueError as e:
-        return ToolResult.error(str(e), retryable=False, kind="bad_path")
+        return tool_error("list_dir", "bad_path", str(e))
 
     if not os.path.isdir(full):
-        return ToolResult.error(f"不是目录：{rel}", retryable=False, kind="not_dir")
+        return tool_error("list_dir", "not_dir", f"{rel} 不是目录。")
 
     show_hidden = bool(args.get("show_hidden", False))
     try:
         entries = sorted(os.scandir(full), key=lambda e: (not e.is_dir(), e.name.lower()))
     except OSError as e:
-        return ToolResult.error(f"无法列出目录：{e}", retryable=False, kind="io")
+        return tool_error("list_dir", "io", f"无法列出目录 {rel}：{e}")
 
     lines = []
     n_dir = n_file = 0
@@ -178,13 +173,12 @@ def glob_files(workspace: str, args: Dict[str, Any]) -> ToolResult:
     """
     pattern = args.get("pattern", "").strip()
     if not pattern:
-        return ToolResult.error("pattern 不能为空，例如 `**/*.py`。",
-                                retryable=False, kind="bad_args")
+        return tool_error("glob", "bad_glob", "pattern 参数为空。")
 
     try:
         root = resolve_within(workspace, args.get("path") or ".")
     except ValueError as e:
-        return ToolResult.error(str(e), retryable=False, kind="bad_path")
+        return tool_error("glob", "bad_path", str(e))
 
     limit = int(args.get("limit") or 200)
     pat = pattern.replace("\\", "/")
@@ -252,8 +246,14 @@ def register_fs_tools(reg: ToolRegistry, workspace: str) -> None:
             "（形如 `  42| code`），可直接用于引用与补丁定位。\n"
             "什么时候用：需要查看已知路径的文件内容时。\n"
             "边界：只读文件内容，不改动任何东西；只接受工作区内的**相对路径**，"
-            "不接受绝对路径；一次最多返回 2000 行，大文件请用 start_line/end_line 分段读。"
-            "如果只是想确认某路径下有什么，用 list_dir；想按名字找文件，用 glob。"
+            "不接受绝对路径；一次最多返回 2000 行，大文件请用 start_line/end_line 分段读。\n"
+            "**不要用它来做这些**：\n"
+            "· 想确认某个路径下有哪些文件 → 用 list_dir（read_file 只能读文件，传目录会报错）\n"
+            "· 知道文件名特征但不知道在哪 → 用 glob（比逐个目录试快得多）\n"
+            "· 想找某个函数/字符串出现在哪些文件 → 用 grep（read_file 只读一个文件，"
+            "要开几十个文件才能达到同样效果）\n"
+            "· 想确认文件是否存在 → 直接 read_file 会报「文件不存在」并给你下一步，"
+            "或用 glob 按名字查"
         ),
         properties={
             "path": {"type": "string", "description": "相对于工作区的路径，例如 `src/main.py`"},
@@ -278,7 +278,12 @@ def register_fs_tools(reg: ToolRegistry, workspace: str) -> None:
             "什么时候用：探索项目结构、确认某个目录下有什么文件时，"
             "这是了解陌生代码库的第一步。\n"
             "边界：只列当前层，**不递归**；默认隐藏点开头的文件"
-            "（需要时给 show_hidden=true）；不读取文件内容。"
+            "（需要时给 show_hidden=true）；不读取文件内容。\n"
+            "**不要用它来做这些**：\n"
+            "· 想看文件里写了什么 → 用 read_file（list_dir 只给名字和大小）\n"
+            "· 想找深层嵌套的文件 → 用 glob `**/*.py`（list_dir 只列一层，"
+            "逐层手工展开很慢且容易漏）\n"
+            "· 想按内容找东西 → 用 grep"
         ),
         properties={
             "path": {"type": "string", "description": "相对路径，省略或 `.` 表示工作区根目录"},
@@ -298,8 +303,14 @@ def register_fs_tools(reg: ToolRegistry, workspace: str) -> None:
             "`src/**/test_*.py`。\n"
             "什么时候用：知道文件名特征（后缀、前缀、命名约定）但不知道具体位置时。"
             "比内容搜索快得多，因为它不打开文件。\n"
-            "边界：**只匹配文件名与路径，完全不搜索文件内容** —— "
-            "想按内容找代码请用 grep。自动跳过 .git/node_modules 等目录。"
+            "边界：**只匹配文件名与路径，完全不搜索文件内容** —— 自动跳过 .git/node_modules 等目录。\n"
+            "**不要用它来做这些**：\n"
+            "· 想按内容找代码（函数名、字符串、报错信息）→ 用 grep —— "
+            "glob 只匹配文件名，`*.ts` 里的内容它一点也看不见\n"
+            "· 想看某个已知路径的内容 → 用 read_file（glob 只给路径，不给内容）\n"
+            "· 想确认某个具体路径存不存在 → 直接 read_file，它会告诉你\n"
+            "· 模式写成了正则（如 `.*\\.py`）→ glob 用的是 shell 通配符，"
+            "没有 `.*` 语义；跨目录用 `**`，例如 `**/*.py`"
         ),
         properties={
             "pattern": {"type": "string", "description": "glob 模式，例如 `**/*.py` 或 `src/**/*.ts`"},

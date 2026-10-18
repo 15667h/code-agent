@@ -37,6 +37,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from ..errors import tool_error
 from ..policy import Action, ActionKind, infer_network_needed, infer_side_effect
 from ..protocol import ERR_TOOL, ToolResult
 from .registry import Tool, ToolRegistry
@@ -313,10 +314,10 @@ class PersistentShell:
                 self._proc.stdin.flush()
             except (OSError, ValueError) as e:
                 self.kill()
-                return ToolResult.error(
-                    f"终端会话已失效，无法写入命令：{e}。会话已重置，请重试。",
-                    layer=ERR_TOOL, retryable=True, kind="shell_dead",
-                )
+                return tool_error(
+                    "shell", "shell_dead",
+                    f"终端会话已失效，无法写入命令：{e}。会话已重置。",
+                    retryable=True)
 
             out: List[str] = []
             rc: Optional[int] = None
@@ -357,12 +358,9 @@ class PersistentShell:
 
             if timed_out:
                 self.kill()
-                return ToolResult.error(
-                    f"命令超过 {timeout_ms} ms 未结束，已被终止。\n"
-                    "如果这是长时任务，请拆成更小的步骤；如果命令在等待输入，"
-                    "请改用非交互形式（加 -y / --yes / </dev/null 等）。",
-                    layer=ERR_TOOL, retryable=False, kind="timeout",
-                )
+                return tool_error(
+                    "shell", "timeout",
+                    f"命令超过 {timeout_ms} ms 未结束，已被终止。")
 
             text = "\n".join(out)
             if rc is None:
@@ -479,12 +477,10 @@ class ShellTool:
     def __call__(self, args: Dict[str, Any]) -> ToolResult:
         cmd = args.get("command", "")
         if not isinstance(cmd, str) or not cmd.strip():
-            return ToolResult.error("command 不能为空。", retryable=False, kind="bad_args")
+            return tool_error("shell", "bad_args", "command 参数为空。")
         if len(cmd) > MAX_COMMAND_LEN:
-            return ToolResult.error(
-                f"命令过长（{len(cmd)} 字符，上限 {MAX_COMMAND_LEN}）。请拆成多条命令。",
-                retryable=False, kind="too_long",
-            )
+            return tool_error("shell", "too_long",
+                              f"命令过长（{len(cmd)} 字符，上限 {MAX_COMMAND_LEN}）。")
         t = int(args.get("timeout_ms") or DEFAULT_TIMEOUT_MS)
         t = max(1000, min(t, MAX_TIMEOUT_MS))
         return self.shell.run(cmd, timeout_ms=t)

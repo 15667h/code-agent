@@ -43,6 +43,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..errors import tool_error
 from ..policy import Action, ActionKind
 from ..protocol import ToolResult
 from .fs import resolve_within, to_rel
@@ -275,13 +276,13 @@ def _find_anchor(haystack: List[str], anchor: str, from_index: int) -> Optional[
 def apply_patch(workspace: str, args: Dict[str, Any], dry_run: bool = False) -> ToolResult:
     text = args.get("patch", "")
     if not text.strip():
-        return ToolResult.error("patch 不能为空。", retryable=False, kind="bad_args")
+        return tool_error("apply_patch", "bad_args", "patch 参数为空。")
 
     try:
         ops = parse_patch(text)
     except PatchParseError as e:
         # 解析错误明确回传，模型可自行修正
-        return ToolResult.error(f"补丁格式有误：{e}", retryable=False, kind="parse_error")
+        return tool_error("apply_patch", "parse_error", f"补丁格式有误：{e}")
 
     # ── 先全部校验，再统一落盘（原子性：一个补丁要么全成，要么全不成）──
     planned: List[Tuple[str, str, List[str]]] = []     # (rel, full, 新内容)
@@ -292,15 +293,12 @@ def apply_patch(workspace: str, args: Dict[str, Any], dry_run: bool = False) -> 
         try:
             full = resolve_within(workspace, op.path)
         except ValueError as e:
-            return ToolResult.error(f"`{op.path}`：{e}", retryable=False, kind="bad_path")
+            return tool_error("apply_patch", "bad_path", f"路径 `{op.path}` 不可用：{e}")
         rel = to_rel(workspace, full)
 
         if op.kind == "add":
             if os.path.exists(full):
-                return ToolResult.error(
-                    f"`{rel}` 已存在，Add File 只用于新建文件。若想修改它，请改用 Update File。",
-                    retryable=False, kind="exists",
-                )
+                return tool_error("apply_patch", "exists", f"`{rel}` 已存在。")
             planned.append((rel, full, list(op.lines)))
             changed.append(rel)
             diffs.append(f"[新增] {rel}  (+{len(op.lines)})")
@@ -308,8 +306,8 @@ def apply_patch(workspace: str, args: Dict[str, Any], dry_run: bool = False) -> 
 
         if op.kind == "delete":
             if not os.path.exists(full):
-                return ToolResult.error(f"`{rel}` 不存在，无法删除。",
-                                        retryable=False, kind="not_found")
+                return tool_error("apply_patch", "not_found",
+                                  f"要删除的 `{rel}` 不存在。")
             planned.append((rel, full, None))
             changed.append(rel)
             diffs.append(f"[删除] {rel}")
@@ -317,28 +315,26 @@ def apply_patch(workspace: str, args: Dict[str, Any], dry_run: bool = False) -> 
 
         # update
         if not os.path.exists(full):
-            return ToolResult.error(
-                f"`{rel}` 不存在，无法修改。若想新建文件，请改用 Add File。",
-                retryable=False, kind="not_found",
-            )
+            return tool_error("apply_patch", "not_found",
+                              f"要修改的 `{rel}` 不存在。")
         try:
             with open(full, "r", encoding="utf-8") as f:
                 lines = f.read().split("\n")
         except OSError as e:
-            return ToolResult.error(f"读取 `{rel}` 失败：{e}", retryable=False, kind="io")
+            return tool_error("apply_patch", "io", f"读取 `{rel}` 失败：{e}")
 
         cursor = 0
         for hi, hk in enumerate(op.hunks, start=1):
             if not hk.old and not hk.new:
-                return ToolResult.error(
-                    f"`{rel}` 的第 {hi} 个修改块是空的。", retryable=False, kind="empty_hunk")
+                return tool_error("apply_patch", "empty_hunk",
+                                  f"`{rel}` 的第 {hi} 个修改块是空的。")
 
             idx, why = _locate(lines, hk.old, hk.anchor, cursor)
             if idx is None:
-                return ToolResult.error(
+                return tool_error(
+                    "apply_patch", "no_unique_match",
                     f"`{rel}` 第 {hi} 个修改块无法应用：{why}",
-                    retryable=False, kind="no_unique_match", path=rel, hunk=hi,
-                )
+                    path=rel, hunk=hi)
             lines[idx: idx + len(hk.old)] = hk.new
             cursor = idx + len(hk.new)
 
@@ -351,7 +347,8 @@ def apply_patch(workspace: str, args: Dict[str, Any], dry_run: bool = False) -> 
             try:
                 dst = resolve_within(workspace, op.move_to)
             except ValueError as e:
-                return ToolResult.error(f"`{op.move_to}`：{e}", retryable=False, kind="bad_path")
+                return tool_error("apply_patch", "bad_path",
+                                  f"移动目标 `{op.move_to}` 不可用：{e}")
             planned[-1] = (rel, full, lines)
             changed.append(to_rel(workspace, dst))
 
@@ -372,10 +369,14 @@ def apply_patch(workspace: str, args: Dict[str, Any], dry_run: bool = False) -> 
             written.append(rel)
         except OSError as e:
             # 部分失败：已写的如实报告，避免"以为成功了"的错觉（保真原则）
-            return ToolResult.error(
-                f"写入 `{rel}` 失败：{e}。已成功写入：{written or '无'}。"
-                "注意补丁是逐文件应用的，已写入的文件不会自动回滚，请用 git 检查状态。",
-                layer="tool", retryable=False, kind="io",
+            return tool_error(
+                "apply_patch", "io",
+                f"写入 `{rel}` 失败：{e}。已成功写入：{written or '无'}；"
+                "补丁是逐文件应用的，已写入的文件**不会自动回滚**。",
+                expect="补丁是**原子**的：任一文件写不进去，整个补丁都不应落盘。",
+                next_step="用 git status/diff 确认已落盘的那部分，"
+                          "修掉写入失败的原因后重发补丁；"
+                          "**注意**已写入的文件可能是半完成状态，先核对再继续。",
                 files_changed=list(written),
             )
 
@@ -434,7 +435,16 @@ def register_patch_tools(reg: ToolRegistry, workspace: str) -> None:
             "不要在同一个补丁上反复重试。\n"
             "· 补丁是**原子**的：任一文件无法应用，则整个补丁都不落盘。\n"
             "· 只接受工作区内的相对路径；命中禁改清单（.git/、node_modules/、.env、*.pem 等）会被拒绝。\n"
-            "· 改文件前请先用 read_file 确认当前内容。"
+            "· 改文件前请先用 read_file 确认当前内容。\n"
+            "**不要用它来做这些**：\n"
+            "· 只是想看看文件现在写了什么 → 用 read_file（补丁是**写**操作，"
+            "发出去就会改盘，不要用补丁去『试探』内容）\n"
+            "· 想新建一个**空**文件 → 用 Add File 并显式写一行 `+`；"
+            "不要发一个没有任何内容行的 Add File\n"
+            "· 想整体重写一个文件 → 若改动超过文件大半，说明你可能读错了基础版本，"
+            "先 read_file 核对，而不是用超大补丁覆盖\n"
+            "· 想确认某个路径存不存在 → 用 read_file 或 list_dir，"
+            "补丁会因为路径不存在而整份失败"
         ),
         properties={
             "patch": {"type": "string", "description": f"完整的 V4A 补丁文本，以 `{BEGIN}` 开始、`{END}` 结束"},

@@ -38,8 +38,9 @@
 | `harness/model.py` | **模型接入**：OpenAI 兼容端点（三字段）+ 连通性自检 + 离线 stub |
 | `harness/loop.py` | ReAct 主循环 + 五功能闭环 + 事件发射 |
 | `harness/server.py` | 零依赖 HTTP + SSE，同源托管前端 |
+| `harness/errors.py` | **统一错误模板**：出了什么错 + 期望是什么 + 下一步调什么 |
 | `harness/retention.py` | **类型化保留**：约束 verbatim 永不进摘要器（防压缩悬崖） |
-| `harness/test_harness.py` | **272 项测试**，每项标注书中出处 |
+| `harness/test_harness.py` | **294 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
 | `docs/harness-research-2026.md` | **2026 前沿调研**：ETCLOVG 七层、架构收敛、ECT、压缩悬崖、CapScope、Self-Harness、AHE |
 | `docs/harness-gap-diagnosis.md` | **差距诊断**：逐层读代码，含两个「空壳」实证 |
@@ -180,7 +181,7 @@ curl -X POST http://127.0.0.1:8787/api/run \
 ## 已验证
 
 **后端**（`python -m harness.test_harness`）
-- **272 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- **294 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
 - 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
   重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
 - 模型接入：地址归一化（中转站四种写法）、api_key 绝不回传明文、掩码可核对、
@@ -195,6 +196,11 @@ curl -X POST http://127.0.0.1:8787/api/run \
   未配置时自动走离线脚本 —— 全通过
 - **目标闸门（真实模型 deepseek-v4.1-flash）**：文件落盘 → `check/scope=goal newly_met`
   → `all_met:true` → `completed`；反向用例（要求创建但指示不动手）正确报 `all_met:false`
+- **工具错误统一 + 描述补负例（G-7）**：33 处错误全部收敛到三段式模板
+  （同一错误码跨工具措辞一致）；**6 个工具全部具备负例并互相点名替代工具**。
+  真实模型复验：任务「找哪个文件定义了 compute_magic_number」→ 工具序列
+  `list_dir → grep → read_file`，准确给出文件名与行号。
+  （顺带修掉一个**静默丢弃工具调用**的真 bug，见下）
 - **验收框架（测法可信性）**：三条方法论硬约束落成可执行检查。
   真实模型端到端 1/1 通过、null agent 0/1、**BenchJack 式作弊被精确拦截**
   （不改实现而改检查文件 → 篡改检查点出 `check.py` 的 `modified`）；

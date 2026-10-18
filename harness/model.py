@@ -325,6 +325,30 @@ _DSML_PARAM_RE = re.compile(
     re.DOTALL,
 )
 
+# ── DSML 标记 + JSON 负载（第三种漂移形态）──
+# 实测踩到：同一模型还会输出
+#
+#     <｜｜DSML｜｜call>
+#     {"name": "grep", "arguments": {"pattern": "compute_magic_number"}}
+#     </tool_call>
+#
+# 也就是**用 DSML 的标签包 JSON 的负载**（两种格式杂交）。
+# 当时的后果很严重：解析器认不出它 → 这次工具调用被**静默丢弃** →
+# 循环把它当成"最终回答"收尾，事件流里 `tool_calls=0`，
+# 而模型其实做对了（它确实想调 grep）。
+#
+# 这不是"模型选错了工具"，而是 **harness 把正确的动作丢了** ——
+# 属于书 §1 警告的「看上去毫无破绽的失败」：回答里残留着半截标签，
+# 但运行状态是 completed，不细看根本发现不了。
+#
+# 判据刻意**窄**：必须是 DSML 标签紧跟着一个 JSON 对象。
+# 不能放宽成"正文里出现 DSML 就找 JSON" —— 那会误吞模型在解释 DSML 时的正文。
+_DSML_JSON_CALL_RE = re.compile(
+    r"<\s*\uff5c\uff5c\s*DSML\s*\uff5c\uff5c\s*(?:call|tool_calls?)\s*>"
+    r"\s*(?:\n\s*)?(\{)",
+    re.IGNORECASE,
+)
+
 
 def extract_text_tool_calls(content: str) -> "tuple[List[ToolCall], str]":
     """从正文里抽出文本形式的工具调用。
@@ -373,6 +397,53 @@ def extract_text_tool_calls(content: str) -> "tuple[List[ToolCall], str]":
                 args = args["arguments"]
             calls.append(ToolCall(name, args))
             stripped = stripped.replace(m.group(0), "")
+
+    # ── 1b. DSML 标记 + JSON 负载（杂交形态）──
+    # 用**花括号配平扫描**取 JSON，不用非贪婪正则 —— 理由同下面的
+    # `<tool_call>` 分支：混写时正则会被截断成半截 JSON。
+    if "DSML" in stripped:
+        pos = 0
+        while True:
+            m = _DSML_JSON_CALL_RE.search(stripped, pos)
+            if not m:
+                break
+            brace = m.start(1)
+            end = _match_brace(stripped, brace)
+            if end < 0:
+                # JSON 没配平 → 解析不了，**保留原文**让模型看见自己写坏了什么
+                pos = m.end()
+                continue
+            # 注意 `+ 1`：`_match_brace` 返回的是**闭括号的下标**，
+            # 不是"结束位置"。漏掉它会少收一个字符，JSON 必然解析失败
+            # （实测踩到：payload 变成 `...{"pattern":"x"}`，
+            # 原本应是 `...{"pattern":"x"}}`）。
+            payload = stripped[brace:end + 1]
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                pos = end
+                continue
+            if not isinstance(obj, dict):
+                pos = end
+                continue
+            name = str(obj.get("name") or obj.get("tool") or "").strip()
+            if not name:
+                pos = end
+                continue
+            raw_args = obj.get("arguments")
+            if raw_args is None:
+                raw_args = obj.get("parameters") or obj.get("args") or {}
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    raw_args = {}
+            if not isinstance(raw_args, dict):
+                raw_args = {}
+            calls.append(ToolCall(name, raw_args))
+            # 整块移除：从 DSML 标签起点到 JSON 结束（同样要 + 1）
+            stripped = stripped[:m.start()] + stripped[end + 1:]
+            pos = 0        # 位置已变，重新扫一遍
 
     # ── 2. 通用 <tool_call>{json} 格式 ──
     # 关键点：**不能**用 `\{.*?\}` 去做这件事 ——

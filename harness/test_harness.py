@@ -1918,6 +1918,81 @@ class TestTextToolCallFallback(unittest.TestCase):
         self.assertEqual(rendered["tool_calls"][0]["function"]["name"], "read_file")
         self.assertNotIn("<tool_call>", rendered.get("content") or "")
 
+    def test_dsml_tag_with_json_payload(self):
+        """**第三种漂移形态**：DSML 标签包 JSON 负载。
+
+        实测踩到（本轮）：模型输出
+
+            <｜｜DSML｜｜call>
+            {"name": "grep", "arguments": {"pattern": "compute_magic_number"}}
+            </tool_call>
+
+        当时解析器认不出它 → **工具调用被静默丢弃** → 循环把它当成
+        "最终回答"收尾，`tool_calls=0`。而模型其实**做对了**。
+
+        这不是"模型选错了工具"，而是 harness 把正确的动作丢了 ——
+        属于书 §1 警告的「看上去毫无破绽的失败」：
+        回答里残留半截标签，但运行状态是 completed。
+
+        顺带修掉的 off-by-one：`_match_brace` 返回的是**闭括号下标**，
+        切片必须 `[brace:end+1]`。漏掉 `+1` 会让 payload 少一个 `}`，
+        JSON 必然解析失败（而失败又被 `except` 吞掉，症状是"什么都没发生"）。
+        """
+        from harness.model import extract_text_tool_calls
+        s = ('<｜｜DSML｜｜call>\n'
+             '{"name": "grep", "arguments": {"pattern": "compute_magic_number"}}\n'
+             '</tool_call>')
+        calls, rest = extract_text_tool_calls(s)
+        self.assertEqual(len(calls), 1, "DSML+JSON 杂交形态必须被解析出来")
+        self.assertEqual(calls[0].name, "grep")
+        self.assertEqual(calls[0].args, {"pattern": "compute_magic_number"})
+
+    def test_dsml_tool_calls_variant(self):
+        from harness.model import extract_text_tool_calls
+        s = ('<｜｜DSML｜｜tool_calls>\n'
+             '{"name": "read_file", "arguments": {"path": "a.py"}}\n'
+             '</｜｜DSML｜｜tool_calls>')
+        calls, _ = extract_text_tool_calls(s)
+        self.assertEqual([(c.name, c.args) for c in calls],
+                         [("read_file", {"path": "a.py"})])
+
+    def test_dsml_json_prose_not_swallowed(self):
+        """**反向防线**：正文里*提到* DSML 不该被当成工具调用。
+
+        判据必须窄 —— 只认"DSML 标签紧跟 JSON 对象"这一形态。
+        放宽成"正文出现 DSML 就找 JSON"会误吞模型解释协议时的正文。
+        """
+        from harness.model import extract_text_tool_calls
+        s = "我用 DSML 格式调用工具，例如 <｜｜DSML｜｜call> 这样的写法。"
+        calls, rest = extract_text_tool_calls(s)
+        self.assertEqual(calls, [], "纯正文被误判成工具调用")
+        self.assertIn("DSML", rest, "正文不该被移除")
+
+    def test_brace_matching_handles_brace_inside_string(self):
+        """配平扫描必须跳过**字符串内部**的花括号。
+
+        否则 `{"command": "echo }"}` 会在字符串里的 `}` 处被截断。
+        """
+        from harness.model import extract_text_tool_calls
+        s = ('<｜｜DSML｜｜call>\n'
+             '{"name": "shell", "arguments": {"command": "echo }"}}')
+        calls, _ = extract_text_tool_calls(s)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].args, {"command": "echo }"})
+
+    def test_malformed_dsml_json_is_kept_visible(self):
+        """JSON 没配平 → **保留原文**，让模型看见自己写坏了什么。
+
+        静默丢弃会让模型永远不知道自己格式写错了（书 §5：
+        工具层错误不终止调用，把错误变成模型的输入）。
+        """
+        from harness.model import extract_text_tool_calls
+        s = '<｜｜DSML｜｜call>\n{"name": "grep", "arguments": {"x": '
+        calls, rest = extract_text_tool_calls(s)
+        self.assertEqual(calls, [])
+        self.assertIn("{", rest, "坏掉的原文必须留下")
+
+
 
 class TestTypedRetention(unittest.TestCase):
     """类型化上下文保留 —— 防「压缩悬崖」。
@@ -4044,6 +4119,262 @@ class TestAcceptanceFramework(unittest.TestCase):
         r = a.run(self.ws.path)
         self.assertFalse(r["ok"])
         self.assertIn("ZeroDivisionError", r["detail"])
+
+
+# ══════════════════════════════════════════════════════════════════
+# 17. 工具错误模板与描述负例（G-7）
+# ══════════════════════════════════════════════════════════════════
+class TestErrorTemplates(unittest.TestCase):
+    """统一错误形态：**出了什么错 + 期望是什么 + 下一步调什么**。
+
+    前沿数据（Harness Engineering Survey 汇总）：
+    把 30 个常见错误改写为「下一步指令」，无人干预的恢复率 **~50% → >80%**。
+
+    所以这不是"文案美化"，而是**恢复率的直接杠杆**。
+    本组测试保证：新增错误码时作者必须顺手补三段式文案，
+    不允许再出现 `ToolResult.error(str(e))` 那种裸错误。
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        os.makedirs(os.path.join(self.ws.path, "src"), exist_ok=True)
+        self.ws.write("src/a.py", "x = 1\n")
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    # ---------- 模板结构 ----------
+    def test_template_has_three_sections(self):
+        from harness.errors import tool_error
+        r = tool_error("read_file", "bad_path", "路径越出工作区：/etc/passwd")
+        self.assertFalse(r.ok)
+        for section in ("[工具错误]", "出了什么错", "期望是什么", "下一步"):
+            self.assertIn(section, r.text)
+        # 具体事实必须在里面
+        self.assertIn("/etc/passwd", r.text)
+
+    def test_same_kind_same_wording_across_tools(self):
+        """同一错误码在不同工具里**措辞必须一致**。
+
+        模型对同一类问题只需学一次；三个工具三种说法会白耗注意力。
+        """
+        from harness.errors import tool_error
+        a = tool_error("read_file", "not_found", "文件不存在：a.py")
+        b = tool_error("apply_patch", "not_found", "要修改的 `b.py` 不存在。")
+        # 期望与下一步两段必须完全相同（只有"出了什么错"是不同的具体事实）
+        for seg in ("期望是什么", "下一步"):
+            la = [l for l in a.text.splitlines() if seg in l][0]
+            lb = [l for l in b.text.splitlines() if seg in l][0]
+            self.assertEqual(la, lb, f"{seg} 段在不同工具里措辞不一致")
+
+    def test_next_step_is_actionable_not_vague(self):
+        """下一步必须是**可执行动作**，不能是"请检查"这类空洞措辞。
+
+        写「请检查参数」等于没写 —— 模型没有"检查"这个动作可执行。
+        """
+        from harness.errors import catalog, has_next_step
+        bad = [k for k in catalog() if not has_next_step(k)]
+        self.assertEqual(bad, [], f"这些错误码的下一步不够具体：{bad}")
+
+    def test_no_missing_catalog_entries(self):
+        """工具实际用到的错误码必须都有专属文案（不能只靠兜底）。"""
+        import re
+        from harness.errors import missing_catalog_entries
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # 只在 tools/ 下扫 —— 那里才是"工具实现"，
+        # 别把 errors.py 自己的示例代码、测试文件算进来
+        kinds = set()
+        tools_dir = os.path.join(root, "harness", "tools")
+        for fn in os.listdir(tools_dir):
+            if not fn.endswith(".py"):
+                continue
+            with open(os.path.join(tools_dir, fn), encoding="utf-8") as f:
+                text = f.read()
+            # tool_error(<任意第一参数>, "<kind>", ...)
+            # 第一参数可能是字面量也可能是变量名，所以不限定它
+            kinds.update(re.findall(
+                r'tool_error\(\s*[^,()]+,\s*"([a-z_]+)"\s*,', text))
+        self.assertTrue(kinds, "没有扫到任何错误码？检查正则是否失效")
+        missing = missing_catalog_entries(sorted(kinds))
+        self.assertEqual(missing, [],
+                         f"这些错误码没有三段式文案，只走了兜底：{missing}")
+
+    def test_no_raw_str_exception_errors_left(self):
+        """工具实现里不得再有 `ToolResult.error(...)` 这种旧形态。
+
+        它是"只说了出错了、没说怎么办"的典型 —— 所有工具错误
+        都必须走 `errors.tool_error` 的三段式模板。
+
+        只在 tools/ 下扫：errors.py 自己的**文档举例**里会出现这个字符串，
+        那是说明反面形态，不是在用它（第一版判据过宽，把它误报了一次）。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tools_dir = os.path.join(root, "harness", "tools")
+        offenders = []
+        for fn in os.listdir(tools_dir):
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(tools_dir, fn)
+            with open(path, encoding="utf-8") as f:
+                for i, ln in enumerate(f, start=1):
+                    if "ToolResult.error" in ln:
+                        offenders.append(f"{fn}:{i}")
+        self.assertEqual(offenders, [],
+                         "工具里还残留旧的裸错误返回（应改用 errors.tool_error）："
+                         + ", ".join(offenders))
+
+    # ---------- 实测各类错误 ----------
+    def test_read_file_errors_are_standard(self):
+        from harness.tools.fs import read_file, list_dir, glob_files
+        from harness.errors import is_standard_error
+        cases = [
+            read_file(self.ws.path, {"path": "nope.py"}),
+            read_file(self.ws.path, {"path": "/etc/passwd"}),
+            read_file(self.ws.path, {"path": "src"}),
+            list_dir(self.ws.path, {"path": "src/a.py"}),
+            glob_files(self.ws.path, {"pattern": ""}),
+        ]
+        for r in cases:
+            self.assertFalse(r.ok)
+            self.assertTrue(is_standard_error(r),
+                            f"未走标准模板：{r.text[:60]}")
+
+    def test_read_file_not_found_mentions_next_tool(self):
+        """`not_found` 的下一步必须点名**具体的替代工具**。"""
+        from harness.tools.fs import read_file
+        r = read_file(self.ws.path, {"path": "nope.py"})
+        self.assertIn("glob", r.text)
+        self.assertIn("grep", r.text)
+
+    def test_patch_no_unique_match_keeps_specific_fact(self):
+        """补丁定位歧义：模板要补三段式，但**必须保留**"匹配到几处/在哪几行"。
+
+        笼统的"定位失败"没价值；模型需要知道歧义出现在哪。
+        """
+        from harness.tools.patch import apply_patch
+        self.ws.write("dup.py", "same\nsame\n")
+        r = apply_patch(self.ws.path, {"patch":
+            "*** Begin Patch\n*** Update File: dup.py\n@@\n-same\n+changed\n*** End Patch"})
+        self.assertFalse(r.ok)
+        self.assertIn("下一步", r.text)
+        # 具体歧义信息必须在
+        self.assertTrue("次" in r.text, f"丢失了匹配次数信息：{r.text}")
+
+    def test_patch_parse_error_actionable(self):
+        from harness.tools.patch import apply_patch
+        r = apply_patch(self.ws.path, {"patch": "这不是补丁"})
+        self.assertFalse(r.ok)
+        self.assertIn("Begin Patch", r.text)   # 期望段说清了格式
+
+    def test_unknown_tool_error_from_router(self):
+        """幻觉调用的错误必须列出**可用工具**（模型据此自纠）。"""
+        from harness.tools.registry import ToolRegistry
+        from harness.tools.router import ToolRouter
+        from harness.policy import Policy, SandboxMode, ApprovalPolicy
+        from harness.protocol import EventBus, ToolCall
+        reg, _ = build_default_registry(self.ws.path)
+        pol = Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST,
+                     self.ws.path)
+        router = ToolRouter(reg, pol, EventBus(), workspace=self.ws.path)
+        r = router.route(ToolCall("nonexistent_tool", {}))
+        self.assertFalse(r.ok)
+        for name in reg.names():
+            self.assertIn(name, r.text, "错误里应列出可用工具名")
+
+    def test_shell_timeout_error_standard(self):
+        from harness.errors import tool_error, is_standard_error
+        r = tool_error("shell", "timeout", "命令超过 30000 ms 未结束，已被终止。")
+        self.assertTrue(is_standard_error(r))
+        self.assertIn("拆成更小的步骤", r.text)
+
+
+class TestToolDescriptionNegatives(unittest.TestCase):
+    """**负例是对选择准确率提升最大的一句**，也是大家最常漏的。
+
+    工程共识：工具间**重叠**是错误选择的最大单一原因。
+    我们 4 个"找东西"类工具（read_file / list_dir / glob / grep）
+    天然重叠，正是最需要负例的一组。
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        self.reg, self.shell = build_default_registry(self.ws.path)
+
+    def tearDown(self):
+        self.shell.reset()
+        self.ws.cleanup()
+
+    def test_every_tool_states_when_not_to_use_it(self):
+        """每个工具都必须说明**什么时候不要用它、改用哪个**。
+
+        判据用**语义**而不是固定措辞：负例的价值在于
+        「**点名该改用哪个工具**」—— 只说"这个不好用"而不给替代方案，
+        模型没有可执行的动作。
+        本项目实测过两种合格形态：
+          · `**不要用它来做这些**：… → 用 X`
+          · 直接写 `搜内容用 grep、找文件用 glob、改文件用 apply_patch`
+        （第一版判据只认固定词，把第二种合格形态误报了一次。）
+        """
+        names = self.reg.names()
+        missing = []
+        for name in names:
+            d = self.reg.tool(name).description
+            alternatives = [n for n in names if n != name and n in d]
+            # 要么有明确的"不要用它"段，要么点名了替代工具
+            has_neg_section = any(k in d for k in
+                                  ("不要用它", "不要用", "别用", "不要在同一个"))
+            if not (has_neg_section or alternatives):
+                missing.append(name)
+        self.assertEqual(missing, [],
+                         f"这些工具没有负例（只说能做什么，没说何时改用别的）：{missing}")
+
+    def test_every_tool_names_an_alternative(self):
+        """更严的一条：每个工具都必须**至少点名一个替代工具**。
+
+        「重叠是错误选择的最大单一原因」，所以负例的核心就是
+        "这件事该交给谁做"。不点名替代 = 模型只能自己猜。
+        """
+        names = self.reg.names()
+        missing = []
+        for name in names:
+            d = self.reg.tool(name).description
+            if not [n for n in names if n != name and n in d]:
+                missing.append(name)
+        self.assertEqual(missing, [],
+                         f"这些工具的负例没有点名替代工具：{missing}")
+
+    def test_overlapping_tools_cross_reference(self):
+        """重叠工具之间必须**互相点名** —— 这正是负例要解决的核心问题。"""
+        pairs = [
+            ("read_file", "list_dir"),   # 读文件 vs 看目录
+            ("list_dir", "glob"),        # 列一层 vs 跨目录找
+            ("glob", "grep"),            # 按名找 vs 按内容找
+            ("grep", "glob"),
+        ]
+        for src, other in pairs:
+            d = self.reg.tool(src).description
+            self.assertIn(other, d,
+                          f"`{src}` 的负例里没有点名 `{other}` —— "
+                          "重叠工具不交叉引用，模型只能靠猜")
+
+    def test_descriptions_state_boundaries(self):
+        """边界（做不到什么）仍然必须写 —— 这条原有测试也要继续成立。"""
+        for name in self.reg.names():
+            d = self.reg.tool(name).description
+            self.assertIn("边界", d, f"`{name}` 没写边界")
+
+    def test_specs_still_byte_stable(self):
+        """补负例不能破坏"工具顺序固定 + spec 字节一致"这条缓存纪律。"""
+        a = self.reg.specs()
+        b = self.reg.specs()
+        self.assertEqual(json.dumps(a, ensure_ascii=False),
+                         json.dumps(b, ensure_ascii=False))
+
+    def test_registered_order_unchanged(self):
+        """工具注册顺序是缓存不变式，不得因本次改动而变化。"""
+        self.assertEqual(self.reg.names(),
+                         ["read_file", "list_dir", "glob", "grep",
+                          "apply_patch", "shell"])
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -8,6 +8,9 @@
   `Agent = LLM + 上下文 + 工具`，而 **Harness = 上下文管理 + 工具接口 + 约束 + 验证 + 纠正**。
 - **Codex 的实现**（`docs/codex-architecture.md`、`docs/harness-architecture.md`）——
   架构参考与逐条对照。
+- **2026 前沿论文**（`docs/harness-research-2026.md`）——ETCLOVG 七层综述、
+  三 harness 架构收敛研究、证据携带终止（ECT）、压缩悬崖、CapScope 能力作用域、
+  Self-Harness / AHE 自我进化。配套差距诊断见 `docs/harness-gap-diagnosis.md`。
 
 ## 目录
 
@@ -32,6 +35,8 @@
 | `harness/server.py` | 零依赖 HTTP + SSE，同源托管前端 |
 | `harness/test_harness.py` | **136 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
+| `docs/harness-research-2026.md` | **2026 前沿调研**：ETCLOVG 七层、架构收敛、ECT、压缩悬崖、CapScope、Self-Harness、AHE |
+| `docs/harness-gap-diagnosis.md` | **差距诊断**：逐层读代码，含两个「空壳」实证 |
 | `docs/codex-architecture.md` | Codex 架构原理调研 |
 | `docs/harness-architecture.md` | 后端架构设计（含逐条对照与待验证清单） |
 | `docs/design-plan.md` | 前端设计计划 |

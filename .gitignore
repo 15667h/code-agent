@@ -62,3 +62,4 @@ temp/
 **/.crucible/config.json
 **/.crucible/config.json.tmp
 .workbuddy/commit-msg.txt
+.workbuddy/commit-msg*.txt

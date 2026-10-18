@@ -65,6 +65,10 @@ temp/
 # 但 .crucibleignore 之类的**配置**要入库，所以用 `**` 精确匹配运行目录。
 **/.crucible/runs/
 **/.crucible/artifacts/
+# 代码索引缓存：**按工作区内容生成**，换个分支就过期，
+# 入库只会变成噪音与无意义的冲突。它的价值是"冷启动免重建"，
+# 而这个价值只对**本机**成立。
+**/.crucible/index.json
 # 模型接入配置：**含明文 API Key**，绝不能入库
 **/.crucible/config.json
 **/.crucible/config.json.tmp

@@ -3717,6 +3717,216 @@ class TestServerStartupModes(unittest.TestCase):
                     proc.kill()
             ws.cleanup()
 
+    def test_index_build_query_and_stale(self):
+        """代码索引：建、查、过期检测。
+
+        ## 这个索引的边界必须被测到（它是"诚实"的一部分）
+
+        它是**符号索引 + 词表倒排**，不是语义索引。测试要确认它
+        做的事是它声称做的那件 —— 既不能少做（查不到该有的符号），
+        也不能多做（把非符号当符号）。
+        """
+        from harness.index import (build_index, query_symbols, query_files,
+                                   search_index, stale_report, save_index,
+                                   load_index, extract_symbols, lang_of)
+        ws = TempWorkspace()
+        try:
+            os.makedirs(os.path.join(ws.path, "pkg"), exist_ok=True)
+            with open(os.path.join(ws.path, "pkg", "mod.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("MODULE_CONST = 1\n\n"
+                        "class Widget://n    pass\n\n"
+                        "async def fetch_thing(a, b):\n    return a\n")
+            with open(os.path.join(ws.path, "app.js"), "w", encoding="utf-8") as f:
+                f.write("function renderPanel() {}\n"
+                        "const MAX_RETRY = 3;\n"
+                        "class Store {}\n")
+            # 倒排表的"提到"用 .md 验（它在可索引扩展名里）。
+            with open(os.path.join(ws.path, "notes.md"), "w", encoding="utf-8") as f:
+                f.write("Widget and fetch_thing are mentioned here.\n")
+            # 再放一个 .txt：**它不该被索引** —— 索引收的是代码类扩展名，
+            # 不是"所有文本"。这是有意划的边界（否则日志/笔记会淹没符号表），
+            # 所以这里显式断言它被排除，而不是期望它出现。
+            with open(os.path.join(ws.path, "plain.txt"), "w", encoding="utf-8") as f:
+                f.write("Widget appears here too but must NOT be indexed.\n")
+
+            idx = build_index(ws.path)
+            self.assertGreaterEqual(len(idx.files), 3)
+            self.assertNotIn("plain.txt", idx.files,
+                             "纯文本(.txt)不在索引范围内 —— 这是有意的边界")
+
+            # 符号提取：Python
+            self.assertIn("Widget", idx.symbols)
+            self.assertIn("fetch_thing", idx.symbols)
+            self.assertEqual(idx.symbols["Widget"][0].kind, "class")
+            self.assertEqual(idx.symbols["fetch_thing"][0].kind, "def")
+            self.assertEqual(idx.symbols["MODULE_CONST"][0].kind, "const")
+            # JS
+            self.assertIn("renderPanel", idx.symbols)
+            self.assertIn("Store", idx.symbols)
+
+            # 行号必须准确（打开文件比对）—— 这是"能跳到定义"的前提
+            sym = idx.symbols["fetch_thing"][0]
+            lines = open(os.path.join(ws.path, sym.path), encoding="utf-8").read().split("\n")
+            self.assertIn("fetch_thing", lines[sym.line - 1],
+                          f"行号 {sym.line} 指向的不是定义：{lines[sym.line - 1]!r}")
+
+            # 前缀查询（不是子串）—— 子串会把 fetch 命中到 prefetch/wretch
+            hits = query_symbols(idx, "fetch", exact=False)
+            self.assertTrue(any(h.name == "fetch_thing" for h in hits))
+            # 精确查询
+            self.assertEqual(len(query_symbols(idx, "Widget", exact=True)), 1)
+
+            # 倒排：词 → 文件（弱证据）
+            files = query_files(idx, "Widget")
+            self.assertIn("notes.md", files, "提到该词的文件也要入倒排")
+
+            # 分开返回"定义"与"提到"—— 两者是不同强度的证据
+            r = search_index(idx, "Widget")
+            self.assertTrue(r["symbols"])
+            self.assertTrue(r["files"])
+            self.assertIn("强证据", r["note"])
+
+            # 非文本扩展名不入索引（避免把 .png 当源码读）
+            with open(os.path.join(ws.path, "logo.png"), "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+            idx2 = build_index(ws.path)
+            self.assertNotIn("logo.png", idx2.files)
+
+            # 工具自己的运行时目录不入索引（否则工具会索引自己）
+            os.makedirs(os.path.join(ws.path, ".workbuddy"), exist_ok=True)
+            with open(os.path.join(ws.path, ".workbuddy", "probe.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("def should_not_be_indexed(): pass\n")
+            idx3 = build_index(ws.path)
+            self.assertNotIn(".workbuddy/probe.py", idx3.files,
+                             ".workbuddy 是本工具自己的目录，不该被索引")
+
+            # 陈旧检测：改一个文件后必须报过期（而不是返回可能过期的结果）
+            clean = stale_report(idx3, ws.path)
+            self.assertFalse(clean["stale"], f"没改东西却报过期：{clean}")
+            with open(os.path.join(ws.path, "pkg", "mod.py"), "a",
+                      encoding="utf-8") as f:
+                f.write("\nNEW_THING = 2\n")
+            dirty = stale_report(idx3, ws.path)
+            self.assertTrue(dirty["stale"], "改了文件却没报过期")
+            self.assertIn("pkg/mod.py", dirty["changed"])
+
+            # 落盘 / 载入往返
+            p = os.path.join(ws.path, "idx.json")
+            save_index(idx3, p)
+            back = load_index(p)
+            self.assertIsNotNone(back)
+            self.assertEqual(set(back.files), set(idx3.files))
+            self.assertEqual(set(back.symbols), set(idx3.symbols))
+            self.assertEqual(back.stamp["pkg/mod.py"][0], idx3.stamp["pkg/mod.py"][0])
+            self.assertIsNone(load_index(os.path.join(ws.path, "nope.json")))
+
+            # 语言识别只认扩展名（不嗅探内容 —— 猜错会让提取全军覆没）
+            self.assertEqual(lang_of("a/b.py"), "python")
+            self.assertEqual(lang_of("a/b.ts"), "typescript")
+            self.assertEqual(lang_of("a/b.unknownext"), "")
+
+            # 不支持的扩展名不提取符号（宁可少，不可错）
+            self.assertEqual(extract_symbols("def x(): pass", "a.unknownext", ""), [])
+        finally:
+            ws.cleanup()
+
+    def test_workspace_git_status_endpoint(self):
+        """git 改动统计：真实数字、非仓库如实说、不冒充诊断。"""
+        import urllib.request
+        import urllib.parse
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        port = self._port()
+        ws = TempWorkspace()
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "harness/server.py", "--port", str(port)],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(60):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/api/health", timeout=1) as r:
+                        if json.load(r).get("ok"):
+                            break
+                except Exception:
+                    time.sleep(0.1)
+
+            def gs(path):
+                q = urllib.parse.urlencode({"workspace": path})
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/workspace/git-status?{q}",
+                        timeout=20) as r:
+                    return json.load(r)
+
+            # 非 git 目录：如实说 is_repo=false，**不报 0 个改动**
+            #（"不在仓库里"与"没有改动"不是一回事）
+            plain = os.path.join(ws.path, "plain")
+            os.makedirs(plain, exist_ok=True)
+            r1 = gs(plain)
+            self.assertIs(r1.get("is_repo"), False)
+            self.assertTrue(r1.get("detail"), "非仓库必须给出说明")
+            self.assertNotIn("changed", r1,
+                             "非仓库不该报 changed=0（那会被读成「没有改动」）")
+
+            # 真的 git 仓库：数字必须与 git 一致
+            repo = os.path.join(ws.path, "repo")
+            os.makedirs(repo, exist_ok=True)
+            from harness.tools.shell import ShellTool
+            sh = ShellTool(repo)
+            sh({"command": "git init -q", "timeout_ms": 15000})
+            sh({"command": "git config user.email t@t", "timeout_ms": 8000})
+            sh({"command": "git config user.name t", "timeout_ms": 8000})
+            with open(os.path.join(repo, "f.txt"), "w", encoding="utf-8") as f:
+                f.write("a\n")
+            sh({"command": "git add f.txt", "timeout_ms": 8000})
+            sh({"command": "git commit -q -m init", "timeout_ms": 15000})
+            with open(os.path.join(repo, "f.txt"), "a", encoding="utf-8") as f:
+                f.write("b\nc\n")
+            with open(os.path.join(repo, "new.txt"), "w", encoding="utf-8") as f:
+                f.write("x\n")
+            sh.reset()
+
+            r2 = gs(repo)
+            self.assertIs(r2.get("is_repo"), True)
+            self.assertEqual(r2.get("changed"), 2, f"应有 2 个改动：{r2}")
+            self.assertEqual(r2.get("untracked"), 1)
+            self.assertGreaterEqual(r2.get("added_lines"), 2)
+            self.assertIn("f.txt", r2.get("paths") or [])
+            self.assertIn("git", r2.get("note", "").lower())
+            self.assertIn("不是", r2.get("note", ""),
+                          "必须说明这不是 lint/类型检查结果")
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            ws.cleanup()
+
+    def test_offline_script_format_error_is_actionable(self):
+        """`offline_script` 传错格式时，错误信息必须**指出该用什么格式**。
+
+        实测踩到：传成 `[{"tool_calls": [...]}]`（看起来很合理）得到的是
+        `AttributeError: 'dict' object has no attribute 'partition'` ——
+        完全看不出该用什么格式。**指错方向/不给方向比报错本身更糟。**
+        """
+        from harness.server import _build_scripted
+        with self.assertRaises(ValueError) as cm:
+            _build_scripted([{"tool_calls": []}])
+        msg = str(cm.exception)
+        self.assertIn("字符串", msg, f"错误信息没说明要传字符串：{msg}")
+        self.assertIn("call:shell", msg, f"错误信息没给正确示例：{msg}")
+        # 正确格式照常工作（返回的是 ScriptedModel，不是列表）
+        model = _build_scripted(['call:shell:{"command": "ls"}', "final:done"])
+        self.assertIsNotNone(model)
+        r1 = model.complete({})
+        self.assertEqual(r1.tool_calls[0].name, "shell")
+        r2 = model.complete({})
+        self.assertIn("done", r2.content)
+
     def test_route_handlers_avoid_relative_imports(self):
         """静态检查：路由处理函数里不得出现局部相对导入。
 

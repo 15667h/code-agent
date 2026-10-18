@@ -315,10 +315,12 @@
     </button>
   </div>
   <div class="statusbar__right">
-    <button type="button" class="statusitem statusitem--btn" id="btn-diag" data-tip="诊断：0 错误 · 2 警告">
-      <span class="tabular">0</span> 错误
-      <span class="statusitem__sep" aria-hidden="true"></span>
-      <span class="tabular">2</span> 警告
+    <!-- 这里原来是"0 错误 / 2 警告" —— 全是编的（harness 不做 lint）。
+         现在展示**真实的 git 改动统计**：改了几个文件、增删多少行。
+         标签也从"错误/警告"改成"改动"，因为在没有诊断来源的情况下
+         写"诊断"会让人以为这些数字来自静态检查。 -->
+    <button type="button" class="statusitem statusitem--btn" id="btn-diag" data-tip="工作区改动（git）">
+      <span class="statusitem__icon" aria-hidden="true">±</span><span id="status-changes">读取中</span>
     </button>
     <span class="statusitem tabular" id="status-pos" data-tip="光标位置">L1, C1</span>
     <span class="statusitem" data-tip="文件编码">UTF-8</span>

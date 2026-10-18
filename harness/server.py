@@ -44,6 +44,8 @@ if __package__ in (None, ""):
     from harness.protocol import Event, EventBus, EventType
     from harness.session import Session, list_runs
     from harness.tools.shell import ShellTool
+    from harness.index import (build_index, load_index, save_index,
+                               search_index, stale_report)
 else:
     from .chain import verify_all, verify_chain
     from .context import DEFAULT_SYSTEM_PROMPT, StaticPrefix
@@ -56,6 +58,8 @@ else:
     from .protocol import Event, EventBus, EventType
     from .session import Session, list_runs
     from .tools.shell import ShellTool
+    from .index import (build_index, load_index, save_index,
+                        search_index, stale_report)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -140,6 +144,13 @@ class RunState:
 
 RUNS: Dict[str, RunState] = {}
 RUNS_LOCK = threading.Lock()
+
+# 代码索引缓存：按工作区各存一份。
+# 为什么放进程内：建索引是纯计算（实测 53 个文件 0.17s），而它
+# **与某次运行无关** —— 它描述的是「当前工作区长什么样」。
+# 落盘缓存仍然写（供冷启动用），但内存态优先，
+# 否则每次查询都要重读 ~700KB JSON。
+_INDEX_CACHE: Dict[str, Any] = {}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -234,6 +245,17 @@ def _build_scripted(spec: Optional[List[str]]):
     「看上去毫无破绽的失败」。解析错误必须立刻可见。
     """
     script = []
+    # 收到非字符串项时**给出格式说明**，而不是让它在 partition 上抛
+    # AttributeError —— 实测踩到：传成 `[{"tool_calls": [...]}]`（看起来
+    # 很合理）会得到 "dict object has no attribute 'partition'"，
+    # 完全看不出该用什么格式。**指错方向/不给方向比报错本身更糟。**
+    for i, item in enumerate(spec or []):
+        if not isinstance(item, str):
+            raise ValueError(
+                f"offline_script 的第 {i + 1} 项是 {type(item).__name__}，"
+                "但这里只接受**字符串**。正确格式："
+                '["call:shell:{\\"command\\":\\"git status\\"}", "final:完成"]。'
+                "可用动词见 _parse_offline_script 的文档。")
     for item in (spec or []):
         kind, _, rest = item.partition(":")
         kind = kind.strip()
@@ -636,6 +658,63 @@ class Handler(BaseHTTPRequestHandler):
             ws = (q.get("workspace") or [default_workspace()])[0]
             cmd = (q.get("cmd") or [""])[0]
             return self._json(200, _run_readonly_command(ws, cmd))
+
+        if path == "/api/workspace/git-status":
+            ws = (q.get("workspace") or [default_workspace()])[0]
+            return self._json(200, _workspace_git_status(ws))
+
+        if path == "/api/workspace/index":
+            # 代码索引（符号 + 词表倒排）。
+            #
+            # 内存态优先（同一个工作区只建一次），否则读落盘缓存；
+            # 都没有就**按需建**并落盘 —— 前端首次点"索引"时不该等太久，
+            # 而 53 个文件的索引实测只要 0.17s。
+            ws = os.path.realpath((q.get("workspace") or [default_workspace()])[0])
+            rebuild = (q.get("rebuild") or ["0"])[0] in ("1", "true", "yes")
+            idx = _INDEX_CACHE.get(ws)
+            if idx is None or rebuild:
+                cache_path = os.path.join(ws, ".crucible", "index.json")
+                if not rebuild:
+                    idx = load_index(cache_path)
+                    if idx is not None:
+                        _INDEX_CACHE[ws] = idx
+                if idx is None or rebuild:
+                    idx = build_index(ws)
+                    _INDEX_CACHE[ws] = idx
+                    try:
+                        save_index(idx, cache_path)
+                    except OSError as e:
+                        # 落盘失败不致命，但**要说出来** —— 否则下次
+                        # 冷启动会重新建索引，而用户以为缓存是好的。
+                        idx.errors.append(f"落盘失败：{e}")
+            return self._json(200, {
+                **idx.to_json(with_symbols=False),
+                "cache": "memory" if ws in _INDEX_CACHE else "disk",
+                "limit_note": "这是**符号索引 + 词表倒排**，不是语义索引："
+                              "搜「处理完成判定的逻辑」这类意图搜不到。"
+                              "也不含跨文件调用关系（谁调用了谁）。",
+            })
+
+        if path == "/api/workspace/index/query":
+            ws = os.path.realpath((q.get("workspace") or [default_workspace()])[0])
+            text = (q.get("q") or [""])[0]
+            if not text.strip():
+                return self._json(400, {"error": "empty query",
+                                        "detail": "查询词不能为空。"})
+            idx = _INDEX_CACHE.get(ws)
+            if idx is None:
+                cache_path = os.path.join(ws, ".crucible", "index.json")
+                idx = load_index(cache_path) or build_index(ws)
+                _INDEX_CACHE[ws] = idx
+            # 陈旧时**照常返回结果，但必须带上过期标记** ——
+            # 直接拒绝会让用户以为"查不了"，而实际是"结果可能不全"。
+            stale = stale_report(idx, ws)
+            result = search_index(idx, text)
+            result["stale"] = stale["stale"]
+            result["stale_detail"] = stale["detail"] if stale["stale"] else ""
+            result["indexed_at"] = idx.built_at
+            result["file_count"] = len(idx.files)
+            return self._json(200, result)
 
         if path == "/api/workspace/info":
             # 工作区概要：前端状态栏与索引提示需要它。
@@ -1508,6 +1587,101 @@ def _workspace_search(workspace: str, pattern: str, q: Dict[str, List[str]]) -> 
         "lines": [l for l in (getattr(res, "text", "") or "").split("\n") if l.strip()],
         "truncated": bool(getattr(res, "truncated", False)),
     }
+
+
+def _workspace_git_status(workspace: str) -> Dict[str, Any]:
+    """工作区 git 改动统计。
+
+    ## 这是状态栏"诊断"的**真实来源**
+
+    原来状态栏写着"N 错误 / M 警告"，那是编的 —— harness 不做 lint 与类型检查，
+    所以那两个数字没有任何来源。但**"工作区改了多少东西"是真实可得的**，
+    而且对 agent 类界面更有用（agent 刚改了什么一眼可见）。
+
+    所以这个端点返回 diff 统计而不是"诊断"，前端据此把标签从"错误/警告"
+    改成"改动"，并明确说明没有诊断来源。
+
+    ## 判据全部来自 git 本身，不猜
+
+    用 `git status --porcelain` 拿状态码（这是机器可读格式，不像
+    `git status` 的人类输出那样需要解析），用 `git diff --numstat` 拿增删行数。
+    **不解析人类可读输出** —— 那会随 git 版本与语言环境变化。
+
+    非 git 工作区如实返回 `is_repo: false`，不报 0 个改动
+    （"不在仓库里"与"没有改动"不是一回事）。
+    """
+    ws = os.path.realpath(workspace)
+    if not os.path.isdir(ws):
+        return {"error": "workspace not found", "workspace": ws}
+    if not os.path.isdir(os.path.join(ws, ".git")):
+        return {"is_repo": False, "workspace": ws,
+                "detail": "这个工作区不是 git 仓库，因此没有改动统计。"
+                          "这不等于「没有改动」。"}
+
+    shell = ShellTool(ws)
+    try:
+        # 分支：用 rev-parse 拿短名（比解析 `git status` 第一行可靠）
+        br = shell({"command": "git rev-parse --abbrev-ref HEAD", "timeout_ms": 8000})
+        branch = (br.text or "").strip().splitlines()
+        branch = branch[0].strip() if branch else ""
+
+        # 状态：--porcelain 是**机器可读**格式（每行两字母状态码 + 路径）
+        st = shell({"command": "git status --porcelain", "timeout_ms": 12000})
+        rows = [l for l in (st.text or "").splitlines() if l.strip()]
+        staged, unstaged, untracked, renamed = [], [], [], []
+        for line in rows:
+            if len(line) < 4:
+                continue
+            code, path = line[:2], line[3:].strip()
+            if code == "??":
+                untracked.append(path)
+            else:
+                if code[0] not in (" ", "?"):
+                    staged.append(path)
+                if len(code) > 1 and code[1] not in (" ", "?"):
+                    unstaged.append(path)
+                if "R" in code:
+                    renamed.append(path)
+
+        # 增删行数：--numstat 给 "added<TAB>deleted<TAB>path"，同样机器可读
+        num = shell({"command": "git diff --numstat HEAD", "timeout_ms": 12000})
+        added = deleted = 0
+        files_with_diff = 0
+        for line in (num.text or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                added += int(parts[0])
+                deleted += int(parts[1])
+            except ValueError:
+                continue        # 二进制文件的增删是 "-"，跳过而不是当 0 累加
+            files_with_diff += 1
+
+        return {
+            "is_repo": True,
+            "workspace": ws,
+            "branch": branch,
+            "changed": len(rows),
+            "staged": len(staged),
+            "unstaged": len(unstaged),
+            "untracked": len(untracked),
+            "renamed": len(renamed),
+            "added_lines": added,
+            "deleted_lines": deleted,
+            "files_with_diff": files_with_diff,
+            "paths": [l[3:].strip() for l in rows[:50]],
+            # 明确声明这不是"诊断"
+            "note": "这是 git 改动统计，不是 lint/类型检查结果。"
+                    "harness 不做代码诊断。",
+        }
+    except Exception as e:      # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "workspace": ws}
+    finally:
+        try:
+            shell.reset()
+        except Exception:
+            pass
 
 
 def _workspace_info(workspace: str) -> Dict[str, Any]:

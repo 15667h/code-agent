@@ -159,6 +159,11 @@
     searchQuery: "",         // 搜索词
     searchHits: undefined,   // undefined=没搜过 / null=搜索中 / {..}=结果
     searchError: null,
+    searchMode: "index",     // "index" | "grep" —— 两种搜索**性质不同**，必须显式区分
+    indexInfo: null,         // 索引概要（文件数 / 符号数 / 陈旧状态）
+    indexError: null,
+    gitStatus: null,         // 工作区 git 改动（状态栏诊断的真实来源）
+    gitError: null,
 
     // ── 用量 ──
     usage: null,
@@ -751,6 +756,51 @@
         });
     },
 
+    loadGitStatus: function () {
+      if (!this.available()) return Promise.resolve(null);
+      return window.Harness.workspaceGitStatus(state.workspace)
+        .then(function (r) {
+          state.gitStatus = (r && !r.error) ? r : null;
+          state.gitError = (r && r.error) ? r.error : null;
+          if (uiHooks.renderStatusMetrics) uiHooks.renderStatusMetrics();
+          return state.gitStatus;
+        })
+        .catch(function (e) {
+          state.gitStatus = null;
+          state.gitError = String(e && e.message || e);
+          if (uiHooks.renderStatusMetrics) uiHooks.renderStatusMetrics();
+          return null;
+        });
+    },
+
+    loadIndex: function (rebuild) {
+      if (!this.available()) return Promise.resolve(null);
+      return window.Harness.workspaceIndex(state.workspace, rebuild)
+        .then(function (r) {
+          state.indexInfo = (r && !r.error) ? r : null;
+          state.indexError = (r && r.error) ? r.error : null;
+          if (uiHooks.renderStatusMetrics) uiHooks.renderStatusMetrics();
+          if (state.railView === "explorer") renderRail();
+          return state.indexInfo;
+        })
+        .catch(function (e) {
+          state.indexInfo = null;
+          state.indexError = String(e && e.message || e);
+          if (uiHooks.renderStatusMetrics) uiHooks.renderStatusMetrics();
+          return null;
+        });
+    },
+
+    /* 索引查询（符号 + 文件）。**与 grep 是两种不同的搜索**，
+       所以走**两个不同的函数**，各自的结果形状也不同 ——
+       混成一个入口会让人以为它们是一回事。 */
+    indexSearch: function (q) {
+      if (!this.available()) return Promise.resolve(null);
+      return window.Harness.indexQuery(state.workspace, q)
+        .then(function (r) { return r; })
+        .catch(function (e) { return { error: String(e && e.message || e) }; });
+    },
+
     loadWorkspaceInfo: function () {
       if (!this.available()) return Promise.resolve(null);
       return window.Harness.workspaceInfo(state.workspace)
@@ -1196,21 +1246,50 @@
     }
 
     if (state.railView === "search") {
-      // 真实搜索：走 /api/workspace/search，后端复用 agent 的 grep 工具。
-      // 三态（未搜 / 搜索中 / 有结果或明确空）都要分得清。
+      // ## 两种搜索，**必须显式区分**
+      //
+      // · **索引**（符号索引 + 词表倒排）：回答"哪个文件**定义**了这个符号"。
+      //   快（一次查表），但只懂字面，且索引可能是旧的。
+      // · **内容**（grep）：回答"哪一行含这个字符串"。慢（逐文件扫），
+      //   但永远是**当前磁盘状态**。
+      //
+      // 混成一个入口是最坏的做法：用户不知道结果为什么时快时慢、
+      // 也可能不知道为什么"刚才搜到的这一行现在没了"（索引过期）。
+      // 所以用一个明确的两态切换，并在说明里写清各自的能力边界。
       var wrap = el("div", "railinput");
       wrap.appendChild(svg(ICONS.search));
       var inp = el("input");
       inp.type = "search";
-      inp.placeholder = "在工作区内搜索…";
+      inp.placeholder = state.searchMode === "index"
+        ? "搜索符号（函数/类/常量名）…" : "在工作区内容里搜索…";
       inp.setAttribute("aria-label", "在工作区内搜索");
       inp.value = state.searchQuery || "";
       wrap.appendChild(inp);
       body.appendChild(wrap);
 
+      // 模式切换
+      var seg = el("div", "searchmode");
+      [["index", "符号索引", "查定义，快；只懂字面，索引可能过期"],
+       ["grep", "内容 grep", "查每一行，慢；永远是当前磁盘状态"]].forEach(function (m) {
+        var on = state.searchMode === m[0];
+        var b = el("button", "searchmode__btn" + (on ? " is-on" : ""));
+        b.type = "button";
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+        b.setAttribute("data-tip", m[2]);
+        b.textContent = m[1];
+        b.addEventListener("click", function () {
+          state.searchMode = m[0];
+          state.searchHits = undefined;      // 换模式后旧结果无效
+          renderRail();
+          if (state.searchQuery) doSearch(state.searchQuery);
+        });
+        seg.appendChild(b);
+      });
+      body.appendChild(seg);
+
       if (!Backend.available()) {
         body.appendChild(emptyHint("后端未连接",
-          "搜索由后端复用 agent 的 grep 工具执行。"));
+          "两种搜索都由后端执行：索引是符号表，grep 复用 agent 的工具。"));
         return;
       }
 
@@ -1223,45 +1302,49 @@
           renderRail();
           return;
         }
-        state.searchHits = null;      // 搜索中
+        state.searchHits = null;
         state.searchError = null;
         renderRail();
-        // 重绘后输入框是新的，恢复焦点与光标
-        window.Harness.workspaceSearch(state.workspace, q)
-          .then(function (r) {
-            if (r && r.error) {
-              state.searchHits = { error: r.error, detail: r.detail || "" };
-            } else {
-              state.searchHits = r;
-            }
-            renderRail();
-            var ni = $("#rail-body input[type=search]");
-            if (ni) { ni.focus(); ni.setSelectionRange(ni.value.length, ni.value.length); }
-          })
-          .catch(function (e) {
-            state.searchError = String(e && e.message || e);
-            state.searchHits = null;
-            renderRail();
-          });
+
+        var p = state.searchMode === "index"
+          ? Backend.indexSearch(q)
+          : window.Harness.workspaceSearch(state.workspace, q);
+        p.then(function (r) {
+          if (r && r.error) {
+            state.searchHits = { error: r.error, detail: r.detail || "" };
+          } else {
+            state.searchHits = r;
+          }
+          renderRail();
+          var ni = $("#rail-body input[type=search]");
+          if (ni) { ni.focus(); ni.setSelectionRange(ni.value.length, ni.value.length); }
+        }).catch(function (e) {
+          state.searchError = String(e && e.message || e);
+          state.searchHits = null;
+          renderRail();
+        });
       };
 
       var timer = null;
       inp.addEventListener("input", function () {
         if (timer) clearTimeout(timer);
         var v = inp.value;
-        timer = setTimeout(function () { doSearch(v); }, 260);
+        // 索引模式可以更灵敏（查表很快）；grep 慢，多等一会儿再发
+        timer = setTimeout(function () { doSearch(v); },
+                           state.searchMode === "index" ? 200 : 380);
       });
       inp.addEventListener("keydown", function (e) {
         if (e.key === "Enter") { if (timer) clearTimeout(timer); doSearch(inp.value); }
       });
 
-      // 首次进入且没有查过 → 提示怎么用（不自动搜，避免打开就触发全库扫描）
-      if (state.searchHits === undefined || state.searchHits === null) {
-        if (!state.searchQuery) {
-          body.appendChild(emptyHint("输入关键词开始搜索",
-            "搜索复用 agent 使用的 grep 工具，逐文件匹配内容。"));
-          return;
-        }
+      if (!state.searchQuery) {
+        body.appendChild(emptyHint(
+          state.searchMode === "index" ? "输入符号名开始查定义" : "输入关键词开始搜内容",
+          state.searchMode === "index"
+            ? "索引是**符号索引 + 词表倒排**，不是语义索引：它只懂字面。"
+              + "搜「处理完成判定的那段逻辑」这类意图搜不到。"
+            : "grep 逐文件匹配内容，无索引、无语义理解，但结果永远是当前磁盘状态。"));
+        return;
       }
       if (state.searchError) {
         body.appendChild(emptyHint("搜索失败", state.searchError));
@@ -1277,6 +1360,72 @@
         return;
       }
 
+      // ── 索引模式的结果 ──
+      if (state.searchMode === "index") {
+        var syms = (state.searchHits && state.searchHits.symbols) || [];
+        var files = (state.searchHits && state.searchHits.files) || [];
+
+        // 过期要显眼 —— 过期索引的结果**看起来正常但可能是旧的**
+        if (state.searchHits && state.searchHits.stale) {
+          var sb = el("div", "stalebar");
+          sb.appendChild(el("span", null, "索引已过期"));
+          sb.appendChild(el("span", "stalebar__detail",
+            (state.searchHits.stale_detail || "") + "（结果可能不含最新改动）"));
+          var rb = el("button", "dbtn", "重建索引");
+          rb.type = "button";
+          rb.addEventListener("click", function () {
+            UI.toast({ tone: "info", title: "正在重建索引…", duration: 2000 });
+            Backend.loadIndex(true).then(function () { doSearch(state.searchQuery); });
+          });
+          sb.appendChild(rb);
+          body.appendChild(sb);
+        }
+
+        var h1 = el("div", "sect__head");
+        h1.appendChild(el("span", null, "定义（强证据） · " + syms.length + " 处"));
+        body.appendChild(h1);
+        if (!syms.length) {
+          body.appendChild(emptyHint("没有符号命中",
+            "索引里没有以「" + state.searchQuery + "」开头的符号定义。"
+            + "换内容 grep 模式可以搜到「提到过这个词」的位置。"));
+        } else {
+          syms.forEach(function (sm) {
+            var it = el("button", "fileitem fileitem--sym");
+            it.type = "button";
+            it.appendChild(svg(ICONS[sm.kind === "class" ? "book" : "edit"], "fileitem__icon"));
+            var box = el("div");
+            box.style.minWidth = "0";
+            box.style.flex = "1 1 auto";
+            var l1 = el("div", "symname", sm.name);
+            var l2 = el("div", "sympath", sm.kind + " · " + sm.path + ":" + sm.line);
+            box.appendChild(l1);
+            box.appendChild(l2);
+            it.appendChild(box);
+            it.addEventListener("click", function () { openTab(sm.path); });
+            body.appendChild(it);
+          });
+        }
+
+        var h2 = el("div", "sect__head sect__head--sub");
+        h2.appendChild(el("span", null, "提到该词的文件（弱证据） · " + files.length));
+        body.appendChild(h2);
+        files.slice(0, 40).forEach(function (f) {
+          var it2 = el("button", "fileitem");
+          it2.type = "button";
+          it2.appendChild(svg(ICONS.file, "fileitem__icon"));
+          it2.appendChild(el("span", "fileitem__name truncate", f));
+          it2.addEventListener("click", function () { openTab(f); });
+          body.appendChild(it2);
+        });
+
+        var note1 = el("div", "dnote");
+        note1.textContent = "「定义」与「提到」是两种强度的证据，不要混用。"
+          + "索引不含跨文件调用关系（谁调用了谁）。";
+        body.appendChild(note1);
+        return;
+      }
+
+      // ── grep 模式的结果 ──
       var lines = (state.searchHits && state.searchHits.lines) || [];
       var hr = el("div", "sect__head");
       hr.appendChild(el("span", null, state.searchQuery + " · " + lines.length + " 行"));
@@ -1305,8 +1454,6 @@
         body.appendChild(it);
       });
       var note = el("div", "dnote");
-      // **说明搜索范围有限**：grep 是逐文件文本匹配，没有索引，
-      // 也不理解语义。不写这句会让人以为这是全文检索。
       note.textContent = (state.searchHits && state.searchHits.engine
         ? "引擎：" + state.searchHits.engine : "")
         + " —— 逐文件文本匹配，无索引、无语义理解。";
@@ -3411,17 +3558,45 @@
           } },
       ]);
     });
+    /* 状态栏"改动"入口 —— 从**真实 git status** 读，不是诊断。
+       原来这里列的是编造的 lint 警告（"reconnect.ts:22 未使用的常量"），
+       而那个文件根本不存在。harness 不做 lint/类型检查，
+       但**"工作区改了多少东西"是真实可得的**，而且对 agent 类界面更有用。 */
     $("#btn-diag").addEventListener("click", function (e) {
       var r = this.getBoundingClientRect();
-      // 原来这里列了"reconnect.ts:22 未使用的常量"之类 —— 全是编的，
-      // 而且指向一个不存在的文件。**harness 不做 lint / 类型检查**，
-      // 所以没有真实的诊断可列。这里如实说明，而不是继续编两条。
-      UI.contextMenu(r.left - 100, r.top - 84, [
-        { label: "无诊断来源", icon: ICONS.help, disabled: true },
-        { sep: true },
-        { label: "harness 不做 lint/类型检查", icon: ICONS.book, disabled: true },
-        { label: "看代码改动 → 会话历史", icon: ICONS.file, onClick: function () { goView("sessions"); } },
-      ]);
+      var items = [];
+      var g = state.gitStatus;
+      if (!Backend.available()) {
+        items.push({ label: "后端未连接", icon: ICONS.help, disabled: true });
+      } else if (state.gitError) {
+        items.push({ label: "读取失败：" + state.gitError, icon: ICONS.warning, disabled: true });
+      } else if (!g) {
+        items.push({ label: "正在读取工作区改动…", icon: ICONS.help, disabled: true });
+        Backend.loadGitStatus();
+      } else if (!g.is_repo) {
+        items.push({ label: "不在 git 仓库中", icon: ICONS.help, disabled: true });
+        items.push({ label: "因此没有改动统计（这不等于没有改动）", icon: ICONS.help, disabled: true });
+      } else {
+        items.push({ label: g.changed + " 个文件有改动", icon: ICONS.edit, disabled: true });
+        if (g.staged) items.push({ label: "已暂存 " + g.staged + " 个", icon: ICONS.check, disabled: true });
+        if (g.unstaged) items.push({ label: "未暂存 " + g.unstaged + " 个", icon: ICONS.warning, disabled: true });
+        if (g.untracked) items.push({ label: "未跟踪 " + g.untracked + " 个", icon: ICONS.plus, disabled: true });
+        items.push({ label: "+" + g.added_lines + " / −" + g.deleted_lines + " 行", icon: ICONS.edit, disabled: true });
+        items.push({ sep: true });
+        (g.paths || []).slice(0, 8).forEach(function (pth) {
+          items.push({
+            label: pth, icon: ICONS.file,
+            onClick: function () { if (/\.[a-z0-9]+$/i.test(pth)) openTab(pth); },
+          });
+        });
+        if ((g.paths || []).length > 8) {
+          items.push({ label: "还有 " + (g.paths.length - 8) + " 个…", disabled: true });
+        }
+        items.push({ sep: true });
+        items.push({ label: "刷新", icon: ICONS.clock, onClick: function () { Backend.loadGitStatus(); } });
+      }
+      items.push({ label: "harness 不做 lint/类型检查（无诊断来源）", icon: ICONS.help, disabled: true });
+      UI.contextMenu(r.left - 120, r.top - 200, items);
     });
     $("#btn-meter").addEventListener("click", showTokenDetail);
 
@@ -3489,26 +3664,29 @@
       }
     }
 
+    /* 重建代码索引。
+       ## 这个 harness 之前**真的没有索引**，现在有（本轮补上）
+       它是**符号索引 + 词表倒排**（函数/类/常量定义 + 词→文件），
+       不是语义索引。索引的边界写在 incident 说明里，前端也照实展示 ——
+       编一个"已索引 · 18.6 万 token"比没有索引更坏。 */
     function refreshIndex() {
-      // 这个 harness **没有代码索引**（搜索走 grep 工具）。
-      // 所以这里不假装"正在重建索引"，而是如实说明并重新读一次工作区概要。
       if (!Backend.available()) {
         UI.toast({ tone: "warning", title: "后端未连接",
-                   desc: "工作区信息由 harness 提供。", duration: 5000 });
+                   desc: "索引由 harness 建立。", duration: 5000 });
         return;
       }
-      Backend.loadWorkspaceInfo().then(function (info) {
-        if (!info) {
-          UI.toast({ tone: "danger", title: "读取工作区失败",
-                     desc: state.wsInfoError || "", duration: 5000 });
+      UI.toast({ tone: "info", title: "正在重建索引…", duration: 2000 });
+      Backend.loadIndex(true).then(function (ix) {
+        if (!ix) {
+          UI.toast({ tone: "danger", title: "建立索引失败",
+                     desc: state.indexError || "未知原因", duration: 5000 });
           return;
         }
         UI.toast({
-          tone: "info", duration: 6000,
-          title: "工作区：" + info.files + " 个文件 · " + info.dirs + " 个目录",
-          desc: "**没有代码索引** — " + info.index_note
-            + "（扫描上限：深度 " + info.scan.max_depth
-            + "、最多 " + info.scan.max_files + " 个文件）",
+          tone: "ok", duration: 6000,
+          title: "索引已重建：" + ix.unique_symbols + " 个符号 · " + ix.files + " 个文件",
+          desc: "这是**符号索引 + 词表倒排**，不是语义索引（只懂字面）。"
+            + "语言分布：" + Object.keys(ix.languages || {}).join("、"),
         });
       });
     }
@@ -3541,6 +3719,57 @@
       if (dot) dot.className = "statusitem__dot statusitem__dot--ok";
     }
 
+    /* 状态栏右侧：索引徽标与改动统计。
+       ## 为什么单独一个函数、而不是塞进 renderBranchChip
+       它俩职责不同：renderBranchChip 管**顶栏**（仓库名/分支/终端标题），
+       这里管**状态栏**。混在一起的后果实测到了：loadGitStatus() 只调
+       renderStatusbar，而填充代码写在了 renderBranchChip 里 —— 于是
+       状态栏永远显示"读取中"。**函数名与职责不符，接线就会漏。**
+       拆开后，每个加载器调自己那个渲染函数，一眼能看出对不对。 */
+    function renderStatusMetrics() {
+      // **必须自己取一次 info** —— 这段代码是从 renderBranchChip 里拆出来的，
+      // 而那边有个 `var info = state.wsInfo;` 在函数作用域里。
+      // 拆出来后它会变成**未声明的自由变量**，运行时抛
+      // `ReferenceError: info is not defined`，而整个 app 的初始化因此中断
+      // （症状是"页面看着在，但所有数据都是读取中"）。
+      // 拆分时最容易漏的就是这类**隐式依赖外层局部变量**的引用。
+      var info = state.wsInfo;
+      var il = $("#status-index-label");
+      if (il) {
+        // 有索引时优先报索引里的文件数（更准），否则退回目录扫描的计数
+        var ix = state.indexInfo;
+        il.textContent = ix
+          ? (ix.unique_symbols + " 符号 · " + ix.files + " 文件")
+          : (info ? ((info.truncated ? "≥" : "") + info.files + " 文件")
+                  : (Backend.available() ? "读取中" : "未连接"));
+      }
+      // 改动统计（真实的 git 状态，不是诊断）
+      var sc = $("#status-changes");
+      if (sc) {
+        var gg = state.gitStatus;
+        if (!Backend.available()) {
+          sc.textContent = "未连接";
+        } else if (state.gitError) {
+          sc.textContent = "读取失败";
+        } else if (!gg) {
+          sc.textContent = "读取中";
+        } else if (!gg.is_repo) {
+          sc.textContent = "非 git 仓库";
+        } else if (gg.changed === 0) {
+          sc.textContent = "无改动";
+        } else {
+          sc.textContent = gg.changed + " 改动  +" + gg.added_lines + " −" + gg.deleted_lines;
+        }
+        var dg = $("#btn-diag");
+        if (dg) {
+          dg.setAttribute("data-tip", gg && gg.is_repo
+            ? ("工作区改动：" + gg.changed + " 个文件，+" + gg.added_lines
+               + " / −" + gg.deleted_lines + " 行\n（git 统计，不是 lint 诊断）")
+            : "工作区改动（git 统计，不是 lint 诊断）");
+        }
+      }
+    }
+
     /* 把真实工作区信息填进顶栏 / 状态栏 / 终端标题。
        这些位置原本是**硬编码在 index.html 里的 mock 字样**
        （仓库名 crucible-core、分支 feat/stream-reconnect、
@@ -3566,11 +3795,6 @@
       if (tt) tt.textContent = name ? ("shell — " + name) : "shell";
       var tp = $("#term-prompt");
       if (tp) tp.textContent = (name || "workspace") + " $";
-      var il = $("#status-index-label");
-      if (il) {
-        il.textContent = info ? ((info.truncated ? "≥" : "") + info.files + " 文件")
-                              : (Backend.available() ? "读取中" : "未连接");
-      }
       var dot = $("#btn-index .statusitem__dot");
       if (dot && info) dot.className = "statusitem__dot statusitem__dot--ok";
     }
@@ -3580,6 +3804,9 @@
     uiHooks.updateMeter = updateMeter;
     uiHooks.renderStatusbar = renderStatusbar;
     uiHooks.renderBranchChip = renderBranchChip;
+    uiHooks.renderStatusMetrics = renderStatusMetrics;
+    // 首屏把状态栏指标画一次（此时数据可能还没到，会显示"读取中"）
+    renderStatusMetrics();
 
     // ---------- 计划视图 ----------
     $("#plan-toggle").addEventListener("click", function () {
@@ -4218,6 +4445,8 @@
         }
         Backend.loadChainSummary();
         Backend.loadRuns();
+        Backend.loadGitStatus();
+        Backend.loadIndex(false);
         // 工作区可能被改动了 → 让文件树与工作区概要失效重读。
         // **不清缓存的话，改完文件后树里还是旧的** ——
         // 那会让人以为 agent 没生效。
@@ -4305,6 +4534,8 @@
         // 三个只读查询并发发出 —— 串行会让首屏白等三倍。
         Backend.loadWorkspaceInfo();
         Backend.loadTree("");
+        Backend.loadGitStatus();
+        Backend.loadIndex(false);
         uiHooks.updateMeter();
         // 把已保存的模型接入配置反映到界面。
         // 若未配置，状态栏模型会显示"未配置"并在 title 里提示点此接入 ——

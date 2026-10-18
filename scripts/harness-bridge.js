@@ -739,6 +739,15 @@
   function workspaceTerminal(workspace, cmd) {
     return get("/api/workspace/terminal" + wsQuery(workspace, { cmd: cmd }));
   }
+  function workspaceGitStatus(workspace) {
+    return get("/api/workspace/git-status" + wsQuery(workspace, {}));
+  }
+  function workspaceIndex(workspace, rebuild) {
+    return get("/api/workspace/index" + wsQuery(workspace, { rebuild: rebuild ? 1 : 0 }));
+  }
+  function indexQuery(workspace, q) {
+    return get("/api/workspace/index/query" + wsQuery(workspace, { q: q }));
+  }
 
   /* ---------- 回滚 ---------- */
   function rollback(runId, changeId, workspace) {
@@ -1021,6 +1030,9 @@
     workspaceInfo: workspaceInfo,
     workspaceSearch: workspaceSearch,
     workspaceTerminal: workspaceTerminal,
+    workspaceGitStatus: workspaceGitStatus,
+    workspaceIndex: workspaceIndex,
+    indexQuery: indexQuery,
     rollback: rollback,
 
     // 翻译（纯函数，便于单测）

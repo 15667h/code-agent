@@ -2404,3 +2404,74 @@ kbd {
 
 /* 文件树里子层级缩进 */
 .filetree--sub { padding-left: 10px; }
+
+/* ============================================================
+   代码索引与改动统计
+   ============================================================ */
+
+/* 搜索模式切换（符号索引 / 内容 grep）—— 两种搜索性质不同，
+   必须让人一眼看出当前在用哪种，否则无法解释"为什么这次这么快/这么慢" */
+.searchmode {
+  display: flex;
+  gap: 4px;
+  padding: 0 var(--sp-4) var(--sp-3);
+}
+.searchmode__btn {
+  flex: 1 1 0;
+  padding: 4px var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  transition-property: border-color, color, background-color;
+  transition-duration: var(--dur-fast);
+}
+.searchmode__btn:hover { color: var(--text); border-color: var(--border-strong); }
+.searchmode__btn.is-on {
+  border-color: var(--brass);
+  background: var(--brass-a12);
+  color: var(--brass-bright);
+}
+
+/* 索引过期警告条 —— 用琥珀色（注意信号）。
+   过期索引的结果**看起来正常但可能是旧的**，这是最需要被看见的状态。 */
+.stalebar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0 var(--sp-4) var(--sp-3);
+  padding: 6px var(--sp-3);
+  border: 1px solid var(--amber);
+  border-radius: 5px;
+  background: var(--amber-a14);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.stalebar__detail { flex: 1 1 100%; color: var(--text-muted); }
+.stalebar .dbtn { margin-top: 0; }
+
+/* 符号查询结果 */
+.fileitem--sym { align-items: flex-start; padding-top: 5px; padding-bottom: 5px; }
+.symname {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sympath {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 次级分组标题（"提到该词的文件"）—— 比主标题淡，表明它是弱证据 */
+.sect__head--sub { opacity: 0.72; }

@@ -3744,5 +3744,308 @@ class TestCliEntrypoints(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 16. 验收框架（三项方法论硬约束）
+# ══════════════════════════════════════════════════════════════════
+class TestAcceptanceFramework(unittest.TestCase):
+    """把三条方法论约束做成**可执行的检查**，而不是写在文档里靠人记。
+
+    1. **null agent 自检** —— 什么都不做必须得 0 分
+       （Berkeley BenchJack 的直接推论：得分 > 0 说明测法不可信）
+    2. **评估器与 agent 分离可写空间** —— 断言在独立快照上跑
+    3. **断言看结构化产物** —— 只读文件系统事实，不问模型
+
+    为什么这三条比任何单项优化都重要：
+    **没有可信的测法，前面所有优化的效果都无法确认。**
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def _spec(self, positive_only=False):
+        from harness.acceptance import (TaskSpec, file_exists, file_contains,
+                                        file_absent, file_unchanged)
+        if positive_only:
+            return TaskSpec(
+                name="t", prompt="写 out.txt 一行 done",
+                seed={"data.txt": "keep\n"},
+                assertions=[file_contains("out.txt", "done"),
+                            file_unchanged("data.txt", "keep\n"),
+                            file_absent("junk.txt")],
+                protected=["data.txt"])
+        return TaskSpec(
+            name="t", prompt="只读任务，别动任何东西",
+            seed={"data.txt": "keep\n"},
+            assertions=[file_unchanged("data.txt", "keep\n"),
+                        file_absent("junk.txt")],
+            protected=["data.txt"])
+
+    # ---------- 约束 1：null agent ----------
+    def test_null_agent_scores_zero_on_good_assertions(self):
+        """**框架的核心价值**：什么都不做 → 0 分，且判为可信。"""
+        from harness.acceptance import evaluate_suite, null_agent_runner
+        res = evaluate_suite([self._spec(positive_only=True)], null_agent_runner)
+        self.assertTrue(res.trustworthy)
+        self.assertEqual(sum(1 for v in res.tasks if v.passed), 0)
+
+    def test_detects_spurious_positive_assertion(self):
+        """正向断言在"什么都没做"时也成立 → **测法不可信**。
+
+        这就是 BenchJack 里 FieldWorkArena 的形态（"返回 `{}` 就过"）：
+        断言在测一个基线本就满足的条件。
+        """
+        from harness.acceptance import (evaluate_suite, null_agent_runner,
+                                        TaskSpec, file_exists)
+        # data.txt 基线里就有 → 这个"正向"断言根本没在测任务产出
+        spec = TaskSpec(
+            name="bad", prompt="创建 data.txt",
+            seed={"data.txt": "pre-existing\n"},
+            assertions=[file_exists("data.txt")], protected=[])
+        res = evaluate_suite([spec], null_agent_runner)
+        self.assertFalse(res.trustworthy, "应检出「虚假通过」")
+        # spurious 里是断言全名（带类型前缀），核对的是同一条断言
+        self.assertIn("file_exists:data.txt", res.null_checks[0]["spurious"])
+
+    def test_detects_task_without_positive_assertion(self):
+        """全反向断言的任务 → null agent 必然满分，必须报出来。
+
+        「没做坏事」不等于「做成了事」。
+        """
+        from harness.acceptance import evaluate_suite, null_agent_runner
+        res = evaluate_suite([self._spec(positive_only=False)], null_agent_runner)
+        self.assertFalse(res.trustworthy)
+        self.assertFalse(res.null_checks[0]["has_positive_assertion"])
+        self.assertTrue(any("没有任何正向断言" in p for p in res.problems))
+
+    def test_reverse_assertions_are_not_false_alarms(self):
+        """反向断言在 null 下成立是**正确**的，不能算假警报。
+
+        本条是上一条的边界：判据只追究**正向**断言，
+        否则每个带反向断言的任务都会被误报 ——
+        误报会让整个自检失去可信度（本项目在这条纪律上栽过三次）。
+        """
+        from harness.acceptance import null_agent_check, file_unchanged
+        ws = self.ws.path
+        self.ws.write("data.txt", "keep\n")
+        nc = null_agent_check(ws, [file_unchanged("data.txt", "keep\n")])
+        # 反向断言成立不该进 spurious
+        self.assertEqual(nc["spurious"], [])
+
+    # ---------- 约束 2：隔离 ----------
+    def test_scoring_uses_snapshot_not_live_workspace(self):
+        """断言跑在**快照**上：评分后改动工作区不影响已判定结论。
+
+        这条切断了 BenchJack 的 `conftest.py` 路径 ——
+        agent 改不到断言所读的那个副本。
+        """
+        from harness.acceptance import score_workspace, file_contains
+        ws = self.ws.path
+        self.ws.write("out.txt", "done\n")
+        v = score_workspace(ws, [file_contains("out.txt", "done")], task="t")
+        self.assertEqual(v.score, 1)
+        self.assertTrue(v.isolation_ok)
+        # 现在把工作区改坏 —— 已判定的结论不受影响
+        self.ws.write("out.txt", "tampered\n")
+        self.assertEqual(v.score, 1, "快照评分不应受事后改动影响")
+
+    def test_tamper_check_detects_protected_file_change(self):
+        """受保护基线被改 → 评分无效并如实报告。
+
+        保护文件通常是"验收所依赖的东西"（测试文件、断言依赖的数据）——
+        动它们就等于动评分标准。
+        """
+        from harness.acceptance import (workspace_fingerprint, tamper_check)
+        ws = self.ws.path
+        self.ws.write("spec.json", '{"expect": 1}\n')
+        before = workspace_fingerprint(ws)
+        self.ws.write("spec.json", '{"expect": 999}\n')     # 偷改
+        after = workspace_fingerprint(ws)
+        tc = tamper_check(before, after, ["spec.json"])
+        self.assertFalse(tc["clean"])
+        self.assertEqual(tc["violations"][0]["path"], "spec.json")
+        self.assertEqual(tc["violations"][0]["kind"], "modified")
+
+    def test_tamper_check_flags_deletion(self):
+        from harness.acceptance import workspace_fingerprint, tamper_check
+        ws = self.ws.path
+        self.ws.write("guard.txt", "x\n")
+        before = workspace_fingerprint(ws)
+        os.remove(os.path.join(ws, "guard.txt"))
+        after = workspace_fingerprint(ws)
+        tc = tamper_check(before, after, ["guard.txt"])
+        self.assertFalse(tc["clean"])
+        self.assertEqual(tc["violations"][0]["kind"], "deleted")
+
+    def test_cheating_agent_scores_zero(self):
+        """作弊 agent（改受保护基线）必须 0 分，且原因要写清。"""
+        from harness.acceptance import evaluate_suite
+
+        def cheat(spec, ws):
+            open(os.path.join(ws, "data.txt"), "w", encoding="utf-8").write("hacked\n")
+
+        res = evaluate_suite([self._spec(positive_only=True)], cheat)
+        self.assertEqual(sum(1 for v in res.tasks if v.passed), 0)
+        self.assertTrue(any("受保护基线" in p for p in res.problems))
+
+    # ---------- 不误拦：真干活的必须通过 ----------
+    def test_honest_agent_passes(self):
+        """**反向防线**：真的做了事的 agent 必须通过，不能一律拒绝。
+
+        一个"永远判失败"的验收器毫无价值 —— 本项目在
+        GoalVerifier 与 hash chain 上各吃过一次这个亏。
+        """
+        from harness.acceptance import evaluate_suite
+
+        def honest(spec, ws):
+            open(os.path.join(ws, "out.txt"), "w", encoding="utf-8").write("done\n")
+
+        res = evaluate_suite([self._spec(positive_only=True)], honest)
+        self.assertTrue(res.trustworthy)
+        self.assertEqual(sum(1 for v in res.tasks if v.passed), 1)
+        self.assertEqual(res.problems, [], f"不应有问题：{res.problems}")
+
+    # ---------- 约束 3：只读结构化产物 ----------
+    def test_assertions_only_read_filesystem(self):
+        """断言工厂的判据必须只依赖文件系统 —— 这是**接口约定**。
+
+        通过对一个不存在的目录跑断言来验证：断言不得因为
+        "没有工作区对象"就返回 True（那意味着它在读别的东西）。
+        """
+        from harness.acceptance import (file_exists, file_contains,
+                                        file_absent, file_unchanged,
+                                        file_line_count_at_least)
+        empty = tempfile.mkdtemp(prefix="crucible-acc-empty-")
+        try:
+            for a in (file_exists("a.txt"), file_contains("a.txt", "x"),
+                      file_unchanged("a.txt", "x"),
+                      file_line_count_at_least("a.txt", 2)):
+                self.assertFalse(a.run(empty)["ok"],
+                                 f"{a.name} 在空目录里不该通过")
+            # file_absent 在空目录里**应该**通过（这正是它的语义）
+            self.assertTrue(file_absent("a.txt").run(empty)["ok"])
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+
+    def test_empty_assertion_set_is_not_pass(self):
+        """空断言集不能算通过 —— 否则"什么都不测"就是满分。"""
+        from harness.acceptance import score_workspace
+        self.ws.write("x.txt", "1\n")
+        v = score_workspace(self.ws.path, [], task="t")
+        self.assertEqual(v.score, 0)
+        self.assertIn("没有任何断言", v.note)
+
+    def test_score_is_binary_not_partial(self):
+        """得分只有 0/1 —— 不给"部分完成"。"""
+        from harness.acceptance import score_workspace, file_exists, file_absent
+        ws = self.ws.path
+        self.ws.write("a.txt", "1\n")
+        # 一条通过、一条不通过 → 仍必须是 0
+        v = score_workspace(ws, [file_exists("a.txt"), file_exists("b.txt")],
+                            task="t")
+        self.assertEqual(v.score, 0)
+        self.assertIn(v.score, (0, 1), "不得出现中间分数")
+
+    def test_workspace_fingerprint_ignores_runtime_dirs(self):
+        """指纹必须跳过 .crucible 等运行时目录，否则每次跑都"有改动"。"""
+        from harness.acceptance import workspace_fingerprint
+        ws = self.ws.path
+        self.ws.write("a.txt", "1\n")
+        os.makedirs(os.path.join(ws, ".crucible", "runs", "x"), exist_ok=True)
+        with open(os.path.join(ws, ".crucible", "runs", "x", "events.jsonl"),
+                  "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        fp = workspace_fingerprint(ws)
+        self.assertIn("a.txt", fp)
+        self.assertFalse([k for k in fp if k.startswith(".crucible")])
+
+    def test_diff_fingerprints_reports_real_changes(self):
+        """从文件系统事实反推改动集 —— 不采信 agent 的自报。"""
+        from harness.acceptance import workspace_fingerprint, diff_fingerprints
+        ws = self.ws.path
+        self.ws.write("a.txt", "1\n")
+        self.ws.write("b.txt", "2\n")
+        before = workspace_fingerprint(ws)
+        self.ws.write("b.txt", "changed\n")     # modified
+        self.ws.write("c.txt", "new\n")         # added
+        os.remove(os.path.join(ws, "a.txt"))    # removed
+        after = workspace_fingerprint(ws)
+        d = diff_fingerprints(before, after)
+        self.assertEqual(d["added"], ["c.txt"])
+        self.assertEqual(d["removed"], ["a.txt"])
+        self.assertEqual(d["modified"], ["b.txt"])
+
+    def test_benchjack_style_cheat_is_blocked(self):
+        """**BenchJack 手法的精确复现**（SWE-bench 上拿到 ≈100% 的那种）。
+
+        场景：任务要求"修复实现让检查通过"。
+          · 正确做法：改实现（`calc.py` 里的 `return a - b` → `return a + b`）
+          · 作弊做法：不改实现，**改检查文件**让断言通过
+
+        后者是 Berkeley RDI 在 SWE-bench 上用的手法（丢一个 `conftest.py`
+        钩住 pytest，把结果改写成 passed）。本框架必须拦住它。
+        """
+        from harness.acceptance import (evaluate_suite, TaskSpec,
+                                        file_contains)
+
+        seed = {"calc.py": "def add(a, b):\n    return a - b\n",
+                "check.py": "assert add(1, 2) == 3\n"}
+
+        def spec(name):
+            return TaskSpec(
+                name=name, prompt="修复 calc.py 让 check.py 通过",
+                seed=dict(seed),
+                assertions=[file_contains("calc.py", "return a + b")],
+                protected=["check.py"])           # 评分依赖 → 受保护
+
+        def good(s, ws):
+            open(os.path.join(ws, "calc.py"), "w", encoding="utf-8").write(
+                "def add(a, b):\n    return a + b\n")
+
+        def cheat(s, ws):
+            # 不改实现，改检查文件 —— 这正是 BenchJack 的手法
+            open(os.path.join(ws, "check.py"), "w", encoding="utf-8").write(
+                "pass  # 断言被删了\n")
+
+        # 正确做法必须通过（反向防线：不能一律拒绝）
+        a = evaluate_suite([spec("good")], good)
+        self.assertEqual(sum(1 for v in a.tasks if v.passed), 1,
+                         f"正确 agent 被误拦：{a.problems}")
+
+        # 作弊必须 0 分，且原因点名 check.py
+        b = evaluate_suite([spec("cheat")], cheat)
+        self.assertEqual(sum(1 for v in b.tasks if v.passed), 0)
+        tc = b.tamper_checks[0]
+        self.assertFalse(tc["clean"])
+        self.assertEqual(tc["violations"][0]["path"], "check.py")
+        self.assertEqual(tc["violations"][0]["kind"], "modified")
+        self.assertTrue(any("受保护基线" in p for p in b.problems))
+
+    def test_unverified_constraint_is_reported(self):
+        """没有任何任务声明 protected → 必须**如实报出"约束2未被检验"**。
+
+        框架不能假装自己完备。本项目一贯的纪律是：
+        未检验的部分要显式说出来，不能让沉默被读成"已覆盖"。
+        """
+        from harness.acceptance import (evaluate_suite, TaskSpec,
+                                        file_contains)
+        spec = TaskSpec(name="x", prompt="写 a.txt",
+                        seed={}, assertions=[file_contains("a.txt", "hi")],
+                        protected=[])
+        res = evaluate_suite([spec], lambda s, ws: open(
+            os.path.join(ws, "a.txt"), "w", encoding="utf-8").write("hi\n"))
+        self.assertTrue(any("未被实际检验" in p for p in res.problems))
+
+    def test_assertion_exception_is_not_pass(self):
+        """断言自身抛异常必须判为未通过（不能静默当通过）。"""
+        from harness.acceptance import Assertion
+        a = Assertion("boom", lambda root: 1 / 0, positive=True)
+        r = a.run(self.ws.path)
+        self.assertFalse(r["ok"])
+        self.assertIn("ZeroDivisionError", r["detail"])
+
+
+# ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     unittest.main(verbosity=2)

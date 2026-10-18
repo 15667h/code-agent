@@ -2764,3 +2764,304 @@ button.agentpanel__model:focus-visible { outline: 2px solid var(--brass); outlin
   .settings__foot { padding: var(--sp-3) var(--sp-4); }
   .settings__foothint { display: none; }
 }
+
+/* ══════════════════════════════════════════════════════════════
+   目录选择器（选择工作区）
+   ══════════════════════════════════════════════════════════════
+   同样的坑要再说一遍：ui-kit.css 在 app.css **之后**加载，它的
+   `.modal { width: min(460px,100%) }` 会把这边压回 460px。
+   所以选择器必须写 `.modalback .modal--picker`（0,2,0）。 */
+.modalback .modal--picker {
+  width: min(820px, 100%);
+  height: min(580px, 88vh);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.picker__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5) var(--sp-3);
+  flex: 0 0 auto;
+}
+.picker__title {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 路径栏 */
+.picker__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-5) var(--sp-3);
+  flex: 0 0 auto;
+}
+.picker__path {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 30px;
+  padding: 0 var(--sp-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--text);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+.picker__path:focus-visible {
+  outline: none;
+  border-color: var(--brass);
+  box-shadow: 0 0 0 2px var(--brass-a20);
+}
+
+/* 两栏：左快捷位 右目录列表 */
+.picker__body {
+  display: grid;
+  grid-template-columns: 172px minmax(0, 1fr);
+  flex: 1 1 auto;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+
+.picker__side {
+  overflow-y: auto;
+  padding: var(--sp-3);
+  border-right: 1px solid var(--border);
+  background: var(--bg-inset);
+}
+.picker__group { margin-bottom: var(--sp-3); }
+.picker__grouptitle {
+  margin: 0 0 var(--sp-1);
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-3xs, 10px);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.picker__quick {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px var(--sp-2);
+  font: inherit;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  background: none;
+  border: 0;
+  border-radius: var(--r-xs, 3px);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.picker__quick:hover { background: var(--surface-hover, rgba(128,128,128,0.12)); color: var(--text); }
+.picker__quick:focus-visible { outline: 2px solid var(--brass); outline-offset: -2px; }
+.picker__crumbitem { font-family: var(--font-mono); }
+
+/* 目录列表 */
+.picker__list {
+  overflow-y: auto;
+  padding: var(--sp-2);
+  min-height: 0;
+}
+.picker__list:focus-visible { outline: none; box-shadow: inset 0 0 0 1px var(--brass-a40); }
+
+.picker__item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: 6px var(--sp-2);
+  font: inherit;
+  font-size: var(--fs-sm);
+  color: var(--text);
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.picker__item:hover,
+.picker__item.is-sel { background: var(--brass-a12, rgba(192,148,64,0.12)); }
+.picker__item:focus-visible { outline: 2px solid var(--brass); outline-offset: -2px; }
+.picker__icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  color: var(--brass);
+  opacity: 0.85;
+}
+.picker__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.picker__tag {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-3xs, 10px);
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.picker__tag--git { color: var(--amber); border-color: var(--amber); opacity: 0.85; }
+
+/* 空态与加载态 */
+.picker__empty { padding: var(--sp-6) var(--sp-4); text-align: center; }
+.picker__emptytitle { font-size: var(--fs-sm); color: var(--text-dim); margin-bottom: var(--sp-1); }
+.picker__emptyhint { font-size: var(--fs-2xs); color: var(--text-faint); line-height: 1.6; }
+.picker__loading { padding: var(--sp-4); font-size: var(--fs-2xs); color: var(--text-faint); }
+
+/* 内联新建文件夹 */
+.picker__new {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  background: var(--bg-inset);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  flex-wrap: wrap;
+}
+.picker__newinput {
+  flex: 1 1 160px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 var(--sp-2);
+  font: inherit;
+  font-size: var(--fs-sm);
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs, 3px);
+}
+.picker__newinput:focus-visible { outline: none; border-color: var(--brass); }
+.picker__newerr {
+  flex: 1 1 100%;
+  font-size: var(--fs-2xs);
+  color: var(--vermilion);
+  line-height: 1.5;
+}
+
+/* 底部 */
+.picker__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5);
+  border-top: 1px solid var(--border);
+  background: var(--bg-inset);
+  flex: 0 0 auto;
+}
+.picker__stat {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+.picker__stat.is-warn { color: var(--amber); }
+.picker__stat.is-bad { color: var(--vermilion); }
+.picker__acts { display: flex; align-items: center; gap: var(--sp-2); flex: 0 0 auto; }
+
+/* 窄屏：快捷位变成顶部一行横向滚动的 chip，把高度全留给目录列表。
+   一开始写的是"左栏改成 flex"，但 .picker__group 内部还是 block ——
+   结果六个快捷位置竖着排下来占了半屏，列表只剩 4 行。 */
+@media (max-width: 700px) {
+  .modalback .modal--picker { height: min(620px, 92vh); }
+  .picker__body {
+    grid-template-columns: minmax(0, 1fr);
+    /* 两行：快捷位按内容高度，列表吃掉剩下的 */
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .picker__side {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--sp-1);
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: var(--sp-2) var(--sp-3);
+    flex: 0 0 auto;
+  }
+  .picker__group {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 2px;
+    margin: 0;
+    flex: 0 0 auto;
+  }
+  .picker__grouptitle { display: none; }
+  .picker__quick {
+    width: auto;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .picker__foot { flex-wrap: wrap; }
+  .picker__acts { width: 100%; justify-content: flex-end; }
+}
+
+/* 状态栏的工作区条目。
+   工作区名可能是"代码开发agent"这种中文长名，也可能是一个很长的路径尾段 ——
+   不截断会把状态栏挤成两行。 */
+.statusitem--ws { max-width: 200px; min-width: 0; }
+.statusitem--ws #status-workspace {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+/* 面包屑：路径栏下方一行。
+   曾经做成左栏里"每级一行"，六层路径就把快捷位置顶出屏幕了 —— 而且
+   它和上面的路径栏表达的是同一件事，占两份地方没有道理。 */
+.picker__crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0;
+  padding: 0 var(--sp-5) var(--sp-3);
+  font-size: var(--fs-2xs);
+  flex: 0 0 auto;
+}
+.picker__crumb {
+  padding: 1px 5px;
+  font: inherit;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  background: none;
+  border: 0;
+  border-radius: var(--r-xs, 3px);
+  cursor: pointer;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.picker__crumb:hover { color: var(--text); background: var(--brass-a12, rgba(192,148,64,0.12)); }
+.picker__crumb:focus-visible { outline: 2px solid var(--brass); outline-offset: -1px; }
+.picker__crumbsep { color: var(--text-faint); padding: 0 1px; }
+
+/* 路径栏与标题栏里的按钮**不许被压缩**。
+   400px 下实测：路径输入框 flex-grow 把 ↑ 按钮挤到对话框边界之外，
+   只剩半个箭头露在外面 —— 看起来像图标坏了。 */
+.picker__bar > .iconbtn,
+.picker__bar > .btn,
+.picker__head > .iconbtn { flex: 0 0 auto; }

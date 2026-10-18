@@ -750,6 +750,22 @@
   function workspaceSearch(workspace, q, limit) {
     return get("/api/workspace/search" + wsQuery(workspace, { q: q, limit: limit || 200 }));
   }
+  /* 列本机目录，供"选择工作区"。
+     与 workspace 无关 —— 它的用途就是去看工作区**之外**的地方，
+     所以刻意不接受 workspace 参数。 */
+  function fsList(path) {
+    return get("/api/fs/list" + wsQuery(null, { path: path || "" }));
+  }
+  /* 把一个工作区的模型配置复制到另一个。
+     配置存在 <workspace>/.crucible/config.json，换工作区必然"这个目录还没配过"；
+     这里只做显式的沿用，不自动。 */
+  function copyConfig(from, to) {
+    return post("/api/config/copy", { from: from, to: to })
+      .then(function (r) { return r.body || {}; })
+      .catch(function (e) {
+        return { ok: false, error: "network", detail: String(e && e.message || e) };
+      });
+  }
   function workspaceTerminal(workspace, cmd) {
     return get("/api/workspace/terminal" + wsQuery(workspace, { cmd: cmd }));
   }
@@ -1044,6 +1060,8 @@
     workspaceCreate: workspaceCreate,
     workspaceInfo: workspaceInfo,
     workspaceSearch: workspaceSearch,
+    fsList: fsList,
+    copyConfig: copyConfig,
     workspaceTerminal: workspaceTerminal,
     workspaceGitStatus: workspaceGitStatus,
     workspaceIndex: workspaceIndex,

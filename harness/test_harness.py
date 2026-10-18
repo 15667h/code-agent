@@ -4092,6 +4092,250 @@ class TestServerStartupModes(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 14.4b 选择工作区（目录浏览 / 危险目录 / 配置沿用）
+# ══════════════════════════════════════════════════════════════════
+class TestWorkspacePicker(unittest.TestCase):
+    """「能不能开个新项目在里面干活」。
+
+    在此之前工作区**只能**由 `--workspace` 或 URL 的 `?workspace=` 指定 ——
+    界面里没有任何入口。想开新项目就得先建目录、停服务、带参数重启。
+    这不是"限制得保守"，是缺了一整块功能。
+
+    这一组钉三件事：
+
+      1. 目录浏览能看本机任意位置，且**错误分支的返回形状与成功一致**
+         （不一致时前端会画出空白列表，用户会以为"这台机器没有目录"）
+      2. 危险目录（盘符根 / 系统目录）**在浏览时就给出理由**，
+         不是等点了"选择"才报错
+      3. 模型配置按工作区存储，所以换目录必然"这个目录还没配过" ——
+         必须能显式沿用一份；**但不能自动沿用**（自动的话用户会以为
+         在新项目里用的是 A 模型，实际沿用了上个项目的 B）
+    """
+
+    def test_fs_list_lists_dirs_only_and_reports_hidden(self):
+        from harness.server import _fs_list
+        ws = TempWorkspace()
+        try:
+            os.makedirs(os.path.join(ws.path, "alpha"))
+            os.makedirs(os.path.join(ws.path, "beta", "inner"))
+            os.makedirs(os.path.join(ws.path, ".hidden_only"))
+            with open(os.path.join(ws.path, "a_file.txt"), "w", encoding="utf-8") as f:
+                f.write("x")
+
+            d = _fs_list(ws.path)
+            names = [e["name"] for e in d["entries"]]
+
+            # 只列目录。这个端点的用途是"选一个工作区根"，列文件没用。
+            self.assertNotIn("a_file.txt", names,
+                             "列目录端点把文件也列出来了 —— 它的用途是选工作区根")
+            self.assertIn("alpha", names)
+            self.assertIn("beta", names)
+            # 点开头的隐藏目录不进列表，但**必须报个数** ——
+            # 静默省略会让人以为磁盘上就这么多东西
+            self.assertNotIn(".hidden_only", names)
+            self.assertEqual(d["skipped_hidden"], 1,
+                             "跳过的隐藏目录没有如实报数")
+
+            self.assertEqual(d["path"], os.path.realpath(ws.path))
+            self.assertIs(d["usable"], True)
+            self.assertIsNone(d["blocked_reason"])
+            self.assertFalse(d["truncated"])
+
+            # 项目标志：方便用户认出"这是一个项目，不是随便一个文件夹"
+            with open(os.path.join(ws.path, "beta", "package.json"),
+                      "w", encoding="utf-8") as f:
+                f.write("{}")
+            d2 = _fs_list(ws.path)
+            beta = [e for e in d2["entries"] if e["name"] == "beta"][0]
+            self.assertEqual(beta["project"], "package.json",
+                             "含 package.json 的目录没有被识别为项目")
+        finally:
+            ws.cleanup()
+
+    def test_fs_list_errors_keep_the_way_back(self):
+        """路径不存在 / 不是目录 / 没权限时，**仍然要能退回去**。
+
+        只回一个 400 空 body 的话，选择器会停在一个走不出去的界面上 ——
+        这比"报错"更糟：用户会以为整个浏览功能坏了。
+        """
+        from harness.server import _fs_list
+        ws = TempWorkspace()
+        try:
+            missing = os.path.join(ws.path, "no-such-dir")
+            d = _fs_list(missing)
+            self.assertEqual(d["error"], "not_found")
+            self.assertTrue(d["parent"], "路径不存在时没有 parent —— 用户退不回去")
+            self.assertTrue(d["drives"], "路径不存在时没有盘符列表 —— 用户换不了盘")
+            self.assertIs(d["usable"], False)
+            self.assertTrue(d["detail"], "拒绝时要给人话，不能只有错误码")
+
+            f = os.path.join(ws.path, "a.txt")
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write("x")
+            d2 = _fs_list(f)
+            self.assertEqual(d2["error"], "not_a_dir")
+            self.assertIn("parent", d2)
+            self.assertIs(d2["usable"], False)
+
+            # **所有分支的字段必须一致** —— 前端读 undefined 会把
+            # "不能选"当成"能选"（undefined 是 falsy，但 `data.entries.length`
+            # 会直接抛异常，整个列表画不出来）
+            for k in ("entries", "shortcuts", "drives", "truncated",
+                      "usable", "blocked_reason", "parent", "path"):
+                self.assertIn(k, d, "not_found 分支缺字段 %r" % k)
+                self.assertIn(k, d2, "not_a_dir 分支缺字段 %r" % k)
+        finally:
+            ws.cleanup()
+
+    def test_dangerous_directories_are_named_at_browse_time(self):
+        """盘符根 / 系统目录：**浏览时**就带理由，不是点"选择"才拒。
+
+        这条是"先解释再拒绝"而不是"先允许再出事"：把 C:\\Windows 设成
+        工作区，agent 的写操作会直接改系统文件。
+        """
+        from harness.server import _fs_list, _dangerous_workspace
+        ws = TempWorkspace()
+        try:
+            # 普通目录可用
+            self.assertIsNone(_dangerous_workspace(ws.path))
+            self.assertIs(_fs_list(ws.path)["usable"], True)
+
+            if os.name == "nt":
+                drive_root = os.environ.get("SystemDrive", "C:") + "\\"
+                d = _fs_list(drive_root)
+                self.assertIs(d["usable"], False, "盘符根被判成可用工作区")
+                self.assertTrue(d["blocked_reason"],
+                                "盘符根不可用，却没给出理由")
+                self.assertIn("盘符根", d["blocked_reason"])
+
+                win = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"))
+                reason = _dangerous_workspace(win)
+                self.assertTrue(reason, "系统目录没有被拦住")
+                self.assertIn("系统目录", reason)
+                # 子目录同样拦住 —— 只挡根目录没用
+                self.assertTrue(_dangerous_workspace(os.path.join(win, "System32")),
+                                "系统目录的子目录没有被拦住")
+        finally:
+            ws.cleanup()
+
+    def _free_port(self):
+        """拿一个空闲端口。
+
+        `_port()` 是别的测试类里的方法，这里不继承它 ——
+        继承一个只为了借一个 5 行函数，会让两个测试类产生不该有的耦合。
+        """
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    def test_fs_list_endpoint_and_config_adoption(self):
+        """两个新端点的端到端行为。
+
+        · `GET /api/fs/list` 列出任意本机目录，路径不存在也给 parent
+        · `POST /api/config/copy` 显式沿用一个工作区的模型配置，
+          且**不落明文 key**、**不在目标不存在时凭空建目录**
+        """
+        import urllib.parse
+        import urllib.request
+        from harness.model import EndpointConfig, save_config
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        port = self._free_port()
+        src = TempWorkspace()
+        dst = TempWorkspace()
+        blank = TempWorkspace()
+        proc = None
+        try:
+            os.makedirs(os.path.join(src.path, "proj-x"))
+            save_config(src.path, EndpointConfig(
+                base_url="http://example.invalid/v1",
+                api_key="sk-test-1234",
+                model="m-test"))
+
+            proc = subprocess.Popen(
+                [sys.executable, "harness/server.py", "--port", str(port)],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(60):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/api/health", timeout=1) as r:
+                        if json.load(r).get("ok"):
+                            break
+                except Exception:
+                    time.sleep(0.1)
+
+            def get(path):
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}{path}", timeout=10) as r:
+                    return json.load(r)
+
+            def post(path, body):
+                payload = json.dumps(body).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}", data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        return r.status, json.load(r)
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read().decode("utf-8"))
+
+            q = urllib.parse.quote
+
+            # ① 列目录：能看见刚建的子目录
+            d = get("/api/fs/list?path=" + q(src.path))
+            self.assertIn("proj-x", [e["name"] for e in d["entries"]],
+                          "列目录端点看不到真实存在的子目录")
+            self.assertIs(d["usable"], True)
+
+            # ② 路径不存在：**不是 400 空 body**，要带 parent 让用户退回去
+            d2 = get("/api/fs/list?path=" + q(os.path.join(src.path, "nope")))
+            self.assertEqual(d2.get("error"), "not_found")
+            self.assertTrue(d2.get("parent"))
+
+            # ③ 配置沿用：dst 本来没配置
+            self.assertFalse(
+                get("/api/config?workspace=" + q(dst.path))["endpoint"]["configured"])
+            st, b = post("/api/config/copy", {"from": src.path, "to": dst.path})
+            self.assertTrue(b.get("ok"), f"沿用失败了：{b}")
+            self.assertTrue(b["endpoint"]["configured"])
+            # **不回明文 key** —— 沿用不是"把密码打到屏幕上"的理由
+            self.assertNotIn("sk-test-1234", json.dumps(b),
+                             "沿用接口把明文 key 回传了")
+            self.assertTrue(
+                get("/api/config?workspace=" + q(dst.path))["endpoint"]["configured"])
+
+            # ④ 目标目录不存在 → 拒绝，且**不凭空建出来**
+            #    （拼错一个路径就在别处留下一份带明文 key 的文件，是这里最坏的结果）
+            ghost = os.path.join(src.path, "ghost")
+            st, b2 = post("/api/config/copy", {"from": src.path, "to": ghost})
+            self.assertFalse(b2.get("ok"))
+            self.assertFalse(os.path.exists(ghost),
+                             "目标目录不存在，却被建出来了")
+            self.assertFalse(os.path.exists(os.path.join(ghost, ".crucible")),
+                             "在不存在的工作区里写出了配置目录")
+
+            # ⑤ 源没配置 → 说清是"源没有"，不是笼统的"失败"
+            st, b3 = post("/api/config/copy", {"from": blank.path, "to": dst.path})
+            self.assertFalse(b3.get("ok"))
+            self.assertEqual(b3.get("error"), "source_not_configured",
+                             "源没配置时的原因码不对，用户不知道下一步该做什么")
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            src.cleanup()
+            dst.cleanup()
+            blank.cleanup()
+
+
+# ══════════════════════════════════════════════════════════════════
 # 14.5 前端接线（静态检查）
 # ══════════════════════════════════════════════════════════════════
 class TestFrontendWiring(unittest.TestCase):
@@ -4243,6 +4487,118 @@ class TestFrontendWiring(unittest.TestCase):
         self.assertIn("backs[backs.length - 1] !== back", seg,
                       "判据必须是「自己是最后一个模态」才处理 Esc")
 
+    @staticmethod
+    def _strip_comments(text):
+        """抹掉 `/* */`、`<!-- -->`、`//` 注释，只留代码。
+
+        **判据必须落在代码上，不是注释上。** 这一条是踩出来的：
+        「不许出现假模型名」的断言在注释里命中过 —— 而注释里写
+        "原来是 gpt-x，那个模型页面上根本不存在" 恰恰是最该保留的说明。
+        反过来，「不许用 webkitdirectory」也会在"为什么不用它"的注释里误报。
+        """
+        out, i, n = [], 0, len(text)
+        while i < n:
+            if text.startswith("/*", i):
+                j = text.find("*/", i + 2)
+                j = n if j < 0 else j + 2
+                out.append("\n" * text.count("\n", i, j))
+            elif text.startswith("<!--", i):
+                j = text.find("-->", i + 4)
+                j = n if j < 0 else j + 3
+                out.append("\n" * text.count("\n", i, j))
+            else:
+                out.append(text[i]); i += 1
+                continue
+            i = j
+        code = "".join(out)
+        return "\n".join(re.sub(r"//.*$", "", ln) for ln in code.splitlines())
+
+    def test_workspace_can_be_switched_without_restarting_server(self):
+        """工作区必须能在界面里换 —— 这是"能不能开新项目"的关键。
+
+        在这之前只有两条路：启动参数 `--workspace`、或 URL 的 `?workspace=`。
+        两条都在命令行里 —— 界面用户根本够不着。想开个新项目，得先建目录、
+        停服务、带参数重启。所以这里钉的是**入口存在且真的接上了**：
+
+          · 状态栏有一个工作区条目（用户最先看"我在哪"的地方）
+          · 点它打开目录选择器，而不是弹一句 toast
+          · 切换后必须**清掉属于旧目录的状态**（树缓存、标签、改动统计）——
+            不清不会报错，只会显示旧项目的内容，看起来像新目录的
+          · 选择的目录要能被记住（下次打开不用重选），且 URL 同步
+        """
+        app = self._read("scripts", "app.js")
+        html = self._read("index.html")
+
+        # 入口一：状态栏
+        self.assertIn('id="btn-workspace"', html,
+                      "状态栏没有工作区条目 —— 用户看不出 agent 会在哪个目录动手")
+        self.assertIn('id="status-workspace"', html)
+        seg = app.split('$("#btn-workspace").addEventListener("click"', 1)
+        self.assertEqual(len(seg), 2, "状态栏的工作区按钮没有绑定点击")
+        self.assertIn("openFolderPicker", seg[1].split("});", 1)[0],
+                      "点工作区域名没有打开目录选择器")
+
+        # 入口二：命令面板（换工作区是高频动作，得有条顶层命令）
+        self.assertIn('label: "打开文件夹…"', app,
+                      "命令面板里没有「打开文件夹…」")
+        # 入口三：设置页「工作区」分区
+        self.assertIn("切换目录…", app)
+
+        # 选择器本体
+        self.assertIn("function openFolderPicker(", app)
+        self.assertIn("window.Harness.fsList", app,
+                      "选择器没有调后端的列目录端点 —— 那它就只能列出假目录")
+        # 浏览器拿不到本机绝对路径，所以必须走后端；这里断言它没走
+        # 浏览器原生的目录选择 input（那东西只给相对路径）
+        self.assertNotIn("webkitdirectory", self._strip_comments(app),
+                         "用了浏览器原生的目录选择 input —— 它只给相对路径，"
+                         "而工作区必须是绝对路径")
+
+        # 切换要清掉旧状态
+        sw = app.split("function switchWorkspace(", 1)[1]
+        sw = sw.split("\n  function ", 1)[0]
+        for key in ("state.tabs = []", "state.treeCache = {}",
+                    "state.fileCache = {}", "state.gitStatus = null"):
+            self.assertIn(key, sw,
+                          f"切换工作区没有清 {key} —— 界面会继续显示旧项目的内容")
+        self.assertIn("history.replaceState", sw,
+                      "切换后没有同步 URL —— 刷新一下就回到旧工作区了")
+        self.assertIn("persisted.workspace", sw,
+                      "切换后没有记住 —— 下次打开还得重新选一遍")
+
+        # 记住的地方要真的被读回来
+        self.assertIn("urlParams.workspace || persisted.workspace", app,
+                      "启动时没有读回上次的工作区")
+
+    def test_folder_picker_esc_respects_stacked_modals_and_blocks_bad_dirs(self):
+        """选择器的两个安全约束。
+
+        1. **Esc 分层**：选择器会从设置页里打开，那时它上面还压着设置页。
+           Esc 的监听挂在 document 的 capture 阶段，不分层的话按一次 Esc
+           会把整页设置关掉 —— 用户以为只是取消选目录。
+        2. **危险目录当场禁用**：盘符根 / 系统目录不能当工作区。
+           判据必须在**浏览时**就生效（按钮 disabled），而不是点完才报错。
+        """
+        app = self._read("scripts", "app.js")
+        seg = app.split("function openFolderPicker(", 1)[1]
+        seg = seg.split("\n  /* ===", 1)[0]
+
+        # Esc 分层判据
+        self.assertIn("backs[backs.length - 1] !== back", seg,
+                      "选择器的 Esc 没有判断模态层级 —— 会越过上层关掉设置页")
+
+        # 危险目录：按钮禁用 + 显示理由
+        self.assertIn("pickBtn.disabled = true", seg,
+                      "危险目录没有禁用「选择此文件夹」")
+        self.assertIn("blocked_reason", seg,
+                      "危险目录没有显示原因 —— 用户不知道为什么不能选")
+
+        # 后端也要有这道闸（前端禁用只是提示，不是权限）
+        srv = self._read("harness", "server.py")
+        self.assertIn("def _dangerous_workspace(", srv)
+        self.assertIn("_dangerous_workspace(ws)", srv,
+                      "新建端点没走危险目录检查 —— 可以在系统目录里建东西")
+
     def test_user_facing_strings_contain_no_markdown_emphasis(self):
         """用户可见文案里不许出现 markdown 的 `**强调**`。
 
@@ -4253,23 +4609,7 @@ class TestFrontendWiring(unittest.TestCase):
         判据：把注释（`//`、`/* */`、`<!-- -->`）全部抹掉之后，代码里不许再有 `**`。
         （注释里写 `**` 是给读代码的人看的，不算。）
         """
-        def strip_comments(text):
-            out, i, n = [], 0, len(text)
-            while i < n:
-                if text.startswith("/*", i):
-                    j = text.find("*/", i + 2)
-                    j = n if j < 0 else j + 2
-                    out.append("\n" * text.count("\n", i, j))
-                elif text.startswith("<!--", i):
-                    j = text.find("-->", i + 4)
-                    j = n if j < 0 else j + 3
-                    out.append("\n" * text.count("\n", i, j))
-                else:
-                    out.append(text[i]); i += 1
-                    continue
-                i = j
-            code = "".join(out)
-            return "\n".join(re.sub(r"//.*$", "", ln) for ln in code.splitlines())
+        strip_comments = self._strip_comments
 
         offenders = []
         for parts in (("scripts", "app.js"), ("scripts", "harness-bridge.js"),

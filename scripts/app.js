@@ -94,6 +94,9 @@
         termH: persisted.termH,
         activeView: persisted.activeView,
         filter: persisted.filter,
+        // 上次用的工作区。URL 里有 ?workspace= 时仍然以 URL 为准（显式优先），
+        // 这里只是"上次我在哪干活"的记忆，用来免去每次重新选一遍。
+        workspace: persisted.workspace,
       }));
     } catch (e) { /* 隐私模式写不进去就算了，不该因此崩掉 */ }
   }
@@ -122,7 +125,10 @@
     // 那是在 state 自己的初始化表达式里引用 state —— `var` 提升让此刻的 state
     // 是 undefined，于是抛 TypeError，**整个 app.js 从这一行起全部不执行**。
     // 表现为「页面看着正常、所有交互都是死的」，极难定位。
-    workspace: urlParams.workspace || null,
+    //
+    // 优先级：URL（显式，这次就要在这个目录干活）> 上次用的 > 空（服务端默认）。
+    // **不再需要靠重启服务换工作区** —— 界面里可以直接选任意目录。
+    workspace: urlParams.workspace || persisted.workspace || null,
 
     // ── 后端数据（本次对接新增）──
     // 全部初始化为 null 而不是空数组：`null` 表示"还没查"，
@@ -833,6 +839,48 @@
       return window.Harness.indexQuery(state.workspace, q)
         .then(function (r) { return r; })
         .catch(function (e) { return { error: String(e && e.message || e) }; });
+    },
+
+    /* ---------- 本机目录浏览（选择工作区用）----------
+       失败时**返回形状与成功一致**（entries/drives/shortcuts 都在），
+       只是多一个 error 字段。理由：选择器是用户唯一能换工作区的地方，
+       它拿到 undefined 就会画出空白列表并让用户以为"这台机器没有目录"。 */
+    fsList: function (path) {
+      if (!this.available()) {
+        return Promise.resolve({
+          error: "offline", detail: "后端未连接，浏览不了本机目录。",
+          entries: [], drives: [], shortcuts: [], usable: false,
+        });
+      }
+      return window.Harness.fsList(path).catch(function (e) {
+        return {
+          error: "network", detail: String(e && e.message || e),
+          entries: [], drives: [], shortcuts: [], usable: false,
+        };
+      });
+    },
+
+    /* 把模型配置沿用到新工作区。**只在用户显式点"沿用"时调** ——
+       自动沿用会让用户以为在新项目里用的是 A 模型，其实沿用了上个项目的 B。 */
+    copyConfig: function (from, to) {
+      if (!this.available()) {
+        return Promise.resolve({ ok: false, error: "offline", detail: "后端未连接。" });
+      }
+      return window.Harness.copyConfig(from, to);
+    },
+
+    /* 在**指定目录**下建空文件/空目录。
+       与 startCreate 走同一个后端端点（`/api/workspace/create`）——
+       写磁盘的入口只许有一个，否则迟早出现"一个入口校验了、另一个没有"。
+       选择器用它建"新项目文件夹"。 */
+    createEntry: function (dir, path, kind) {
+      if (!this.available()) {
+        return Promise.resolve({
+          ok: false, status: 0,
+          body: { error: "offline", detail: "后端未连接，建不了目录。" },
+        });
+      }
+      return window.Harness.workspaceCreate(dir, path, kind);
     },
 
     loadWorkspaceInfo: function () {
@@ -3424,6 +3472,12 @@
         onRun: function () {
           openSettings(state.endpoint && state.endpoint.configured ? "appearance" : "model");
         } });
+      // 换工作区是一个高频动作（开新项目就要做一次），
+      // 所以给它一条**顶层**命令，而不是让人先进设置再找。
+      cmds.push({ label: "打开文件夹…", sub: "切换工作区（当前：" + workspaceName(
+          state.workspace || (state.wsInfo && state.wsInfo.workspace) || "服务端默认") + "）",
+        group: "工作区", icon: ICONS.dirOpen,
+        onRun: function () { openFolderPicker(); } });
 
       cmds.push({ label: "键盘快捷键总览", sub: "查看全部快捷键", group: "帮助", icon: ICONS.terminal, keys: ["?"], onRun: openShortcuts });
 
@@ -3789,10 +3843,33 @@
       });
     }
 
+    /* 状态栏左侧：**当前工作区**。
+       在这之前状态栏里根本没有这个信息 —— 只有分支名。用户看不出
+       "agent 到底会在哪个目录上动手"，而切换工作区又只能靠重启服务。
+       有 state.workspace 就用它；没有就用服务端回报的路径 ——
+       "还不知道"和"没有"是两件事，不能都显示成"工作区"。 */
+    function renderWorkspaceChip() {
+      var label = $("#status-workspace");
+      var btn = $("#btn-workspace");
+      if (!label || !btn) return;
+      var p = state.workspace || (state.wsInfo && state.wsInfo.workspace) || "";
+      if (!p) {
+        label.textContent = Backend.available() ? "读取中…" : "未连接";
+        btn.setAttribute("data-tip", Backend.available()
+          ? "正在读取服务端的工作区路径" : "后端未连接，读不到工作区");
+        return;
+      }
+      label.textContent = workspaceName(p);
+      btn.setAttribute("data-tip", p + "\n点击切换工作区目录");
+    }
+
     /* 状态栏：把真实工作区信息写回去。
        mock 版写着"已索引 · 1,284 文件 · 18.6 万 token" —— 全是编的。
        现在只显示能核实的量（文件数、分支），没有的就说没有。 */
     function renderStatusbar() {
+      // 工作区分两处显示（状态栏 + 资源管理器标题）。wsInfo 回来时
+      // 两处都要更新 —— 只更新一处会出现"状态栏说 A、侧栏说 B"。
+      renderWorkspaceChip();
       var idx = $("#btn-index");
       if (!idx) return;
       var dot = idx.querySelector(".statusitem__dot");
@@ -3903,8 +3980,31 @@
     uiHooks.renderStatusbar = renderStatusbar;
     uiHooks.renderBranchChip = renderBranchChip;
     uiHooks.renderStatusMetrics = renderStatusMetrics;
+    uiHooks.renderWorkspaceChip = renderWorkspaceChip;
     // 首屏把状态栏指标画一次（此时数据可能还没到，会显示"读取中"）
     renderStatusMetrics();
+    renderWorkspaceChip();
+
+    // ---------- 工作区切换 ----------
+    // 入口一：状态栏（用户最先看到"我在哪"的地方）
+    $("#btn-workspace").addEventListener("click", function () {
+      openFolderPicker();
+    });
+    // 入口二：资源管理器里的工作区标题行。
+    // `sect__head` 本身是 button（点击折叠），不能在里面再嵌一个 button
+    // （button 嵌套 button 是非法 HTML，浏览器会把它拆开）。用右键菜单。
+    document.addEventListener("contextmenu", function (e) {
+      var head = e.target && e.target.closest && e.target.closest(".sect__head");
+      if (!head) return;
+      e.preventDefault();
+      UI.contextMenu(e.clientX, e.clientY, [
+        { label: "切换工作区…", icon: ICONS.dirOpen, onClick: function () { openFolderPicker(); } },
+        { label: "复制工作区路径", icon: ICONS.file, onClick: function () {
+            var p = state.workspace || (state.wsInfo && state.wsInfo.workspace) || "";
+            if (p) UI.copy(p, "工作区路径");
+          } },
+      ]);
+    });
 
     // ---------- 计划视图 ----------
     $("#plan-toggle").addEventListener("click", function () {
@@ -4905,6 +5005,15 @@
       wrap.appendChild(rows);
 
       var acts = el("div", "settings__acts");
+      var switchBtn = el("button", "btn btn--primary", "切换目录…");
+      switchBtn.type = "button";
+      switchBtn.addEventListener("click", function () {
+        // 选择器会叠在设置页上面 —— 所以它的 Esc 必须分层判断
+        // （openFolderPicker 里有和这里一样的 backs[last] !== back 判据）。
+        openFolderPicker();
+      });
+      acts.appendChild(switchBtn);
+
       var rebuild = el("button", "btn", "重建索引");
       rebuild.type = "button";
       rebuild.addEventListener("click", function () {
@@ -5053,11 +5162,568 @@
       if (uiHooks.renderStatusbar) uiHooks.renderStatusbar();
       if (uiHooks.renderBranchChip) uiHooks.renderBranchChip();
       if (uiHooks.renderStatusMetrics) uiHooks.renderStatusMetrics();
+      if (uiHooks.renderWorkspaceChip) uiHooks.renderWorkspaceChip();
       if (uiHooks.updateMeter) uiHooks.updateMeter();
     } catch (e) {
       // 重画失败不能连"已连接"这个事实一起吞掉 —— 至少留一条可查的痕迹
       if (window.console) console.error("连接后重画界面失败：", e);
     }
+  }
+
+  /* ============================================================
+     切换工作区
+     ============================================================
+     在此之前工作区只能由 `--workspace` 或 URL 的 `?workspace=` 指定 ——
+     也就是**只能从命令行换**。想开个新项目，得先建好目录、停服务、
+     带 `--workspace` 重启。这不是"限制得比较保守"，是缺了一整块功能。
+
+     现在后端每个端点本来就接受 `workspace` 参数（索引缓存也是按工作区
+     分的），所以切换工作区**不需要重启服务**：前端换个参数、把属于旧目录
+     的状态清掉、重画即可。 */
+
+  function workspaceName(p) {
+    var segs = String(p || "").split(/[\\/]/).filter(Boolean);
+    return segs.length ? segs[segs.length - 1] : String(p || "");
+  }
+
+  /* 切换工作区。
+     返回 true 表示真的换了（调用方据此决定是否提示），false 表示没变。
+     **相同路径直接返回** —— 否则会出现"点一下工作区，标签全被关掉"这种
+     莫名其妙的行为（用户只是想把选择器打开看看）。 */
+  function switchWorkspace(next) {
+    var p = String(next || "").trim();
+    if (!p || p === state.workspace) return false;
+    /* 旧工作区要回落到 wsInfo。
+       `state.workspace` 为 null 的含义是"没显式指定，用服务端默认" ——
+       如果只读 state.workspace，页面刚打开、还没在界面里切过的时候
+       它就是 null，于是"上一份配置在哪个工作区"这个问题直接无从回答，
+       沿用提示（以及一切靠 prev 判断的东西）会**静默不执行**。
+       实测就是这样：切到新目录后什么都没提示，而源目录明明配着模型。 */
+    var prev = state.workspace || (state.wsInfo && state.wsInfo.workspace) || "";
+
+    state.workspace = p;
+    persisted.workspace = p;
+    save();
+
+    /* URL 同步用 replaceState 而不是 pushState。
+       用 push 的话用户按一次"后退"就回到旧工作区的地址，但界面状态
+       （已清空的标签、已重载的树）不会跟着回退 —— 结果是
+       「地址栏说 A、界面显示 B」。要么完整支持 popstate，要么不要 push。 */
+    try {
+      var u = new URL(window.location.href);
+      u.searchParams.set("workspace", p);
+      window.history.replaceState(null, "", u.toString());
+    } catch (e) { /* 老浏览器 / file:// 下忽略 */ }
+
+    /* ── 清掉一切属于旧目录的状态 ──
+       不清的后果不是报错，是**显示错的内容**：旧项目的文件树、旧项目的
+       标签、旧项目的改动统计，全都看起来像是新目录的。 */
+    state.tabs = [];
+    state.activeTab = null;
+    dirtyFile = {};
+    state.treeCache = {};
+    state.fileCache = {};
+    state.ctxRefs = [];
+    state.wsInfo = null;
+    state.wsInfoError = null;
+    state.gitStatus = null;
+    state.indexInfo = null;
+    state.indexError = null;
+    state.runs = null;
+    state.runsError = null;
+    state.detail = null;
+    state.detailRun = null;
+    state.detailError = null;
+    state.replayVMs = null;
+    state.replayRunId = null;
+    state.replayDetail = null;
+    state.streamMode = "live";
+    state.gateResolved = null;
+    termHistory.length = 0;
+    liveVMs.length = 0;
+    if (D.stream) D.stream.innerHTML = "";
+
+    // 重画 + 按新工作区重新取一遍。顺序无关（各自 updae 自己的区块），
+    // 但 loadEndpoint 要在重画之后 —— 它会把模型名写进状态栏与 Agent 面板。
+    refreshConnectionUI();
+    Backend.loadWorkspaceInfo();
+    Backend.loadGitStatus();
+    Backend.loadIndex(false);
+    Backend.loadRuns();
+    loadEndpoint();
+
+    /* 配置是按工作区存的（<workspace>/.crucible/config.json），
+       所以新目录必然是"还没配过"。用户刚配好就去开新项目，一进去看到
+       "未配置"，第一反应是"我的 key 丢了"。
+
+       **不自动沿用** —— 自动的话用户会以为自己在新项目里用的是 A 模型，
+       其实沿用了上个项目的 B。只在旧目录确实有配置时，给一次显式选择。 */
+    if (prev) suggestAdoptConfig(prev);
+    return true;
+  }
+
+  function suggestAdoptConfig(prevWs) {
+    if (!window.Harness || !window.Harness.isLive()) return;
+    window.Harness.getConfig(state.workspace).then(function (now) {
+      if (now && now.endpoint && now.endpoint.configured) return;  // 新目录自己有
+      return window.Harness.getConfig(prevWs).then(function (old) {
+        var ep = old && old.endpoint;
+        if (!ep || !ep.configured) return;                          // 旧目录也没有，不打扰
+        UI.toast({
+          tone: "info",
+          title: "这个目录还没有模型配置",
+          desc: "配置是按工作区存的。可以把「" + workspaceName(prevWs)
+                + "」那份（" + (ep.model || "已配置") + "）沿用过来。",
+          duration: 10000,
+          actions: [{
+            label: "沿用",
+            primary: true,
+            onClick: function () {
+              Backend.copyConfig(prevWs, state.workspace).then(function (r) {
+                if (r && r.ok) {
+                  applyEndpoint(r.endpoint);
+                  UI.toast({ tone: "success", title: "已沿用模型配置",
+                             desc: r.endpoint && r.endpoint.model || "", duration: 3200 });
+                } else {
+                  UI.toast({ tone: "warning", title: "没能沿用",
+                             desc: (r && r.detail) || "原因未知", duration: 5200 });
+                }
+              });
+            },
+          }],
+        });
+      });
+    }).catch(function (e) {
+      /* 取配置失败不该影响切换本身，但**不能静默** ——
+         这里静默过一次：整个"沿用配置"入口没出现，界面上看不出任何异常，
+         只有截图对比才能发现少了一条提示。 */
+      if (window.console) console.error("切换工作区后检查模型配置失败：", e);
+    });
+  }
+
+  /* ============================================================
+     目录选择器
+     ============================================================
+     为什么自己写而不用 <input type="file" webkitdirectory>：
+     它只给**相对路径**，拿不到绝对路径，而工作区必须是一个绝对路径
+     （后端所有端点都要 realpath）。所以只能让后端列目录。
+
+     这个对话框是**唯一**能让用户换工作区的地方，所以几条底线：
+     · 永远有退路（上一级、快捷位置、盘符、手输路径），不会卡在空目录里；
+     · 不能选的目录**当场就说为什么**，不要等点了"选择"才报错；
+     · Esc 分层（可能压在设置页上面）。 */
+  function openFolderPicker(opts) {
+    opts = opts || {};
+    var startAt = opts.path || state.workspace
+      || (state.wsInfo && state.wsInfo.workspace) || "";
+
+    var back = el("div", "modalback");
+    var dlg = el("div", "modal modal--picker");
+    dlg.setAttribute("role", "dialog");
+    dlg.setAttribute("aria-modal", "true");
+    dlg.setAttribute("aria-label", "选择工作区目录");
+
+    /* ── 头部 ── */
+    var head = el("div", "picker__head");
+    head.appendChild(el("h2", "picker__title", "打开文件夹"));
+    var closeBtn = el("button", "iconbtn iconbtn--sm picker__close");
+    closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "关闭");
+    closeBtn.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">'
+      + '<path d="M5.5 5.5l9 9M14.5 5.5l-9 9" stroke="currentColor" '
+      + 'stroke-width="1.7" stroke-linecap="round"/></svg>';
+    head.appendChild(closeBtn);
+    dlg.appendChild(head);
+
+    /* ── 路径栏 ── */
+    var bar = el("div", "picker__bar");
+    var upBtn = el("button", "iconbtn iconbtn--sm");
+    upBtn.type = "button";
+    upBtn.setAttribute("aria-label", "上一级");
+    upBtn.setAttribute("data-tip", "上一级（Backspace）");
+    upBtn.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">'
+      + '<path d="M10 15.5v-11M5.5 9L10 4.5 14.5 9" stroke="currentColor" '
+      + 'stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    bar.appendChild(upBtn);
+
+    var pathInput = el("input", "picker__path");
+    pathInput.type = "text";
+    pathInput.spellcheck = false;
+    pathInput.setAttribute("aria-label", "路径");
+    pathInput.placeholder = "输入路径后回车";
+    bar.appendChild(pathInput);
+
+    var goBtn = el("button", "btn btn--sm", "转到");
+    goBtn.type = "button";
+    bar.appendChild(goBtn);
+    dlg.appendChild(bar);
+
+    /* 面包屑独立成行，不放在左栏。
+       放在左栏时每一级各占一行（C: / Users / 34442 / Desktop / …），
+       六行就把快捷位置顶下去了，而它跟路径栏表达的是同一件事。 */
+    var crumbs = el("div", "picker__crumbs");
+    dlg.appendChild(crumbs);
+
+    /* ── 内容：左快捷位 / 右目录列表 ── */
+    var body = el("div", "picker__body");
+    var side = el("div", "picker__side");
+    var list = el("div", "picker__list");
+    list.setAttribute("role", "listbox");
+    list.setAttribute("aria-label", "目录");
+    list.tabIndex = 0;
+    body.appendChild(side);
+    body.appendChild(list);
+    dlg.appendChild(body);
+
+    /* ── 底部 ── */
+    var foot = el("div", "picker__foot");
+    var stat = el("div", "picker__stat");
+    foot.appendChild(stat);
+    var actions = el("div", "picker__acts");
+
+    var newBtn = el("button", "btn btn--sm", "新建文件夹");
+    newBtn.type = "button";
+    newBtn.setAttribute("data-tip", "在当前目录下建一个新文件夹，然后直接进去");
+    actions.appendChild(newBtn);
+
+    var cancelBtn = el("button", "btn btn--sm", "取消");
+    cancelBtn.type = "button";
+    actions.appendChild(cancelBtn);
+
+    var pickBtn = el("button", "btn btn--sm btn--primary", "选择此文件夹");
+    pickBtn.type = "button";
+    actions.appendChild(pickBtn);
+
+    foot.appendChild(actions);
+    dlg.appendChild(foot);
+    back.appendChild(dlg);
+
+    /* ── 状态 ── */
+    var data = null;        // 最近一次列目录的结果（唯一真相）
+    var sel = -1;           // 列表高亮下标
+    var closed = false;
+
+    function close() {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener("keydown", onKey, true);
+      if (releaseTrap) releaseTrap();
+      UI.lockScroll(false);
+      back.classList.add("modalback--out");
+      setTimeout(function () {
+        if (back.parentNode) back.parentNode.removeChild(back);
+      }, 190);
+    }
+
+    function chdir(p) {
+      pathInput.value = p || "";
+      list.innerHTML = "";
+      list.appendChild(el("div", "picker__loading", "读取中…"));
+      Backend.fsList(p).then(function (d) {
+        if (closed) return;
+        data = d || {};
+        sel = -1;
+        // 用**后端归一化后的真实路径**回填输入框。
+        // 不回填的话，用户会看到自己敲的或拼出来的形式（比如
+        // `C:\Users\me\Desktop/newproj` 这种混用分隔符），
+        // 而真正的路径不是那样 —— 地址栏与磁盘不一致最容易被误读。
+        if (data.path) pathInput.value = data.path;
+        renderCrumb(d);
+        renderList();
+        renderStat();
+      });
+    }
+
+    function renderCrumb(d) {
+      var host = side;
+      host.innerHTML = "";
+
+      function group(title) {
+        var g = el("div", "picker__group");
+        g.appendChild(el("div", "picker__grouptitle", title));
+        host.appendChild(g);
+        return g;
+      }
+
+      if (d && d.drives && d.drives.length) {
+        var gd = group("磁盘");
+        d.drives.forEach(function (dr) {
+          var b = el("button", "picker__quick", String(dr).replace(/\\$/, ""));
+          b.type = "button";
+          b.setAttribute("data-tip", dr);
+          b.addEventListener("click", function () { chdir(dr); });
+          gd.appendChild(b);
+        });
+      }
+      if (d && d.shortcuts && d.shortcuts.length) {
+        var gs = group("常用位置");
+        d.shortcuts.forEach(function (s) {
+          var b = el("button", "picker__quick", s.name);
+          b.type = "button";
+          b.setAttribute("data-tip", s.path);
+          b.addEventListener("click", function () { chdir(s.path); });
+          gs.appendChild(b);
+        });
+      }
+      // 面包屑：路径栏下方一行，逐级可点 —— 比"点上一级点十次"好用
+      var crumbPath = (d && d.path) || pathInput.value || "";
+      crumbs.innerHTML = "";
+      if (crumbPath) {
+        var segs = String(crumbPath).split(/[\\/]/).filter(Boolean);
+        var acc = "";
+        segs.forEach(function (seg, i) {
+          acc += (i === 0 && /^[A-Za-z]:$/.test(seg) ? seg + "\\" : seg + "/");
+          if (i > 0) crumbs.appendChild(el("span", "picker__crumbsep", "›"));
+          var b = el("button", "picker__crumb", seg);
+          b.type = "button";
+          b.setAttribute("data-tip", acc);
+          // 点击任意一级 = 跳到那一级
+          (function (target) {
+            b.addEventListener("click", function () { chdir(target); });
+          })(acc);
+          crumbs.appendChild(b);
+        });
+      }
+    }
+
+    function renderList() {
+      list.innerHTML = "";
+      if (!data) return;
+      if (data.error) {
+        var e = el("div", "picker__empty");
+        e.appendChild(el("div", "picker__emptytitle",
+          data.error === "not_found" ? "这个路径不存在"
+            : data.error === "permission_denied" ? "没有权限读取这个目录"
+            : data.error === "not_a_dir" ? "这是一个文件，不是目录"
+            : "读不了这个目录"));
+        e.appendChild(el("div", "picker__emptyhint",
+          data.detail || "换一个目录试试，或者点左边的快捷位置。"));
+        list.appendChild(e);
+        return;
+      }
+      var dirs = data.entries || [];
+      if (!dirs.length) {
+        var em = el("div", "picker__empty");
+        em.appendChild(el("div", "picker__emptytitle", "这个目录下没有子目录"));
+        em.appendChild(el("div", "picker__emptyhint",
+          "它本身可以当作工作区 —— 空目录也算一个项目。点「选择此文件夹」即可。"));
+        list.appendChild(em);
+        return;
+      }
+      dirs.forEach(function (d, i) {
+        var row = el("button", "picker__item");
+        row.type = "button";
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", "false");
+        row.appendChild(svg(ICONS.dirClosed, "picker__icon"));
+        var nameEl = el("span", "picker__name", d.name);
+        row.appendChild(nameEl);
+        if (d.has_git) {
+          row.appendChild(el("span", "picker__tag picker__tag--git", "git"));
+        } else if (d.project) {
+          row.appendChild(el("span", "picker__tag", d.project));
+        }
+        row.setAttribute("data-tip", d.path);
+        // 单击进入（而不是"单击选中、双击进入"）：这个对话框只干一件事，
+        // 多一层哑状态只会让人多点一次。选中靠键盘 ↑↓。
+        row.addEventListener("click", function () { chdir(d.path); });
+        row.addEventListener("mouseenter", function () { setSel(i); });
+        list.appendChild(row);
+      });
+      if (data.truncated) {
+        list.appendChild(el("div", "picker__loading",
+          "目录太多，只列出前 " + dirs.length + " 个。可以手输路径直达。"));
+      }
+    }
+
+    function setSel(i) {
+      var rows = list.querySelectorAll(".picker__item");
+      if (!rows.length) { sel = -1; return; }
+      if (i < 0) i = rows.length - 1;
+      if (i >= rows.length) i = 0;
+      sel = i;
+      Array.prototype.forEach.call(rows, function (r, k) {
+        r.classList.toggle("is-sel", k === sel);
+        r.setAttribute("aria-selected", k === sel ? "true" : "false");
+      });
+      rows[sel].scrollIntoView({ block: "nearest" });
+    }
+
+    function renderStat() {
+      stat.className = "picker__stat";
+      upBtn.disabled = !(data && data.parent);
+      if (!data) { stat.textContent = ""; return; }
+      if (data.error) { stat.textContent = ""; pickBtn.disabled = true; return; }
+
+      var bits = [];
+      bits.push((data.count || 0) + " 个子目录");
+      // 隐藏目录被跳过要报个数 —— 静默省略会让人以为磁盘上就这么多东西
+      if (data.skipped_hidden) {
+        bits.push(data.skipped_hidden + " 个隐藏目录未列出");
+      }
+      if (data.has_git) bits.push("git 仓库");
+      else if (data.project) bits.push("含 " + data.project);
+      else bits.push("未检测到项目标志");
+
+      // 能不能当工作区：浏览时就说，不要等点"选择"才报错
+      var blocked = data.blocked_reason;
+      if (blocked) {
+        pickBtn.disabled = true;
+        stat.classList.add("is-bad");
+        stat.textContent = blocked;
+        return;
+      }
+      pickBtn.disabled = false;
+      if (data.writable === false) {
+        stat.classList.add("is-warn");
+        bits.push("不可写 —— agent 的写操作会失败");
+      }
+      stat.textContent = bits.join(" · ");
+    }
+
+    /* ── 新建文件夹：内联输入，不叠第二层模态 ──
+       叠一层的话 Esc 分层又要多一份判断（确认框、设置页、选择器三层），
+       而这里只需要一个名字。 */
+    function startNewFolder() {
+      if (list.querySelector(".picker__new")) {
+        list.querySelector(".picker__new input").focus();
+        return;
+      }
+      var row = el("div", "picker__new");
+      var input = el("input", "picker__newinput");
+      input.type = "text";
+      input.placeholder = "新文件夹名";
+      input.setAttribute("aria-label", "新文件夹名");
+      var ok = el("button", "btn btn--sm btn--primary", "创建");
+      ok.type = "button";
+      var no = el("button", "btn btn--sm", "取消");
+      no.type = "button";
+      row.appendChild(input);
+      row.appendChild(ok);
+      row.appendChild(no);
+      list.insertBefore(row, list.firstChild);
+      input.focus();
+
+      var errEl = null;
+      function showErr(msg) {
+        if (!errEl) {
+          errEl = el("div", "picker__newerr");
+          row.appendChild(errEl);
+        }
+        errEl.textContent = msg;
+      }
+      function submit() {
+        var name = String(input.value || "").trim();
+        if (!name) { input.focus(); return; }
+        if (!Backend.available()) {
+          showErr("后端未连接，建不了目录。");
+          return;
+        }
+        ok.disabled = true;
+        // 复用工作区的新建端点：workspace = 当前浏览目录，path = 名字。
+        // **不接受带分隔符的名字** —— 那会让"在这建一个文件夹"变成
+        // "在别处建一条路径"。（后端也会拒，这里先拦是为了能就地给出提示。）
+        if (/[\\/]/.test(name)) {
+          ok.disabled = false;
+          showErr("名字里不能带斜杠。要分层次的话，先建外层，进去再建。");
+          return;
+        }
+        Backend.createEntry(data.path, name, "dir").then(function (r) {
+          ok.disabled = false;
+          if (r && r.ok) {
+            var np = String(data.path).replace(/[\\/]+$/, "") + "/" + name;
+            chdir(np);       // 建完直接进去 —— 建好还要再找一遍太绕
+            UI.toast({ tone: "success", title: "已创建 " + name, duration: 2400 });
+          } else {
+            // 失败原因写在输入框下面，不弹 toast：用户接下来要改的就是这个名字
+            showErr((r && r.body && r.body.detail) || "创建失败，原因未知。");
+            input.focus();
+          }
+        });
+      }
+      ok.addEventListener("click", submit);
+      no.addEventListener("click", function () { row.parentNode && row.parentNode.removeChild(row); });
+      input.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") { e.preventDefault(); submit(); }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          e.stopPropagation();
+          row.parentNode && row.parentNode.removeChild(row);
+        }
+      });
+    }
+
+    /* ── 确认选择 ── */
+    function confirmPick() {
+      if (!data || data.error || !data.usable) return;
+      var target = data.path;
+      var ok = switchWorkspace(target);
+      close();
+      if (ok) {
+        UI.toast({
+          tone: "success",
+          title: "工作区已切到 " + workspaceName(target),
+          desc: target,
+          duration: 3600,
+        });
+      }
+    }
+
+    /* ── 键盘 ── */
+    function onKey(e) {
+      // Esc 分层：这个对话框可能压在设置页上面。
+      // 判据与其他模态一致 —— 只有自己是最后一个时才处理。
+      var backs = document.querySelectorAll(".modalback");
+      if (backs.length && backs[backs.length - 1] !== back) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        close();
+        return;
+      }
+      // 焦点在输入框里时不抢方向键（要改路径文字）
+      var tag = (e.target && e.target.tagName) || "";
+      if (tag === "INPUT") {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          chdir(pathInput.value.trim());
+        }
+        return;
+      }
+      if (e.key === "ArrowDown") { e.preventDefault(); setSel(sel + 1); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); setSel(sel <= 0 ? -1 : sel - 1); }
+      else if (e.key === "Enter") {
+        var rows = list.querySelectorAll(".picker__item");
+        if (sel >= 0 && rows[sel]) {
+          e.preventDefault();
+          rows[sel].click();
+        }
+      } else if (e.key === "Backspace") {
+        e.preventDefault();
+        if (data && data.parent) chdir(data.parent);
+      }
+    }
+
+    document.addEventListener("keydown", onKey, true);
+    var releaseTrap = UI.trapFocus(dlg);
+    UI.lockScroll(true);
+    back.addEventListener("mousedown", function (e) {
+      if (e.target === back) close();
+    });
+    closeBtn.addEventListener("click", close);
+    cancelBtn.addEventListener("click", close);
+    pickBtn.addEventListener("click", confirmPick);
+    newBtn.addEventListener("click", startNewFolder);
+    upBtn.addEventListener("click", function () {
+      if (data && data.parent) chdir(data.parent);
+    });
+    goBtn.addEventListener("click", function () { chdir(pathInput.value.trim()); });
+
+    document.body.appendChild(back);
+    chdir(startAt);
+    // 焦点放在列表上而不是路径框：进来第一件事通常是"看子目录 / ↑↓ 选"，
+    // 而不是重新敲一遍路径。
+    setTimeout(function () { try { list.focus(); } catch (e) { /* 忽略 */ } }, 30);
   }
 
   /* ============================================================

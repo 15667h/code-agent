@@ -317,6 +317,13 @@
 <!-- ═══════════════ 状态栏 ═══════════════ -->
 <footer class="statusbar">
   <div class="statusbar__left">
+    <!-- 工作区：**我在哪个目录上干活**。
+         在这之前这个信息只在资源管理器里有个名字、在设置页有一行路径，
+         而且没有任何地方能改 —— 想换项目只能停服务加 --workspace 重启。
+         点这里打开目录选择器。 -->
+    <button type="button" class="statusitem statusitem--btn statusitem--ws" id="btn-workspace" data-tip="当前工作区（点击切换目录）">
+      <span class="statusitem__icon" aria-hidden="true">⌂</span><span id="status-workspace">工作区</span>
+    </button>
     <!-- 这个按钮原来弹的是一个**编造的模型清单**（两个页面上并不存在的模型名），
          点了只会弹 toast。现在它打开真正的设置页（模型接入），
          默认值也不再写死 —— 没配置就如实显示"未配置"。 -->

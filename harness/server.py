@@ -716,6 +716,13 @@ class Handler(BaseHTTPRequestHandler):
             result["file_count"] = len(idx.files)
             return self._json(200, result)
 
+        # ── 本机目录浏览（供"选择工作区"）──
+        # 这个端点**与 workspace 无关**：它就是要去看工作区之外的地方。
+        # 只读、只列目录，见 _fs_list 的说明。
+        if path == "/api/fs/list":
+            p = (q.get("path") or [""])[0]
+            return self._json(200, _fs_list(p))
+
         if path == "/api/workspace/info":
             # 工作区概要：前端状态栏与索引提示需要它。
             # 只报**能可靠得到**的几个量（路径、文件数、是否有 .git）。
@@ -1082,6 +1089,12 @@ class Handler(BaseHTTPRequestHandler):
         # 一次误刷新、一个 <img src> 都能触发建文件。
         if path == "/api/workspace/create":
             ws = body.get("workspace") or default_workspace()
+            # 在系统目录里"新建一个空目录"听起来无害，但这是把工作区
+            # 引到系统路径上的第一步。在入口就拒，比事后再解释便宜。
+            blocked = _dangerous_workspace(ws)
+            if blocked:
+                return self._json(400, {"ok": False, "error": "dangerous_workspace",
+                                        "detail": blocked})
             r = _create_workspace_entry(ws, body.get("path") or "",
                                         body.get("kind") or "file")
             # 拒绝用 400 + 原因码：前端能把"为什么不行"直接摆到字段下面
@@ -1120,6 +1133,39 @@ class Handler(BaseHTTPRequestHandler):
             removed = clear_config(ws)
             return self._json(200, {"ok": True, "removed": removed,
                                     "endpoint": EndpointConfig().to_public()})
+
+        # ── 把一份模型配置沿用到另一个工作区 ──
+        # 为什么需要它：配置存在 `<workspace>/.crucible/config.json`，
+        # 所以"换工作区"必然等于"这个新目录还没配过模型"。用户刚配好就去开新项目，
+        # 一进去看到"未配置"，第一反应是"我的 key 丢了"。
+        #
+        # 刻意**不做自动沿用**：自动的话，用户在新项目里以为用的是 A 模型，
+        # 其实沿用了上个项目的 B —— 那正是「配置来源必须单一且可见」要避免的。
+        # 这里只在用户显式点"沿用"时复制，并且**只接受同一台机器上的路径**。
+        if path == "/api/config/copy":
+            src = os.path.realpath(body.get("from") or "")
+            dst = os.path.realpath(body.get("to") or "")
+            if not src or not dst or src == dst:
+                return self._json(400, {"ok": False, "error": "bad_args",
+                                        "detail": "需要两个不同的工作区路径。"})
+            cfg = load_config(src)
+            if not cfg.configured:
+                return self._json(200, {
+                    "ok": False, "error": "source_not_configured",
+                    "detail": "来源工作区没有可沿用的配置（%s）。"
+                              % config_path(src)})
+            target = config_path(dst)
+            try:
+                # 目标必须是**已存在**的目录：不替用户把整个目录树建出来，
+                # 否则拼错一个路径就等于在别处悄悄留下一份带明文 key 的文件。
+                if not os.path.isdir(dst):
+                    raise OSError("目标目录不存在：%s" % dst)
+                save_config(dst, cfg)
+            except OSError as e:
+                return self._json(200, {"ok": False, "error": "write_failed",
+                                        "detail": str(e)})
+            return self._json(200, {"ok": True, "config_path": target,
+                                    "endpoint": load_config(dst).to_public()})
 
         if path.startswith("/api/run/") and path.endswith("/rollback"):
             rid = path.split("/")[3]
@@ -1474,6 +1520,190 @@ def _create_workspace_entry(workspace: str, rel: str, kind: str) -> Dict[str, An
         "parent": "/".join(parts[:-1]),
         "detail": "已创建%s：%s" % (_NEW_KIND_CN[kind], "/".join(parts)),
     }
+
+
+def _windows_drives() -> List[str]:
+    """枚举盘符。
+
+    用 `GetLogicalDrives` 而不是逐个 `os.path.exists("A:\\")`：
+    后者在有不存在的软驱时会让整个请求卡几秒（访问硬件）。
+    """
+    if os.name != "nt":
+        return ["/"]
+    try:
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        return [chr(ord("A") + i) + ":\\" for i in range(26) if mask & (1 << i)]
+    except (AttributeError, OSError):
+        # 拿不到就退回逐个探测 —— 慢一点，但不会让整个选择器不可用
+        return [chr(ord("A") + i) + ":\\"
+                for i in range(26) if os.path.isdir(chr(ord("A") + i) + ":\\")]
+
+
+# 目录里有这些东西，基本可以认定"这是一个项目"（而不是一个随便的文件夹）。
+_PROJECT_MARKERS = (".git", "package.json", "pyproject.toml", "setup.py",
+                    "Cargo.toml", "go.mod", "pom.xml", "build.gradle",
+                    "CMakeLists.txt", "AGENTS.md", "README.md")
+
+
+def _shortcuts() -> List[Dict[str, str]]:
+    """选择器里的"快捷位置"。只列真实存在的。"""
+    out: List[Dict[str, str]] = []
+    home = os.path.expanduser("~")
+    cands = [("主目录", home)]
+    for label, sub in (("桌面", "Desktop"), ("文档", "Documents"),
+                       ("下载", "Downloads")):
+        cands.append((label, os.path.join(home, sub)))
+    for label, p in cands:
+        if p and os.path.isdir(p):
+            out.append({"name": label, "path": os.path.realpath(p)})
+    return out
+
+
+def _fs_list(path: str = "", max_entries: int = 800) -> Dict[str, Any]:
+    """列本机的一个目录，供"选择工作区"使用。
+
+    ## 为什么需要它
+
+    之前工作区只能由 `--workspace` 或 URL 的 `?workspace=` 指定 ——
+    也就是**只能从命令行切**。要换项目就得重启服务。这不是"限制得比较保守"，
+    是缺了一块功能：用户没法新建项目再在里面干活。
+
+    ## 能力刻意压到最小
+
+    · **只读**：列目录，不建、不删、不改。要建空目录走
+      `/api/workspace/create`（那一个端点管写，方便单独审查）。
+    · **只列目录**，不列文件：这个端点的用途是"选一个工作区根"，
+      列出文件名既没用又多泄露。
+    · 不跟随符号链接判目录（`follow_symlinks=False`），避免软链环。
+
+    ## 错误要能继续走
+
+    目录不存在 / 没权限时**仍然返回 parent 与 drives** ——
+    让选择器能退回去。只回一个 400 的话，前端会卡在一个走不出去的界面里。
+    """
+    drives = _windows_drives()
+    raw = (path or "").strip().strip('"').strip("'")
+    if not raw:
+        raw = os.path.expanduser("~")
+    # 用户可能手输了一个反斜杠结尾或重复分隔符；realpath 会把它们归一。
+    # 注意 realpath 在路径不存在时**不报错**，只做字符串归一 —— 所以后面必须再判存在。
+    target = os.path.realpath(os.path.expandvars(os.path.expanduser(raw)))
+
+    out: Dict[str, Any] = {
+        "path": target,
+        # parent 为 None 表示已经在最顶层（盘符根 / 根目录），前端据此禁用"上一级"
+        "parent": None,
+        "drives": drives,
+        "shortcuts": _shortcuts(),
+        "entries": [],
+        "truncated": False,
+        "skipped_hidden": 0,
+        # 默认不可用；只有成功列出来、且不是危险目录时才置 True。
+        # 提前放默认值是为了让所有错误分支的返回形状**一致** ——
+        # 前端读 undefined 会把"不能选"当成"能选"。
+        "usable": False,
+        "blocked_reason": None,
+    }
+
+    parent = os.path.dirname(target)
+    if parent and parent != target:
+        out["parent"] = parent
+
+    if not os.path.exists(target):
+        out["error"] = "not_found"
+        out["detail"] = "这个路径不存在。"
+        return out
+    if not os.path.isdir(target):
+        out["error"] = "not_a_dir"
+        out["detail"] = "这是一个文件，不是目录。请选它所在的目录。"
+        return out
+
+    try:
+        entries = []
+        hidden = 0
+        with os.scandir(target) as it:
+            for e in it:
+                try:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                name = e.name
+                # **只跳过点开头的隐藏目录**（.git / .venv / .crucible）：
+                # 它们既不能当工作区根，进去也什么都没有。
+                #
+                # 刻意**不**按 _SKIP_DIRS 过滤 node_modules / dist / build ——
+                # 那是索引扫描的规则，不是浏览的规则。用户在这里是主动看磁盘，
+                # 藏掉目录只会让他觉得"这个文件夹是空的"。
+                if name.startswith("."):
+                    hidden += 1
+                    continue
+                full = os.path.join(target, name)
+                marker = next((m for m in _PROJECT_MARKERS
+                               if os.path.exists(os.path.join(full, m))), "")
+                entries.append({
+                    "name": name,
+                    "path": full,
+                    "project": marker,
+                    "has_git": os.path.isdir(os.path.join(full, ".git")),
+                })
+                if len(entries) >= max_entries:
+                    out["truncated"] = True
+                    break
+    except PermissionError:
+        out["error"] = "permission_denied"
+        out["detail"] = "没有权限读取这个目录。"
+        return out
+    except OSError as e:
+        out["error"] = "listdir_failed"
+        out["detail"] = "读不了这个目录：%s" % e
+        return out
+
+    entries.sort(key=lambda x: x["name"].lower())
+    out["entries"] = entries
+    out["count"] = len(entries)
+    # 跳过的隐藏目录要报出个数 —— 静默省略会让人以为磁盘上就这么多东西
+    out["skipped_hidden"] = hidden
+    # 是否可写要如实报：不可写的目录当工作区，agent 一动手就全失败，
+    # 与其让它之后报一堆写失败，不如现在就显示出来。
+    out["writable"] = os.access(target, os.W_OK)
+    out["has_git"] = os.path.isdir(os.path.join(target, ".git"))
+    out["project"] = next((m for m in _PROJECT_MARKERS
+                           if os.path.exists(os.path.join(target, m))), "")
+    # 根目录不算项目。允许选中它，但要提示后果：agent 会在这个巨型目录里
+    # 建索引、跑 grep —— 慢到不可用，而且 .crucible 会落在系统盘根上。
+    out["is_root"] = os.path.dirname(target) == target
+    # 能不能当工作区，**在浏览时就说**，不要等用户点"选这个"才报错。
+    blocked = _dangerous_workspace(target)
+    out["usable"] = blocked is None
+    out["blocked_reason"] = blocked
+    return out
+
+
+def _dangerous_workspace(path: str) -> Optional[str]:
+    """返回"不该当工作区"的理由，能当就返回 None。
+
+    这不是权限控制（那是 policy 的事），而是**免得出事之后再解释**：
+    把 C:\\Windows 设成工作区，agent 的写操作会直接改系统文件。
+    """
+    p = os.path.realpath(path).rstrip("\\/").lower()
+    if not p:
+        return None
+    if os.name != "nt":
+        for bad in ("/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc"):
+            if p == bad or p.startswith(bad + "/"):
+                return "系统目录不能作为工作区：%s" % bad
+        return None
+    if len(p) == 2 and p[1] == ":":           # c: 这种盘符根
+        return "盘符根目录不能作为工作区 —— 索引与搜索会扫全盘。" \
+               "请选盘里的一个具体目录。"
+    for bad in ("c:\\windows", "c:\\program files", "c:\\program files (x86)",
+                "c:\\programdata", "c:\\$recycle.bin"):
+        if p == bad or p.startswith(bad + "\\"):
+            return "系统目录不能作为工作区：%s。agent 会在工作区里写文件，" \
+                   "改这里会破坏系统。" % bad
+    return None
 
 
 # 终端白名单：只允许**只读、只读工作区、不改变系统状态**的命令。

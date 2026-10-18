@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -241,6 +242,144 @@ class GoalCheck:
     text: str
     satisfied: bool
     evidence: str = ""
+    seq: Optional[int] = None       # 证据来自轨迹第几条消息（可回溯到 rollout）
+
+
+# ══════════════════════════════════════════════════════════════════
+# 条件 → 可观测信号
+# ══════════════════════════════════════════════════════════════════
+# 设计要点：**不解析模型的话**，而是把条件文本翻译成「什么样的工具结果
+# 才算这条条件的证据」。这一步是确定性的、可复现的、可单元测试的 ——
+# 与 verify.py 开头那条铁律一致：只看结构化数据。
+#
+# 为什么不用 LLM 判官：判官要读模型输出，而模型输出可被提示注入操纵
+# （书 §1）。更要紧的是 —— 一个恒真的判官比没有判官更坏，它会把
+# "看起来完成了" 固化成 "已完成"。
+
+_TOOL_NAMES = ("read_file", "list_dir", "glob", "grep", "apply_patch", "shell")
+
+# 中文动词 → 工具名。**刻意不用模糊语义**，只做明确的词面映射；
+# 认不出任何信号的条件下文会被标为「无法绑定证据」，如实报告而不是猜。
+_VERB_TO_TOOL = (
+    ("apply_patch", ("修改", "改动", "写入", "新建", "创建", "生成", "补丁",
+                     "删除", "重命名", "重构", "实现", "edit", "modify",
+                     "create", "write", "add", "patch", "delete", "implement")),
+    ("read_file",   ("读取", "读一下", "查看内容", "看内容", "打开文件",
+                     "read", "open file", "cat")),
+    ("grep",        ("搜索内容", "内容搜索", "检索", "内含", "grep")),
+    ("glob",        ("按文件名", "文件名匹配", "查找文件", "找到文件", "glob")),
+    ("list_dir",    ("列出", "列举", "目录结构", "项目结构", "list", "ls")),
+    ("shell",       ("运行", "执行命令", "跑测试", "构建", "编译", "安装",
+                     "run", "execute", "build", "test", "install", "npm",
+                     "pytest", "git ")),
+)
+
+# 读类工具：它们出现在 actual_paths 里只说明"碰过这个路径"，**不代表产生了它**。
+# 路径证据必须来自写操作，否则 `read_file a.txt` 会让"创建 a.txt"误判为满足。
+_READ_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep"})
+
+# 「写」类工具：真的会产生/改变文件的动作。条件要求"创建/修改 X"时，
+# 任何一个写工具命中 X 都算证据 —— 因为**结果**才是判据。
+# 实测教训：模型经常用 `shell`（`printf > notes/hello.txt`）而不是 apply_patch
+# 来建文件。若只认 apply_patch，闸门就会在文件确实已落盘时仍报"未满足"，
+# 也就是闸门自己在说假话 —— 那比没有闸门更坏。
+_WRITE_TOOLS = frozenset({"apply_patch", "shell"})
+
+# 条件文本里出现这些词 = 该条件要求的是**写**类动作
+_WRITE_INTENT = ("创建", "新建", "写入", "生成", "修改", "改动", "删除", "重命名",
+                 "保存", "添加", "补丁", "输出到",
+                 "create", "write", "generate", "modify", "edit", "delete",
+                 "add", "save", "patch", "produce")
+
+# 可以被判定为「已执行」的命令名（出现在条件里即视为要求实际跑一次）
+_COMMAND_TOKENS = ("pytest", "unittest", "npm", "node", "python", "pip",
+                   "git", "make", "cargo", "go test", "mvn", "gradle",
+                   "npm run", "py_compile")
+
+# 路径样 token：带扩展名，或含 `/`。刻意保守，不把普通英文单词当路径。
+_PATH_RE = re.compile(
+    r"(?:[A-Za-z0-9_.\-]*/)+[A-Za-z0-9_.\-*]+"          # 含斜杠的路径
+    r"|[A-Za-z0-9_\-*]+\.[A-Za-z0-9]{1,8}\b"            # 带扩展名的文件名
+)
+
+
+@dataclass
+class GoalSignal:
+    """一条条件翻译出的可观测信号。"""
+
+    tool: Optional[str] = None
+    paths: List[str] = field(default_factory=list)
+    command: Optional[str] = None
+    # 条件要求的是"产生/改变文件"类动作（而不是仅仅触碰某个路径）
+    wants_write: bool = False
+
+    @property
+    def has_signal(self) -> bool:
+        """有没有任何可用于绑定证据的信号。没有 = 无法自动判定。"""
+        return bool(self.tool or self.paths or self.command)
+
+
+def _extract_signals(text: str) -> GoalSignal:
+    """把一条自然语言条件翻译成可观测信号。
+
+    只做**词面级**翻译，不做语义推理 —— 认不出就留空，
+    由上层如实报告「无法绑定证据」，而不是猜一个。
+    """
+    low = (text or "").lower()
+    sig = GoalSignal()
+
+    # 1. 路径
+    for m in _PATH_RE.finditer(text or ""):
+        tok = m.group(0).strip("`《》\"'(),;，。")
+        if tok and tok not in sig.paths:
+            sig.paths.append(tok)
+
+    # 2. 命令
+    for c in _COMMAND_TOKENS:
+        if c in low:
+            sig.command = c
+            break
+
+    # 3. 动词 → 工具
+    for tool, verbs in _VERB_TO_TOOL:
+        if any(v in low for v in verbs):
+            sig.tool = tool
+            break
+
+    # 4. 显式写出工具名（最可靠的信号，优先级最高）
+    for name in _TOOL_NAMES:
+        if name in low:
+            sig.tool = name
+            break
+
+    # 5. 只有命令没有工具 → 命令必走 shell
+    if sig.command and not sig.tool:
+        sig.tool = "shell"
+
+    # 6. 写意图
+    sig.wants_write = any(w in low for w in _WRITE_INTENT)
+
+    return sig
+
+
+def _path_match(pattern_token: str, actual: str) -> bool:
+    """条件里的路径 token 是否覆盖了某个实际路径。
+
+    用 `fnmatch` 语义，并额外做 basename 兜底 —— 条件常写 `index.html`
+    而结果是 `snake/index.html`，这两者指的是同一个文件。
+    """
+    import fnmatch
+    p = (pattern_token or "").replace("\\", "/").strip()
+    a = (actual or "").replace("\\", "/").strip()
+    if not p or not a:
+        return False
+    if p == a:
+        return True
+    if fnmatch.fnmatch(a, p) or fnmatch.fnmatch(a, "*/" + p.lstrip("/")):
+        return True
+    if "/" not in p and (a == p or a.endswith("/" + p)):
+        return True
+    return False
 
 
 class GoalVerifier:
@@ -248,26 +387,210 @@ class GoalVerifier:
 
     **它只判断证据是否充分，不参与实际工作** —— 这正是书 §1
     「提议者—审核者」的要求：评判方与产出方不共享上下文，判断才客观。
+
+    ## 判定语义（刻意保守，三类状态）
+
+    | 状态 | 含义 |
+    | --- | --- |
+    | satisfied | 挂上了**确定性匹配**到的工具结果证据 |
+    | pending   | 条件可绑定，但本次会话还没出现对应证据 |
+    | unmatched | 条件里没有任何可识别信号，**无法自动判定**（如实暴露，不猜） |
+
+    `all_met` 的含义是「所有条件都挂上了证据」，而不是「模型说完成了」。
+
+    ## 为什么不用 LLM 当判官
+
+    验证层的第一条铁律是只看结构化数据。让模型来判断自己的任务完成度，
+    等于把审核者并进提议者 —— 而书 §1 明确写了「前提是自审不可靠」。
+    这里是确定性匹配器：`apply_patch` 真的写了 `index.html`，
+    就只能证明「有文件被写入」，**不能**证明「写进去的内容是对的」。
+    所以证据文本会如实写清这一点（见 `_evidence_text`）。
     """
 
     def __init__(self, conditions: List[str]) -> None:
         self.conditions = list(conditions)
+        self._signals: List[GoalSignal] = [_extract_signals(c) for c in self.conditions]
         self._results: List[GoalCheck] = []
+        # 每条条件的累计覆盖：已证据化的路径 / 已命中的工具
+        self._covered: List[set] = [set() for _ in self.conditions]
+        self._tool_hits: List[set] = [set() for _ in self.conditions]
+        self._cmd_hits: List[set] = [set() for _ in self.conditions]
+        self._evidence: List[List[str]] = [[] for _ in self.conditions]
+        # 被**外部显式登记**为已满足的条件索引。
+        # 必须与信号判定分开存：否则无信号条件（"文案读起来自然"）会被
+        # `_is_satisfied` 的 `has_signal` 早退吞掉，逃生口形同虚设。
+        self._external: set = set()
 
-    def record(self, text: str, satisfied: bool, evidence: str) -> None:
-        self._results.append(GoalCheck(text, satisfied, evidence))
+    # ---------- 观察（唯一的自动入口） ----------
+    def observe(self, tool: str, args: Dict[str, Any], result: ToolResult,
+                seq: Optional[int] = None) -> List[str]:
+        """喂进一次工具执行结果，尝试把它挂到各条条件上。
+
+        返回**本次刚刚变成 satisfied 的条件文本**（供循环发事件）。
+
+        纪律：
+          · 只接受 `result.ok is True` 的结果 —— 失败的工具输出不是证据。
+          · 只做确定性匹配，匹配不上就什么都不做（宁可 pending）。
+        """
+        if not self.conditions or not result.ok:
+            return []
+
+        actual_paths = self._paths_of(args, result)
+        newly: List[str] = []
+
+        for i, sig in enumerate(self._signals):
+            if not sig.has_signal:
+                continue
+            before = self._is_satisfied(i)
+
+            # ── 证据门控 ──
+            #
+            # 目标是"产生/改变文件"（wants_write）时：
+            #   · 必须来自**写类工具**（apply_patch / shell）
+            #   · 读类工具即使报出同一路径也**不算** —— 否则 `read_file a.txt`
+            #     会把"创建 a.txt"误判为满足（一个真实的假阳性通道）
+            #   · 不要求恰好是 apply_patch：实测模型常用 `shell` 直接重定向写文件，
+            #     若死认工具名，闸门会在文件确实落盘时仍报未满足（假阴性）
+            #
+            # 目标只是"看到/读到某文件"时：读类与写类都算证据。
+            if sig.wants_write and tool not in _WRITE_TOOLS:
+                continue
+            if tool in _READ_TOOLS and sig.wants_write:
+                continue
+
+            if sig.paths:
+                for want in sig.paths:
+                    for got in actual_paths:
+                        if _path_match(want, got):
+                            self._covered[i].add(want)
+                            self._note(i, f"{tool} 落盘 {got}")
+            if sig.command and tool == "shell":
+                cmd_text = str(args.get("command") or "")
+                if sig.command.lower() in cmd_text.lower():
+                    self._cmd_hits[i].add(sig.command)
+                    self._note(i, f"shell 执行 `{cmd_text[:80]}`"
+                                 + ("（退出码 0）" if result.exit_code in (0, None) else
+                                    f"（退出码 {result.exit_code}）"))
+            if sig.tool and not sig.paths and not sig.command:
+                self._tool_hits[i].add(tool)
+                self._note(i, f"{tool} 成功执行")
+
+            if not before and self._is_satisfied(i):
+                newly.append(self.conditions[i])
+
+        return newly
+
+    def _paths_of(self, args: Dict[str, Any], result: ToolResult) -> List[str]:
+        out: List[str] = []
+        for p in (result.files_changed or []):
+            if p:
+                out.append(str(p))
+        for key in ("path",):
+            v = args.get(key)
+            if isinstance(v, str) and v.strip() and v.strip() != ".":
+                out.append(v.strip())
+        meta = result.meta or {}
+        v = meta.get("path")
+        if isinstance(v, str) and v.strip() and v.strip() != ".":
+            out.append(v.strip())
+        # glob 结果：文件名清单本身也算"找到了这些文件"的佐证
+        if result.meta and isinstance(result.meta.get("matches"), list):
+            out.extend(str(x) for x in result.meta["matches"])
+        return out
+
+    def _note(self, i: int, text: str) -> None:
+        if text not in self._evidence[i]:
+            self._evidence[i].append(text)
+
+    def _is_satisfied(self, i: int) -> bool:
+        """纯函数式判定：结构化累计量是否已经足够。"""
+        # 外部显式登记优先 —— 它是人工/评审 UI 的覆盖入口
+        if i in self._external:
+            return True
+        sig = self._signals[i]
+        if not sig.has_signal:
+            return False
+        if sig.paths:
+            return all(w in self._covered[i] for w in sig.paths)
+        if sig.command:
+            return sig.command in self._cmd_hits[i]
+        if sig.tool:
+            return bool(self._tool_hits[i])
+        return False
+
+    # ---------- 手工登记（保留的逃生口） ----------
+    def record(self, text: str, satisfied: bool, evidence: str,
+               seq: Optional[int] = None) -> None:
+        """人工/外部显式登记一条判定结果。
+
+        保留这个入口是为了让上层（未来的评审 UI、测试夹具）能够显式
+        覆盖自动判定；自动路径走 `observe()`。
+
+        **无信号的条件只能靠这个入口达成** —— 比如"文案读起来自然"
+        这类主观条件，机器无法自动判定，必须有人显式登记。
+        """
+        self._results.append(GoalCheck(text, satisfied, evidence, seq))
+        if not satisfied:
+            return
+        for i, c in enumerate(self.conditions):
+            if c == text:
+                self._evidence[i] = [evidence or "（外部登记）"]
+                self._external.add(i)
+
+    # ---------- 报告 ----------
+    def _status(self, i: int) -> str:
+        if self._is_satisfied(i):
+            return "satisfied"
+        if not self._signals[i].has_signal:
+            return "unmatched"
+        return "pending"
 
     def report(self) -> Dict[str, Any]:
-        done = sum(1 for r in self._results if r.satisfied)
+        items: List[Dict[str, Any]] = []
+        satisfied = pending = unmatched = 0
+        for i, c in enumerate(self.conditions):
+            st = self._status(i)
+            if st == "satisfied":
+                satisfied += 1
+            elif st == "pending":
+                pending += 1
+            else:
+                unmatched += 1
+            items.append({
+                "text": c,
+                "ok": st == "satisfied",
+                "status": st,
+                "evidence": self._evidence_text(i) if st == "satisfied" else "",
+            })
+        # 外部显式登记的（不走信号匹配）也计入
+        for r in self._results:
+            if r.satisfied and not any(it["text"] == r.text for it in items):
+                satisfied += 1
+                items.append({"text": r.text, "ok": True, "status": "satisfied",
+                              "evidence": r.evidence, "external": True})
+
         return {
             "total": len(self.conditions),
-            "checked": len(self._results),
-            "satisfied": done,
-            "all_met": bool(self.conditions) and done >= len(self.conditions),
-            "items": [{"text": r.text, "ok": r.satisfied, "evidence": r.evidence}
-                      for r in self._results],
+            "checked": satisfied,
+            "satisfied": satisfied,
+            "pending": pending,
+            "unmatched": unmatched,
+            # 「所有条件都挂上了证据」—— 而不是「模型说完成了」
+            "all_met": bool(self.conditions) and satisfied >= len(self.conditions),
+            "items": items,
+            "basis": ("确定性证据绑定：只认工具结果的结构化字段"
+                      "（落盘路径 / 退出码 / ok），不读模型文本。"
+                      "证据只说明「这个动作发生了」，不构成对内容正确性的判断。"),
         }
 
+    def _evidence_text(self, i: int) -> str:
+        notes = self._evidence[i]
+        return "；".join(notes[:4]) if notes else "（无）"
+
     def unmet(self) -> List[str]:
-        met = {r.text for r in self._results if r.satisfied}
-        return [c for c in self.conditions if c not in met]
+        return [c for i, c in enumerate(self.conditions) if self._status(i) != "satisfied"]
+
+    def unmatched(self) -> List[str]:
+        """条件里没有任何可识别信号 —— 需要人工审阅或改写条件。"""
+        return [c for i, c in enumerate(self.conditions)
+                if self._status(i) == "unmatched"]

@@ -63,6 +63,18 @@ class LoopConfig:
     # 空闲看门狗（书 §5：每个长连接都需要活性信号）
     idle_timeout_s: float = 90.0
 
+    # ── 上下文压缩（arXiv 2608.22752：不压缩/乱压缩都会出事）──
+    # 在 token 用量达到预算的这个比例时触发压缩，**而不是等爆掉**。
+    # 为什么不等到 100%：书里与前沿都指出，模型在窗口填满**之前**
+    # 回忆能力就开始下降（context rot），"接近上限才压缩"是错的时机。
+    compact_at_ratio: float = 0.55
+    # 压缩时保留最近多少条消息不参与压缩
+    compact_keep_recent: int = 8
+    # 两次压缩之间至少间隔多少轮（避免反复压缩同一条尾巴）
+    compact_min_interval: int = 6
+    # 最多压缩几次（每次压缩都有信息损失，必须有上限）
+    max_compactions: int = 6
+
     # 即时 lint 开关（书 §5「即时语法反馈机制」）
     lint_after_edit: bool = True
 
@@ -147,6 +159,14 @@ class AgentLoop:
         self._current_batch_is_text = False
         # 上一条模型回复的工具调用是否来自文本协议（供 _execute_tool_calls 读取）
         self._last_reply_was_text_protocol = False
+        # 上下文压缩计数（用于间隔与上限闸）
+        self._compactions = 0
+        self._last_compact_iter = -999
+        # 目标未达成时的纠正次数。上限 2（书 §5：每条恢复路径都要有上限）——
+        # 意图纠正那套的上限也是 2；两类纠正各自计数，互不挤占。
+        self._goal_retries = 0
+        # 已经发过事件的目标条件（避免同一条重复刷屏）
+        self._goal_announced: set = set()
 
     # ------------------------------------------------------------------
     # 主入口
@@ -158,6 +178,18 @@ class AgentLoop:
                       sandbox=self.policy.sandbox.value,
                       approval=self.policy.approval.value,
                       tool_order=self.registry.names())
+
+        # 目标条件里如果有**无法自动判定**的，开场就说清楚。
+        # 这一类既不满足也不阻断，但绝不能沉默 —— 沉默会让人以为
+        # "没有报未达成" 等于 "已达成"，那正是书 §1 警告的"看上去正常的失败"。
+        unmatched0 = self.goal.unmatched() if self.goal.conditions else []
+        if unmatched0:
+            self.bus.emit(EventType.CHECK, scope="goal", ok=False,
+                          warning="unmatched_conditions",
+                          reason=(f"{len(unmatched0)} 条目标条件里没有任何可识别的工具信号，"
+                                  "**无法自动判定**，需要人工复核。"),
+                          items=[{"text": c, "ok": False, "status": "unmatched"}
+                                 for c in unmatched0])
 
         m = self.context.append_user(user_message)
         self.session.persist_message(m)
@@ -184,6 +216,9 @@ class AgentLoop:
 
             self._iterations += 1
             self.watchdog.beat()
+
+            # ── 上下文压缩（在状态栏之前做，让新状态栏落在压缩块之后）──
+            self._maybe_compact()
 
             # ── 状态栏：追加到末尾，不碰前缀（书 §2）──
             if self.cfg.inject_status:
@@ -257,13 +292,12 @@ class AgentLoop:
                                       cls="intent_without_action",
                                       reason="模型描述了将要执行的动作，但没有实际调用工具。"
                                              "已把这一点作为反馈回灌，要求它真正调用。")
-                        self._append_tool_result(
-                            "",
+                        self._append_correction(
                             "[这不是工具结果，是一条纠正指令] 你上一条回复只是在**描述**"
                             "将要做什么，但没有实际发起工具调用，因此什么都没有发生。"
                             "如果你确实需要读取文件或执行操作，请立即发出工具调用；"
                             "如果任务已经完成，请直接给出最终结论并说明依据。",
-                            "harness")
+                        )
                         continue
                     # 连续多次仍不调用 → 如实报告，不假装完成
                     return self._finish(
@@ -275,8 +309,35 @@ class AgentLoop:
 
                 if self.goal.conditions and not self.goal.report()["all_met"]:
                     # 书 §5：「给出了回答」不等于「完成了任务」。
-                    # 目标未全部达成时，如实报告未达成，而不是把回答当成功。
+                    #
+                    # 这里刻意**不是**直接终止 —— 早期版本一到这儿就收尾，
+                    # 结果是闸门只会"报告失败"而从不尝试补救。
+                    # 那比没有闸门更坏：它把未完成固化成了一条看起来
+                    # 很严谨的失败理由，人反而更容易接受它。
+                    #
+                    # 正确做法与 intent_without_action 同源：**把缺口作为反馈回灌**，
+                    # 让模型自己补。但上限同样是 2 —— 不能把闸门变成死循环。
                     unmet = self.goal.unmet()
+                    unmatched = self.goal.unmatched()
+                    if self._goal_retries < 2:
+                        self._goal_retries += 1
+                        self.bus.emit(EventType.ERROR, error_layer=ERR_CONTROL,
+                                      cls="goal_unmet",
+                                      reason=f"还有 {len(unmet)} 条目标条件没有证据，"
+                                             "已把缺口作为反馈回灌，要求补齐。",
+                                      unmet=unmet, attempt=self._goal_retries)
+                        self._append_correction(
+                            "[这不是工具结果，是一条目标校验反馈] 你给出了最终回答，"
+                            f"但以下在开始时声明的目标条件**没有挂上任何工具证据**：\n"
+                            + "\n".join(f"  · {c}" for c in unmet)
+                            + ("\n（另有 " + str(len(unmatched)) + " 条条件无法自动判定，"
+                               "它们不计入上述缺口。）" if unmatched else "")
+                            + "\n请不要再只给结论：**实际调用工具**去完成这些条件，"
+                            "让它们在事件流里留下可复核的痕迹（落盘路径 / 退出码）。"
+                            "如果某条条件确实无法用工具达成，请明确说明原因。",
+                        )
+                        continue
+                    # 纠正次数用尽 → 如实报告未达成，绝不假装成功
                     return self._finish(
                         "completed",
                         f"模型给出了最终回答，但以下在开始时声明的目标条件尚未满足：\n"
@@ -412,6 +473,23 @@ class AgentLoop:
             else:
                 self._consecutive_failures = 0
 
+            # ── 目标证据绑定（确定性，只吃结构化字段）──
+            # 位置刻意在验证通过之后：**失败的工具输出不构成证据**。
+            # 这里只做匹配，不做判断 —— 见 verify.GoalVerifier 的说明。
+            if self.goal.conditions:
+                newly = self.goal.observe(call.name, call.args, result,
+                                          seq=self.context.trajectory()[-1].seq
+                                          if self.context.trajectory() else None)
+                for cond in newly:
+                    if cond in self._goal_announced:
+                        continue
+                    self._goal_announced.add(cond)
+                    self.bus.emit(EventType.CHECK, scope="goal", ok=True,
+                                  newly_met=cond,
+                                  satisfied=self.goal.report()["satisfied"],
+                                  total=self.goal.report()["total"],
+                                  items=self.goal.report()["items"])
+
             # ── 即时 lint（书 §5）──
             text = result.text
             if (self.cfg.lint_after_edit and result.ok
@@ -455,6 +533,30 @@ class AgentLoop:
         # 早期版本在这里又发了一条 `persisted=True` 的事件，造成同一次工具结果
         # 被广播两次 —— 前端因为没有 call_id 而无法合并，渲染成两张卡片，
         # 看起来像「执行了两次」。事件的唯一性也要靠纪律保证，不能靠自觉。
+
+    def _append_correction(self, text: str) -> None:
+        """回灌一条**harness 自己的**纠正指令。
+
+        ## 为什么不能复用 `_append_tool_result`
+
+        实测踩到：目标未达成时，模型上一条回复是"空口说完成了"，
+        **里面根本没有 tool_calls**。此时若追加一条 role=tool 的消息，
+        历史里就会出现一条孤立的工具结果 —— 上游立刻 400：
+        `tool calls and tool results do not match, please start a new
+        conversation and retry`。
+
+        这不是配额或模型名的问题，是轨迹结构被我们搞坏了。
+        工具结果只能紧跟**它自己那条** tool_calls；harness 的纠正
+        不属于任何一次工具调用，所以必须走普通用户消息。
+
+        这个 bug 的精妙之处在于它**第一轮不炸**：崩溃点落在第二次请求上，
+        而且报的是 400（被归类为"不可重试"），看起来像配置错误。
+        """
+        m = Message.user(text)
+        m.meta["kind"] = "correction"
+        m.meta["from"] = "harness"
+        self.context.append(m)
+        self.session.persist_message(m)
 
     def _format_error(self, call: ToolCall, result: ToolResult) -> str:
         """把工具错误**作为模型的输入**（书 §5）。
@@ -556,6 +658,58 @@ class AgentLoop:
         # 状态栏消息也落盘（它是轨迹的一部分，重放时需要）
         if self.context.trajectory():
             self.session.persist_message(self.context.trajectory()[-1])
+
+    def _maybe_compact(self) -> None:
+        """在合适的时机压缩上下文。
+
+        这是之前**完全缺失**的一环：`context.compact()` 早就写好了，
+        但从来没有调用点 —— 长会话根本不压缩，超过窗口后行为未定义。
+
+        触发条件是**用量比例**而不是"等爆"：前沿共识是模型在窗口填满
+        **之前**回忆能力就开始下降（context rot），等到 100% 才压缩已经太晚。
+
+        三道闸（任何一道不满足就不压）：
+          1. 用量占比 ≥ `compact_at_ratio`
+          2. 距上次压缩 ≥ `compact_min_interval` 轮（避免反复压同一条尾巴）
+          3. 累计压缩次数 < `max_compactions`（每次都有信息损失，必须有上限）
+
+        摘要器刻意**不调模型**：治理层不与产出层共享上下文（书 §5），
+        而且压缩发生在循环关键路径上，一次额外的模型往返会显著拖慢。
+        `retention.build_summary_text` 提供了确定性的结构化摘要，
+        它已经区分了硬约束 / 环境事实 / 模型推断。
+        """
+        if self.cfg.max_compactions <= 0:
+            return
+        if self._compactions >= self.cfg.max_compactions:
+            return
+        if self._iterations - self._last_compact_iter < self.cfg.compact_min_interval:
+            return
+
+        used = self._total_tokens()
+        ratio = used / max(1, self.cfg.max_tokens_budget)
+        if ratio < self.cfg.compact_at_ratio:
+            return
+
+        # 摘要器：用保留模块里的确定性摘要（不调模型）
+        def _summarizer(messages):
+            from .retention import _fallback_summary
+            return _fallback_summary(messages, max_chars=240)
+
+        block = self.context.compact(
+            _summarizer, keep_recent=self.cfg.compact_keep_recent)
+        if block is None:
+            return
+
+        self._compactions += 1
+        self._last_compact_iter = self._iterations
+        # 落盘 + 发事件：压缩必须是**可观察**的，否则"东西什么时候没的"无从追查
+        self.session.persist_message(block)
+        self.bus.emit(EventType.COMPACTED,
+                      covers=block.meta.get("covers_seq"),
+                      plan=block.meta.get("plan"),
+                      audit=block.meta.get("audit"),
+                      usage_ratio=round(ratio, 3),
+                      compaction_no=self._compactions)
 
     def _needs_text_protocol(self) -> bool:
         """模型是否需要用文本协议表达工具调用。

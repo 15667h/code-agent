@@ -189,12 +189,44 @@
         };
 
       case "check":
+        // 目标判定有三种状态：satisfied / pending / unmatched。
+        // 不能都渲染成一个叉 —— "无法自动判定"和"确实没做到"是两回事，
+        // 混在一起会让人误以为闸门在瞎报。
+        var goalScope = d.scope === "goal";
+        // 首次挂上证据的单条事件（newly_met）只报一条增量，不刷整块清单
+        if (goalScope && d.newly_met) {
+          return {
+            kind: "check", state: "done", tsOffset: tsOffset,
+            title: "目标条件已挂上证据",
+            model: "goal evaluator",
+            items: [{ ok: true, text: d.newly_met + "（" + (d.satisfied || 0) + "/" + (d.total || 0) + "）" }],
+          };
+        }
+        if (goalScope && d.warning === "unmatched_conditions") {
+          return {
+            kind: "check", state: "done", tsOffset: tsOffset,
+            title: "目标条件无法自动判定",
+            model: "goal evaluator",
+            items: (d.items || []).map(function (it) {
+              return { ok: false, warn: true, text: it.text + " —— 无法自动判定，需人工复核" };
+            }),
+          };
+        }
         return {
           kind: "check", state: "done", tsOffset: tsOffset,
-          title: d.scope === "goal" ? "目标达成判定" : "工具结果验证",
-          model: d.scope === "goal" ? "goal evaluator" : "verifier",
+          title: goalScope ? "目标达成判定" : "工具结果验证",
+          model: goalScope ? "goal evaluator" : "verifier",
           items: (d.items || []).map(function (it) {
-            return { ok: !!it.ok, text: it.text || it.reason || String(it) };
+            var st = it.status;
+            return {
+              ok: !!it.ok,
+              // unmatched 用"未知"语气，不能用"失败"语气
+              warn: st === "unmatched" || st === "pending",
+              text: (it.text || it.reason || String(it))
+                + (it.evidence ? " · 证据：" + it.evidence : "")
+                + (st === "unmatched" ? " · 无法自动判定" : "")
+                + (st === "pending" ? " · 尚无证据" : ""),
+            };
           }),
         };
 

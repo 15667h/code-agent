@@ -1668,6 +1668,18 @@ body.is-col-resizing { cursor: col-resize; user-select: none; }
 }
 .checklist svg { width: 12px; height: 12px; margin-top: 3px; flex: none; color: var(--jade); }
 
+/* 「不确定」语气：用琥珀而非语义绿的衍生色。
+   目的不是报警，而是让"无法自动判定"看起来**仍待确认**，
+   而不是已经失败 —— 之前两者共用一个警示图标，等于把未知说成了坏消息。 */
+.checkcard--warn {
+  border-color: color-mix(in oklab, var(--amber) 34%, var(--border)) !important;
+  background: color-mix(in oklab, var(--amber) 8%, transparent) !important;
+}
+.checkcard--warn .checkcard__title { color: var(--amber); }
+.checkcard--warn > .checkcard__head svg { color: var(--amber); }
+.checklist__item--warn { color: var(--text-muted); }
+.checklist__item--warn svg { color: var(--amber); }
+
 /* 中断 / 已停止 */
 .ev--halt .haltbar {
   display: flex;

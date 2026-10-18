@@ -1919,6 +1919,215 @@ class TestTextToolCallFallback(unittest.TestCase):
         self.assertNotIn("<tool_call>", rendered.get("content") or "")
 
 
+class TestTypedRetention(unittest.TestCase):
+    """类型化上下文保留 —— 防「压缩悬崖」。
+
+    arXiv 2608.22752（CIKM 2026）实测：不加区分的摘要会把安全规则
+    保留率打到 1 轮 53%、5 轮 10%。原因是规则需要精确措辞才可执行，
+    而情节日志只需要大意，两者同速率摘要时先死的必然是规则。
+
+    这组测试锁住三条不变量：
+      1. 硬约束**永不进摘要器**
+      2. 摘要条目**必须标来源**（环境事实 vs 模型推断）
+      3. 压缩必须是**追加**，不改已有消息
+    """
+
+    def _ctx(self, constraint_in_prompt: bool = True):
+        from harness.context import ContextBuilder, StaticPrefix
+        sys_prompt = "你是助手。"
+        if constraint_in_prompt:
+            sys_prompt += "\n不要修改工作区以外的任何路径。危险命令必须审批。"
+        return ContextBuilder(StaticPrefix(sys_prompt, []))
+
+    def _fill(self, ctx, n: int = 10):
+        from harness.protocol import Message, ToolCall
+        ctx.append_user("重构 a.py。不要修改工作区以外的任何路径。")
+        for i in range(n):
+            ctx.append_assistant(content="", tool_calls=[ToolCall("read_file", {"path": f"f{i}.py"})])
+            ctx.append(Message.tool_result("", f"file {i} " + "x" * 150, "read_file"))
+            ctx.append_assistant(content=f"第 {i} 步：claude 我认为这看起来像个模块。")
+
+    def test_constraint_never_enters_summarizer(self):
+        """**核心不变量**：约束消息不得进入摘要器。
+
+        用一个会记录收到什么的假摘要器直接验证 ——
+        如果约束进去了，测试就红。
+        """
+        from harness.retention import classify, plan_compaction, Kind
+        from harness.protocol import Message
+        ctx = self._ctx()
+        self._fill(ctx)
+        traj = ctx.trajectory()
+        plan = plan_compaction(traj)
+
+        for m in plan.to_summarize:
+            self.assertNotEqual(classify(m), Kind.CONSTRAINT,
+                                "约束消息 seq=%s 不该出现在待摘要列表里" % m.seq)
+        self.assertTrue(plan.verbatim, "至少应有一条约束被原样保留")
+
+    def test_compaction_block_keeps_constraints_verbatim(self):
+        """压缩块里必须原样出现约束原文，且标为不可改写。"""
+        from harness.retention import _fallback_summary
+        ctx = self._ctx()
+        self._fill(ctx)
+        blk = ctx.compact(lambda ms: _fallback_summary(ms, 120), keep_recent=6)
+        self.assertIsNotNone(blk)
+        self.assertIn("不要修改工作区以外的任何路径", blk.content,
+                      "硬约束原文必须原样出现在压缩块里")
+        self.assertIn("[硬约束", blk.content, "必须有显式的约束区块标记")
+        self.assertTrue(blk.meta["audit"]["has_constraint_block"])
+
+    def test_summary_labels_sources(self):
+        """摘要条目要区分 `[环境]` 与推断，不能让推断以事实语气进入上下文。"""
+        from harness.retention import _fallback_summary
+        ctx = self._ctx()
+        self._fill(ctx)
+        blk = ctx.compact(lambda ms: _fallback_summary(ms, 120), keep_recent=6)
+        self.assertIn("[环境]", blk.content, "工具结果必须标为环境事实")
+        self.assertIn("[推断]", blk.content,
+                      "必须有对推断的标注说明（即便当前没有推断条目）")
+
+    def test_compaction_only_appends(self):
+        """压缩**只追加**，绝不修改或删除已有消息（append-only 纪律）。"""
+        ctx = self._ctx()
+        self._fill(ctx, 8)
+        before = [(m.seq, m.role, m.content) for m in ctx.trajectory()]
+        ctx.compact(lambda ms: "", keep_recent=4)
+        after = [(m.seq, m.role, m.content) for m in ctx.trajectory()]
+        self.assertEqual(after[:len(before)], before, "已有消息必须逐字节不变")
+        self.assertEqual(len(after), len(before) + 1, "只应多出一条压缩块")
+
+    def test_planned_drops_are_recorded(self):
+        """被丢弃/被摘要的范围必须落进 meta，让「东西什么时候没的」可追查。"""
+        from harness.retention import _fallback_summary
+        ctx = self._ctx()
+        self._fill(ctx)
+        blk = ctx.compact(lambda ms: _fallback_summary(ms, 80), keep_recent=6)
+        plan = blk.meta["plan"]
+        self.assertIn("verbatim", plan)
+        self.assertIn("to_summarize", plan)
+        self.assertIn("dropped", plan)
+        self.assertIn("by_kind", plan)
+        # 被压缩的原文仍留在 trajectory 里，只是不再进后续 prompt
+        self.assertGreater(len(ctx.trajectory()), len(plan["to_summarize"]))
+
+    def test_classification_of_each_role(self):
+        from harness.protocol import Message, ToolCall
+        from harness.retention import classify, Kind
+        self.assertEqual(classify(Message.system("规则")), Kind.CONSTRAINT)
+        self.assertEqual(classify(Message.tool_result("", "输出", "read_file")), Kind.FACT)
+        self.assertEqual(classify(Message.assistant(content="", tool_calls=[ToolCall("x", {})])),
+                         Kind.DECISION)
+        self.assertEqual(classify(Message.assistant(content="我在想")), Kind.REASONING)
+        m = Message.user("[环境状态] {}"); m.meta["kind"] = "status"
+        self.assertEqual(classify(m), Kind.EPISODE)
+
+    def test_constraint_detection_covers_chinese_and_english(self):
+        from harness.retention import is_constraint
+        for t in ("不要修改工作区以外的路径", "危险命令必须审批",
+                  "Do not write outside the workspace", "requires approval"):
+            self.assertTrue(is_constraint(t), "应识别为硬约束：%r" % t)
+        for t in ("我读完了这个文件", "the file has 30 lines"):
+            self.assertFalse(is_constraint(t), "不应误判为约束：%r" % t)
+
+    def test_hedge_detection(self):
+        from harness.retention import is_hedged
+        self.assertTrue(is_hedged("我认为这个函数是入口"))
+        self.assertTrue(is_hedged("it probably returns None"))
+        self.assertFalse(is_hedged("文件共 34 行"))
+
+
+class TestCompactionTrigger(unittest.TestCase):
+    """压缩**必须真的被触发** —— 这是之前的核心缺陷。
+
+    诊断发现 `context.compact()` 从未被调用（grep 无结果），
+    长会话根本不压缩。这组测试锁住"循环里真的会压"。
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def test_loop_compacts_when_ratio_reached(self):
+        from harness.loop import AgentLoop, LoopConfig
+        from harness.model import ScriptedModel, tool_call_reply, final_reply
+        from harness.context import StaticPrefix
+        from harness.policy import Policy, SandboxMode, ApprovalPolicy
+        from harness.session import Session
+
+        reg, shell = build_default_registry(self.ws.path)
+        try:
+            prefix = StaticPrefix("sys", reg.specs())
+            sess = Session(self.ws.path, "m", "stub", "workspace-write", "on-request")
+            pol = Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST, self.ws.path)
+
+            # 每轮换一个不同的 path —— 相同的调用会被**指纹检测**当成无进展循环
+            # 提前熔断（那是正确行为，但会让这条测试测不到压缩）。
+            for i in range(12):
+                self.ws.write("f%d.txt" % i, "content %d\n" % i)
+            script = [tool_call_reply("read_file", {"path": "f%d.txt" % i}) for i in range(12)]
+            script.append(final_reply("好了"))
+            # 把预算压到很小 + 间隔设 1，让比例闸快速命中
+            cfg = LoopConfig(max_iterations=20, max_tokens_budget=600,
+                             compact_at_ratio=0.05, compact_min_interval=1,
+                             compact_keep_recent=4, max_compactions=3)
+            loop = AgentLoop(ScriptedModel(script), reg, prefix, pol, sess, cfg)
+            loop.run("读这些文件")
+
+            compactions = [e for e in loop.bus.events() if e.type == EventType.COMPACTED]
+            self.assertTrue(compactions, "达到比例后必须真的触发压缩")
+            self.assertLessEqual(len(compactions), 3, "压缩次数必须有上限")
+            # 每次压缩都要带计划与审计，不能是黑盒
+            for e in compactions:
+                self.assertIn("plan", e.data)
+                self.assertIn("audit", e.data)
+        finally:
+            shell.reset()
+
+    def test_compaction_disabled_when_max_zero(self):
+        from harness.loop import AgentLoop, LoopConfig
+        from harness.model import ScriptedModel, tool_call_reply, final_reply
+        from harness.context import StaticPrefix
+        from harness.policy import Policy, SandboxMode, ApprovalPolicy
+        from harness.session import Session
+
+        reg, shell = build_default_registry(self.ws.path)
+        try:
+            prefix = StaticPrefix("sys", reg.specs())
+            sess = Session(self.ws.path, "m", "stub", "workspace-write", "on-request")
+            pol = Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST, self.ws.path)
+            for i in range(6):
+                self.ws.write("g%d.txt" % i, "c%d\n" % i)
+            script = [tool_call_reply("read_file", {"path": "g%d.txt" % i}) for i in range(6)]
+            script.append(final_reply("好了"))
+            cfg = LoopConfig(max_iterations=12, max_tokens_budget=100,
+                             compact_at_ratio=0.01, max_compactions=0)
+            loop = AgentLoop(ScriptedModel(script), reg, prefix, pol, sess, cfg)
+            loop.run("读文件")
+            self.assertFalse([e for e in loop.bus.events() if e.type == EventType.COMPACTED],
+                             "max_compactions=0 时必须完全禁用压缩")
+        finally:
+            shell.reset()
+
+    def test_prefix_hash_stable_across_compaction(self):
+        """压缩绝不能动静态前缀 —— 否则击穿 KV-cache。"""
+        from harness.context import StaticPrefix, ContextBuilder
+        from harness.retention import _fallback_summary
+        from harness.protocol import Message, ToolCall
+        prefix = StaticPrefix("系统提示\n不要越界。", [])
+        ctx = ContextBuilder(prefix)
+        h0 = prefix.hash()
+        ctx.append_user("任务")
+        for i in range(8):
+            ctx.append_assistant(content="", tool_calls=[ToolCall("read_file", {"path": str(i)})])
+            ctx.append(Message.tool_result("", "x" * 100, "read_file"))
+        ctx.compact(lambda ms: _fallback_summary(ms, 50), keep_recent=3)
+        ctx.assert_prefix_stable()          # 不抛错即证明前缀未变
+        self.assertEqual(prefix.hash(), h0, "压缩后前缀指纹必须不变")
+
+
 class TempWorkdirOnce:
     _p = None
 
@@ -1927,6 +2136,388 @@ class TempWorkdirOnce:
         if cls._p is None:
             cls._p = tempfile.mkdtemp(prefix="crucible-reg-")
         return cls._p
+
+
+# ══════════════════════════════════════════════════════════════════
+# 12. 目标证据绑定（修 GoalVerifier 空壳）
+# ══════════════════════════════════════════════════════════════════
+class TestGoalEvidence(unittest.TestCase):
+    """`GoalVerifier` 曾经是空壳：`record()` 全项目无人调用，
+    `_results` 恒空 → `all_met` **恒 False**。
+
+    后果不是"少报"，而是**每次声明目标条件都必然报"未达成"** ——
+    一个恒假的闸门比没有闸门更坏：它把未完成包装成一条看起来很严谨的
+    失败理由，人反而更容易接受。
+
+    修法是把判定改成**确定性证据绑定**：条件文本翻译成可观测信号，
+    信号在结构化工具结果里被命中才算 satisfied。全程不读模型文本。
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    # ---------- 信号提取 ----------
+    def test_signal_extraction(self):
+        from harness.verify import _extract_signals
+
+        s = _extract_signals("创建 snake/index.html")
+        self.assertEqual(s.tool, "apply_patch")
+        self.assertIn("snake/index.html", s.paths)
+
+        s = _extract_signals("运行 pytest 并让它通过")
+        self.assertEqual(s.tool, "shell")
+        self.assertEqual(s.command, "pytest")
+
+        s = _extract_signals("读取 README.md")
+        self.assertEqual(s.tool, "read_file")
+
+        # 无信号的条件下不能瞎猜
+        s = _extract_signals("代码质量要好")
+        self.assertFalse(s.has_signal)
+
+    def test_explicit_tool_name_wins(self):
+        """条件里显式写出工具名是最可靠的信号，优先级最高。"""
+        from harness.verify import _extract_signals
+        s = _extract_signals("用 grep 找到那个函数")
+        self.assertEqual(s.tool, "grep")
+
+    # ---------- 绑定 ----------
+    def test_path_evidence_binds_goal(self):
+        """apply_patch 真的落盘了这个文件 → 条件才满足。
+
+        这里是最关键的语义：**证据来自结构化字段 `files_changed`**，
+        而不是去解析补丁正文。
+        """
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["创建 snake/index.html"])
+        self.assertEqual(gv.report()["satisfied"], 0)
+        self.assertFalse(gv.report()["all_met"])
+
+        newly = gv.observe("apply_patch", {"patch": "*** Begin Patch"},
+                           ToolResult(ok=True, side_effect=True,
+                                      files_changed=["snake/index.html"]))
+        self.assertEqual(newly, ["创建 snake/index.html"])
+        rep = gv.report()
+        self.assertEqual(rep["satisfied"], 1)
+        self.assertTrue(rep["all_met"])
+        self.assertIn("snake/index.html", rep["items"][0]["evidence"])
+
+    def test_failed_tool_output_is_not_evidence(self):
+        """**失败的工具输出不构成证据。**
+
+        否则"我试过了"会被当成"我做成了" —— 这是最容易被忽略的漏洞。
+        """
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["创建 snake/index.html"])
+        gv.observe("apply_patch", {},
+                   ToolResult(ok=False, error_layer="tool",
+                              files_changed=["snake/index.html"]))
+        self.assertEqual(gv.report()["satisfied"], 0,
+                         "ok=False 的结果即使声明了文件改动也不能算证据")
+
+    def test_path_match_tolerates_basename(self):
+        """条件里写 `index.html`、结果是 `snake/index.html` 应视为同一文件。"""
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["写出 index.html"])
+        gv.observe("apply_patch", {},
+                   ToolResult(ok=True, side_effect=True,
+                              files_changed=["snake/index.html"]))
+        self.assertTrue(gv.report()["all_met"])
+
+    def test_shell_command_evidence(self):
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["运行 pytest 通过"])
+        gv.observe("shell", {"command": "python -m pytest -q"},
+                   ToolResult(ok=True, exit_code=0, side_effect=True))
+        rep = gv.report()
+        self.assertTrue(rep["all_met"])
+        self.assertIn("退出码 0", rep["items"][0]["evidence"])
+
+        # 换个不相关的命令不能蒙混过关
+        gv2 = GoalVerifier(["运行 pytest 通过"])
+        gv2.observe("shell", {"command": "ls -la"},
+                    ToolResult(ok=True, exit_code=0, side_effect=True))
+        self.assertEqual(gv2.report()["satisfied"], 0)
+
+    def test_unmatched_condition_is_reported_not_guessed(self):
+        """认不出信号的条件必须**如实暴露**，既不算满足也不算未满足。
+
+        沉默是最坏的选择：它会让人把"没有报未达成"读成"已达成"。
+        """
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["代码质量要好", "创建 a.txt"])
+        gv.observe("apply_patch", {}, ToolResult(ok=True, side_effect=True,
+                                                 files_changed=["a.txt"]))
+        rep = gv.report()
+        self.assertEqual(rep["satisfied"], 1)
+        self.assertEqual(rep["unmatched"], 1)
+        self.assertFalse(rep["all_met"], "有无法判定的条件时不能声称全部达成")
+        self.assertEqual(gv.unmatched(), ["代码质量要好"])
+
+    def test_multiple_paths_all_required(self):
+        """一条条件里提到多个文件 → 必须全部出现才算满足。"""
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["创建 a.txt 和 b.txt"])
+        gv.observe("apply_patch", {}, ToolResult(ok=True, side_effect=True,
+                                                 files_changed=["a.txt"]))
+        self.assertFalse(gv.report()["all_met"])
+        gv.observe("apply_patch", {}, ToolResult(ok=True, side_effect=True,
+                                                 files_changed=["b.txt"]))
+        self.assertTrue(gv.report()["all_met"])
+
+    def test_read_does_not_satisfy_write_goal(self):
+        """**读文件不能冒充"创建了文件"。**
+
+        这是修复前真实存在的假阳性通道：`read_file a.txt` 也会把
+        `a.txt` 放进 actual_paths，于是条件"创建 a.txt"被误判为满足。
+        所以写意图的条件必须要求证据来自写类工具。
+        """
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["创建 a.txt"])
+        gv.observe("read_file", {"path": "a.txt"},
+                   ToolResult(ok=True, side_effect=False,
+                              meta={"path": "a.txt"}))
+        self.assertEqual(gv.report()["satisfied"], 0,
+                         "读取不是创建，不能作为创建类目标的证据")
+
+    def test_shell_created_file_satisfies_create_goal_unit(self):
+        """单元级：shell 命中的路径也算"创建"的证据（不要求 apply_patch）。"""
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["创建 notes/hello.txt"])
+        gv.observe("shell", {"command": "echo hi > notes/hello.txt"},
+                   ToolResult(ok=True, exit_code=0, side_effect=True,
+                              files_changed=["notes/hello.txt"]))
+        self.assertTrue(gv.report()["all_met"],
+                        "shell 落盘同样是写动作，闸门不能死认 apply_patch")
+
+    def test_read_goal_accepts_read_tool(self):
+        """条件是"读取 X"时，读工具本身就是正确证据。"""
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["读取 README.md"])
+        gv.observe("read_file", {"path": "README.md"},
+                   ToolResult(ok=True, meta={"path": "README.md"}))
+        self.assertTrue(gv.report()["all_met"])
+
+    def test_report_basis_declares_limits(self):
+        """报告必须自述判据边界 —— 证据只说明动作发生了，不说明内容正确。"""
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["创建 a.txt"])
+        basis = gv.report()["basis"]
+        self.assertIn("结构化字段", basis)
+        self.assertIn("不读模型文本", basis)
+        self.assertIn("不构成对内容正确性的判断", basis)
+
+    def test_manual_record_still_works(self):
+        """逃生口：外部显式登记仍然生效（供评审 UI / 测试夹具用）。"""
+        from harness.verify import GoalVerifier
+        gv = GoalVerifier(["主观条件：文案读起来自然"])
+        self.assertFalse(gv.report()["all_met"])
+        gv.record("主观条件：文案读起来自然", True, "人工评审通过", seq=42)
+        rep = gv.report()
+        self.assertTrue(rep["all_met"])
+        self.assertEqual(rep["items"][0]["evidence"], "人工评审通过")
+
+
+class TestGoalGateInLoop(unittest.TestCase):
+    """目标闸门接进主循环后的行为。"""
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        self.ws.write("src/a.py", "x = 1\n")
+        self.reg, self.shell = build_default_registry(self.ws.path)
+
+    def tearDown(self):
+        self.shell.reset()
+        self.ws.cleanup()
+
+    def _loop(self, script, goals, **cfg):
+        from harness.loop import AgentLoop, LoopConfig
+        prefix = StaticPrefix("你是测试 agent。", self.reg.specs())
+        sess = Session(self.ws.path, "scripted", "stub", "workspace-write", "on-request")
+        pol = Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST, self.ws.path)
+        return AgentLoop(ScriptedModel(script), self.reg, prefix, pol, sess,
+                         LoopConfig(**cfg) if cfg else None,
+                         goal_conditions=goals), sess
+
+    def test_goal_met_reports_all_met(self):
+        """模型真的落盘了这个文件 → 闸门应放行，而不是无脑报未达成。"""
+        loop, _ = self._loop([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("改好了。"),
+        ], ["修改 src/a.py"])
+        res = loop.run("把 a.py 改成 x = 2")
+        self.assertEqual(res.status, "completed")
+        self.assertTrue(res.goal["all_met"], "有结构化证据时必须判为达成")
+        self.assertIn("任务完成", res.reason)
+
+    def test_goal_unmet_feeds_back_then_completes(self):
+        """未达成 → 先回灌纠正（不是直接终止），补齐后正常收尾。
+
+        早期实现在这里**直接收尾**，闸门只会报失败而从不尝试补救。
+        """
+        loop, _ = self._loop([
+            final_reply("我觉得已经好了。"),          # 空口无凭
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("现在真的改好了。"),
+        ], ["修改 src/a.py"])
+        res = loop.run("把 a.py 改成 x = 2")
+        self.assertEqual(res.status, "completed")
+        self.assertTrue(res.goal["all_met"])
+        # 中间那轮纠正必须留下结构化事件（可追查"为什么多跑了一轮"）
+        errs = [e for e in loop.bus.events()
+                if e.type == EventType.ERROR and e.data.get("cls") == "goal_unmet"]
+        self.assertEqual(len(errs), 1, "应恰好回灌一次纠正")
+
+    def test_correction_when_model_had_no_tool_calls(self):
+        """**harness 的纠正不能伪装成工具结果。**
+
+        实测踩到的真实故障：模型"空口说完成"（这条 assistant 消息里
+        **没有 tool_calls**），闸门回灌时若追加 role=tool 的消息，
+        历史里就出现一条**孤立的工具结果**，上游立刻 400：
+        `tool calls and tool results do not match`。
+
+        该 bug 第一轮不炸 —— 崩溃点落在第二次请求上，而且报 400
+        （被归类为"不可重试"），看起来完全像配置错误。所以必须用
+        结构断言把它钉死：任何 tool 消息都必须紧跟它自己的 tool_calls。
+        """
+        loop, _ = self._loop([
+            final_reply("我觉得已经好了。"),            # 没有 tool_calls
+            final_reply("真的好了。"),
+            final_reply("确实好了。"),
+        ], ["修改 src/a.py"])
+        loop.run("改 a.py")
+
+        traj = loop.context.trajectory()
+        for i, m in enumerate(traj):
+            if m.role != "tool":
+                continue
+            # 向前找最近的一条 assistant
+            prev_assistant = None
+            for k in range(i - 1, -1, -1):
+                if traj[k].role == "assistant":
+                    prev_assistant = traj[k]
+                    break
+            self.assertIsNotNone(prev_assistant, "tool 消息之前必须存在 assistant 消息")
+            self.assertTrue(
+                prev_assistant.tool_calls,
+                f"第 {i} 条 tool 消息是孤立的：它前面的 assistant 没有 tool_calls。"
+                "这会让上游返回 400 `tool calls and tool results do not match`。",
+            )
+
+    def test_correction_message_is_plain_user(self):
+        """纠正必须落成普通用户消息，且带可识别的 meta 供审计。"""
+        loop, _ = self._loop([
+            final_reply("好了。"), final_reply("好了。"), final_reply("好了。"),
+        ], ["修改 src/a.py"])
+        loop.run("改 a.py")
+        corr = [m for m in loop.context.trajectory()
+                if m.meta.get("kind") == "correction"]
+        self.assertTrue(corr, "闸门回灌纠正时必须在轨迹里留下记录")
+        for m in corr:
+            self.assertEqual(m.role, "user", "纠正必须是普通用户消息，不能是 role=tool")
+            self.assertEqual(m.meta.get("from"), "harness")
+
+    def test_goal_retry_has_a_cap(self):
+        """纠正必须有上限 —— 否则闸门变成死循环。"""
+        loop, _ = self._loop([
+            final_reply("好了。"), final_reply("真的好了。"),
+            final_reply("确实好了。"), final_reply("反正好了。"),
+        ], ["修改 src/a.py"])
+        res = loop.run("改 a.py")
+        self.assertEqual(res.status, "completed")
+        self.assertFalse(res.goal["all_met"])
+        self.assertIn("尚未满足", res.reason)
+        errs = [e for e in loop.bus.events()
+                if e.type == EventType.ERROR and e.data.get("cls") == "goal_unmet"]
+        self.assertLessEqual(len(errs), 2, "纠正次数必须有上限")
+        self.assertLess(res.iterations, 8, "闸门不得变成无限循环")
+
+    def test_unmatched_warning_emitted_at_start(self):
+        """无法自动判定的条件必须在**开场**就告知，不能静默。"""
+        loop, _ = self._loop([final_reply("好了。")], ["代码质量要好"])
+        loop.run("写点东西")
+        warns = [e for e in loop.bus.events()
+                 if e.type == EventType.CHECK
+                 and e.data.get("warning") == "unmatched_conditions"]
+        self.assertEqual(len(warns), 1)
+        self.assertIn("无法自动判定", warns[0].data["reason"])
+
+    def test_no_goal_conditions_means_no_gate(self):
+        """没声明条件时闸门完全透明 —— 不能凭空给普通任务加一轮。"""
+        loop, _ = self._loop([final_reply("好了。")], [])
+        res = loop.run("随便聊聊")
+        self.assertEqual(res.status, "completed")
+        self.assertIsNone(res.goal)
+        self.assertEqual(res.iterations, 1)
+
+    def test_evidence_event_emitted_on_first_bind(self):
+        """条件首次挂上证据时要发事件 —— 闸门状态变化必须可观察。"""
+        loop, _ = self._loop([
+            tool_call_reply("read_file", {"path": "src/a.py"}),
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("改好了。"),
+        ], ["修改 src/a.py"])
+        loop.run("改 a.py")
+        evs = [e for e in loop.bus.events()
+               if e.type == EventType.CHECK and e.data.get("scope") == "goal"
+               and e.data.get("newly_met")]
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0].data["newly_met"], "修改 src/a.py")
+
+    def test_shell_write_satisfies_create_goal(self):
+        """**实测场景**：模型用 `shell` 而不是 apply_patch 建文件。
+
+        真实运行里 deepseek-v4.1-flash 直接发了
+        `mkdir -p notes && printf 'hello world\\n' > notes/hello.txt`，
+        文件确实落盘了，但早期闸门死认 `apply_patch`，于是报"未满足" ——
+        **闸门在说假话**，比没有闸门更坏（它把已完成包装成一条严谨的失败理由）。
+
+        修法：shell 用文件系统事实（mtime 前后对比）上报 files_changed，
+        闸门按"写类动作 + 路径命中"判定，而不是死认某个工具名。
+        """
+        loop, _ = self._loop([
+            tool_call_reply("shell", {"command": "mkdir -p notes && echo hello world > notes/hello.txt"}),
+            final_reply("建好了。"),
+        ], ["创建 notes/hello.txt"])
+        res = loop.run("新建 notes/hello.txt")
+        self.assertEqual(res.status, "completed")
+        self.assertTrue(res.goal["all_met"],
+                        f"shell 已落盘该文件，闸门必须认可。实际报告：{res.goal}")
+
+    def test_shell_reports_changed_files_structurally(self):
+        """shell 必须用**结构化字段**上报改动，不能靠解析命令文本。"""
+        sh = self.shell.shell            # ShellTool 内部持有的持久会话
+        r = sh.run("echo hi > probe.txt")
+        self.assertTrue(r.ok)
+        self.assertIn("probe.txt", r.files_changed,
+                      "shell 写了文件就必须在结构化字段里报出来")
+        self.assertIn("changed_probe", r.meta)
+
+        r_read = sh.run("echo just-listing")
+        self.assertTrue(r_read.ok)
+        self.assertEqual(r_read.files_changed, [],
+                         f"纯读命令不该报改动，实际报了 {r_read.files_changed}")
+
+    def test_glob_meta_exposes_matches(self):
+        """glob 必须把命中清单放进结构化 meta —— 证据绑定不能靠解析文本。"""
+        from harness.tools.fs import glob_files
+        self.ws.write("snake/index.html", "<html></html>\n")
+        r = glob_files(self.ws.path, {"pattern": "**/*.html"})
+        self.assertTrue(r.ok)
+        self.assertIn("snake/index.html", r.meta.get("matches") or [])
+
+    def test_grep_meta_exposes_matches(self):
+        from harness.tools.search import grep
+        self.ws.write("snake/index.html", "<html>needle</html>\n")
+        r = grep(self.ws.path, {"pattern": "needle"})
+        self.assertTrue(r.ok)
+        self.assertIn("snake/index.html", r.meta.get("matches") or [])
 
 
 # ══════════════════════════════════════════════════════════════════

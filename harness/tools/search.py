@@ -62,6 +62,7 @@ def grep(workspace: str, args: Dict[str, Any]) -> ToolResult:
     files = _collect(root, workspace, glob_pat)
     hits: List[str] = []
     n_files = 0
+    hit_files: List[str] = []          # 结构化：命中的文件清单（供证据绑定）
 
     for full in files:
         try:
@@ -102,6 +103,7 @@ def grep(workspace: str, args: Dict[str, Any]) -> ToolResult:
                         break
         if matched_here:
             n_files += 1
+            hit_files.append(to_rel(workspace, full))
         if len(hits) >= limit:
             break
 
@@ -110,13 +112,15 @@ def grep(workspace: str, args: Dict[str, Any]) -> ToolResult:
             ok=True,
             text=f"没有匹配 `{pattern}`。\n"
                  "（本工具只搜索文件**内容**；如果是要按文件名找文件，请用 glob。）",
-            side_effect=False, meta={"hits": 0, "files": 0},
+            side_effect=False, meta={"hits": 0, "files": 0, "matches": []},
         )
 
     head = f"# grep `{pattern}` —— {len(hits)} 处命中，涉及 {n_files} 个文件"
     tail = "" if len(hits) < limit else f"\n… 已达上限 {limit}，可缩小范围或加 glob 过滤"
     return ToolResult(ok=True, text=head + "\n" + "\n".join(hits) + tail,
-                      side_effect=False, meta={"hits": len(hits), "files": n_files})
+                      side_effect=False,
+                      meta={"hits": len(hits), "files": n_files,
+                            "matches": hit_files})
 
 
 def _collect(root: str, workspace: str, glob_pat: str) -> List[str]:

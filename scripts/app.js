@@ -34,6 +34,9 @@
     chevron: '<path d="M5 7l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>',
     x: '<path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
     warning: '<path d="M8 2.5l6 11H2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 6.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="11.4" r="0.8" fill="currentColor"/>',
+    /* 「无法判定」专用：问号。与 warning 的三角刻意区分 ——
+       不确定不是坏消息，画成警示三角等于把未知说成了失败。 */
+    help: '<circle cx="8" cy="8" r="6.1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M6.2 6.3c0-1 .8-1.7 1.8-1.7s1.8.7 1.8 1.6c0 1.4-1.8 1.5-1.8 3.1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="11.6" r="0.8" fill="currentColor"/>',
     pause: '<rect x="4" y="3.5" width="2.6" height="9" rx="0.8" fill="currentColor"/><rect x="9.4" y="3.5" width="2.6" height="9" rx="0.8" fill="currentColor"/>',
     shield: '<path d="M8 1.8l5 1.8v4.6c0 3-2 5.3-5 6.2-3-.9-5-3.2-5-6.2V3.6z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>',
     terminal: '<path d="M3.5 5l3 3-3 3M9 11h4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
@@ -109,7 +112,11 @@
     focusIdx: 0,             // 文件树的键盘游标
     renaming: null,          // 正在内联重命名的路径
     endpoint: null,          // 当前模型接入配置（公开形态，不含明文 key）
-    workspace: urlParams.workspace || state.workspace || null,  // URL 优先
+    // 只从 URL 取。曾经写成 `urlParams.workspace || state.workspace || null`，
+    // 那是在 state 自己的初始化表达式里引用 state —— `var` 提升让此刻的 state
+    // 是 undefined，于是抛 TypeError，**整个 app.js 从这一行起全部不执行**。
+    // 表现为「页面看着正常、所有交互都是死的」，极难定位。
+    workspace: urlParams.workspace || null,
   };
 
   var dirtyFile = { "src/transport/reconnect.ts": true };
@@ -1556,16 +1563,24 @@
   function buildCheck(ev) {
     var d = el("div", "ev ev--check");
     var card = el("div", "checkcard");
+    // 只要有一项不确定，整块头部就不能用"通过"的语气
+    var anyWarn = (ev.items || []).some(function (it) { return it.warn; });
+    var allOk = (ev.items || []).length > 0 && (ev.items || []).every(function (it) { return it.ok; });
+    if (anyWarn) card.classList.add("checkcard--warn");
     var head = el("div", "checkcard__head");
-    head.appendChild(svg(ICONS.check));
+    // 三种状态三种图标：通过=对勾，失败=警告，不确定=问号。
+    // 以前只分"对勾/警告"两种，"无法自动判定"会被画成"失败"，
+    // 那是把不确定性说成了确定的坏消息。
+    head.appendChild(svg(anyWarn ? ICONS.warning : ICONS.check));
     head.appendChild(el("span", "checkcard__title", ev.title));
     head.appendChild(el("span", "checkcard__model", ev.model));
     card.appendChild(head);
 
     var ul = el("ul", "checklist");
-    ev.items.forEach(function (it) {
+    (ev.items || []).forEach(function (it) {
       var li = el("li");
-      li.appendChild(svg(it.ok ? ICONS.check : ICONS.warning));
+      li.appendChild(svg(it.ok ? ICONS.check : (it.warn ? ICONS.help : ICONS.warning)));
+      if (it.warn) li.classList.add("checklist__item--warn");
       li.appendChild(el("span", null, it.text));
       ul.appendChild(li);
     });
@@ -2829,18 +2844,38 @@
     if (!ep) return;
     state.endpoint = ep;
     var name = ep.configured ? ep.model : "未配置";
-    // 状态栏与 Agent 面板两处模型名保持一致 —— 同一个人看的同一个值
-    ["#btn-model", ".agentpanel__model"].forEach(function (sel) {
-      var n = $(sel);
-      if (n) {
-        n.textContent = name;
-        n.title = ep.configured
-          ? (name + " @ " + ep.chat_url)
-          : "模型未配置 · 点此接入";
-      }
-    });
+    var title = ep.configured
+      ? (name + " @ " + ep.chat_url)
+      : "模型未配置 · 点此接入";
+
+    // 状态栏那个按钮里除了模型名还有一个**状态点 span**。
+    // 直接写 textContent 会把这个 span 一并抹掉 —— 于是用户一旦接入模型，
+    // 指示点就永久消失，颜色也无处可改（实测踩到）。
+    // 所以只替换末尾那个文本节点，保住结构。
+    var btn = $("#btn-model");
+    if (btn) {
+      setTrailingText(btn, name);
+      btn.title = title;
+    }
+    var panelModel = $(".agentpanel__model");
+    if (panelModel) {
+      panelModel.textContent = name;
+      panelModel.title = title;
+    }
+
     var dot = $(".statusitem__dot--model");
     if (dot) dot.style.background = ep.configured ? "var(--jade)" : "var(--text-faint)";
+  }
+
+  /* 替换元素末尾的文本节点，保留已有的子元素（如状态点）。
+     若末尾不是文本节点（全被元素占满），追加一个。 */
+  function setTrailingText(node, text) {
+    var last = node.lastChild;
+    if (last && last.nodeType === 3) {
+      last.nodeValue = text;
+    } else {
+      node.appendChild(document.createTextNode(text));
+    }
   }
 
   /* 启动时把已保存的配置反映到界面 */
@@ -3027,6 +3062,15 @@
       }
     } catch (e) { /* 隐私模式下忽略 */ }
   }
+
+  // 探针入口：只在通过 ?probe=1 打开时暴露，正常使用时不挂任何全局。
+  // 目的：让几何/交互探针走**真实的渲染代码**，而不是复制一份渲染逻辑 ——
+  // 复制出来的探针会验证它自己，而不是产品。
+  try {
+    if (/[?&]probe=1\b/.test(location.search)) {
+      window.__probeBuildCheck = buildCheck;
+    }
+  } catch (e) { /* file:// 下 location.search 可用，出错也不该影响加载 */ }
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);

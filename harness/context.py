@@ -176,39 +176,56 @@ class ContextBuilder:
             "tools": self._prefix.tools,
         }
 
-    # ---------- 压缩：只动中段，且只追加 ----------
+    # ---------- 压缩：按类型路由保留策略 ----------
     def compact(self, summarizer, keep_recent: int = 6) -> Optional[Message]:
-        """上下文压缩。
+        """上下文压缩（**类型化保留**）。
 
-        **本方法刻意不修改任何已有消息** —— 只在轨迹末尾**追加**一条摘要。
-        书 §2 的 append-only 纪律与 §5 的「只增不改」设计模式都要求如此。
+        这是本项目最重要的一处"不能一视同仁"的地方。
 
-        对比书里点名的错误做法「滑动窗口」：它丢弃最早的消息，
-        既破坏前缀一致性，又**丢失关键工具结果** —— 实测会让 Agent 陷入
-        反复调用同一工具的循环（因为它"忘记"了之前已经获得的结果）。
+        ## 为什么不能简单地把中段全丢给摘要器
 
-        返回被追加的摘要消息；轨迹太短则返回 None。
+        arXiv 2608.22752（CIKM 2026）实测：不加区分的摘要会在
+        **1 轮后把安全规则保留率打到 53%、5 轮后 10%**——这叫「压缩悬崖」。
+        原因是安全规则需要**精确措辞**才可执行，而情节日志只需要大意，
+        两者以同一速率被摘要时，先死的必然是规则。
 
-        实现说明：真正的摘要由调用方注入的 `summarizer`（可以是模型，也可以是
-        本地规则）。本类不依赖模型 —— 书 §5「提议者—审核者」的纪律：
-        校验/治理层不应与产出层共享同一上下文。
+        所以这里先出**压缩计划**（`retention.plan_compaction`）：
+          · `constraint` → 原样保留，**永不进摘要器**
+          · `reasoning`  → 直接丢弃（不回放思考）
+          · `fact` / `decision` / `episode` → 交给摘要器，且**必须标来源**
+
+        ## append-only 仍然成立
+
+        **本方法不修改任何已有消息**，只在轨迹末尾追加一条压缩块。
+        被压缩的原文仍完整保留在 rollout 里，可按 seq 检索 ——
+        这也是为什么"丢弃 reasoning"是安全的：它只是不进后续 prompt。
+
+        返回被追加的压缩块；轨迹太短则返回 None。
         """
+        from .retention import audit_summary, build_summary_text, plan_compaction
+
         if len(self._trajectory) <= keep_recent:
             return None
 
         # 中段 = 除最近 keep_recent 条以外的历史
+        # 系统消息不在轨迹里（它在静态前缀），所以这里不会误压系统提示
         middle = self._trajectory[:-keep_recent]
         if not middle:
             return None
 
-        summary_text = summarizer(middle)
+        plan = plan_compaction(middle)
+        summary_text = build_summary_text(plan, summarizer)
 
         m = Message.user(
-            "[上下文压缩摘要] 以下是较早轨迹的结构化摘要。"
-            "原始消息仍完整保留在 rollout 中，可按需检索。\n" + summary_text
+            "[上下文压缩块] 以下是较早轨迹的**类型化摘要**。"
+            "原始消息仍完整保留在 rollout 中，可按 seq 检索。\n\n" + summary_text
         )
         m.meta["kind"] = "compaction"
         m.meta["covers_seq"] = [middle[0].seq, middle[-1].seq]
+        # 把计划与自检一起落进 meta：让"压缩掉了什么"可审计。
+        # AHE 的经验是，只有每次改动都可核验，迭代才不会退化成盲目试错。
+        m.meta["plan"] = plan.to_json()
+        m.meta["audit"] = audit_summary(summary_text)
         return self.append(m)
 
     # ---------- 序列化 ----------

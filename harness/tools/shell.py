@@ -275,6 +275,19 @@ class PersistentShell:
 
             sentinel = f"__CRUCIBLE_END_{uuid.uuid4().hex[:12]}__"
 
+            # ── 执行前后快照 ──
+            # 为什么需要它：`shell` 是最常用的写文件方式（`printf > f.txt`、
+            # 生成器、构建），但它原本**不上报改动了哪些文件**，于是
+            # 目标闸门拿不到路径证据，会在文件确实落盘时仍判"未满足"。
+            #
+            # 为什么不解析命令文本：policy 层的铁律是"安全检查只看结构化数据"，
+            # 从命令字符串里正则抠路径既不准（重定向、变量、管道）又开了一个
+            # 注入口子。用**文件系统事实**（mtime 变化）得到的才是真的发生了什么。
+            #
+            # 代价控制：只扫工作区、跳过忽略目录、限深度与文件数；
+            # 任何异常都退化为空集合，绝不影响命令本身执行。
+            before = self._snapshot()
+
             # 用哨兵包住命令：哨兵里嵌 pwd 与退出码，一次取回全部状态。
             #
             # Windows 的两个坑（都是实测踩到的）：
@@ -358,13 +371,81 @@ class PersistentShell:
                                   side_effect=True, error_layer=ERR_TOOL,
                                   retryable=True, meta={"cwd": self.cwd})
 
+            changed, probe_note = self._diff_snapshot(before)
             return ToolResult(
                 ok=(rc == 0),
                 text=text,
                 exit_code=rc,
                 side_effect=True,
-                meta={"cwd": self.cwd, "command": command},
+                files_changed=changed,
+                meta={"cwd": self.cwd, "command": command,
+                      "changed_probe": probe_note},
             )
+
+    # ---------- 改动探测 ----------
+    _SNAP_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                    "dist", "build", ".next", "target", ".mypy_cache",
+                    ".pytest_cache", ".crucible"}
+    _SNAP_MAX_FILES = 4000
+    _SNAP_MAX_DEPTH = 6
+
+    def _snapshot(self) -> Optional[Dict[str, float]]:
+        """记录工作区文件 → mtime。超限或出错返回 None（退化为不探测）。"""
+        root = self.workspace
+        if not root or not os.path.isdir(root):
+            return None
+        snap: Dict[str, float] = {}
+        root_depth = root.rstrip(os.sep).count(os.sep)
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames
+                               if d not in self._SNAP_IGNORE and not d.startswith(".")]
+                if dirpath.count(os.sep) - root_depth >= self._SNAP_MAX_DEPTH:
+                    dirnames[:] = []
+                for fn in filenames:
+                    full = os.path.join(dirpath, fn)
+                    try:
+                        snap[full] = os.stat(full).st_mtime_ns
+                    except OSError:
+                        continue
+                    if len(snap) >= self._SNAP_MAX_FILES:
+                        return snap
+        except OSError:
+            return None
+        return snap
+
+    def _diff_snapshot(self, before: Optional[Dict[str, float]]) -> "tuple[List[str], str]":
+        """对比出新增/修改的文件（相对工作区路径）。
+
+        返回 (改动清单, 说明)。说明会写进 meta，让"为什么这条命令算改了文件"
+        这件事可追查 —— 闸门的判据必须是可复核的。
+        """
+        if before is None:
+            return [], "未探测（工作区不可用或快照失败）"
+        after = self._snapshot()
+        if after is None:
+            return [], "未探测（快照失败）"
+        changed: List[str] = []
+        for full, mt in after.items():
+            old = before.get(full)
+            if old is None or old != mt:
+                try:
+                    rel = os.path.relpath(full, self.workspace).replace(os.sep, "/")
+                except ValueError:
+                    continue
+                changed.append(rel)
+        # 删除也是一种改动
+        for full in before:
+            if full not in after:
+                try:
+                    rel = os.path.relpath(full, self.workspace).replace(os.sep, "/")
+                except ValueError:
+                    continue
+                changed.append(rel)
+        changed.sort()
+        if len(changed) > 200:
+            return changed[:200], f"探测到 {len(changed)} 个改动，仅保留前 200 个"
+        return changed, f"探测到 {len(changed)} 个改动"
 
     # ---------- 环境变量 ----------
     def set_env(self, key: str, value: str) -> None:

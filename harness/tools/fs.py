@@ -208,11 +208,11 @@ def glob_files(workspace: str, args: Dict[str, Any]) -> ToolResult:
             ok=True,
             text=f"没有文件匹配 `{pattern}`。（本工具只匹配文件名与路径，不搜索文件内容；"
                  "搜内容请用 grep。）",
-            side_effect=False, meta={"count": 0},
+            side_effect=False, meta={"count": 0, "matches": []},
         )
     more = "" if len(hits) < limit else f"\n… 已达上限 {limit}，结果可能不完整"
     return ToolResult(ok=True, text="\n".join(hits) + more, side_effect=False,
-                      meta={"count": len(hits)})
+                      meta={"count": len(hits), "matches": list(hits)})
 
 
 def _match_glob(pat: str, rel: str) -> bool:

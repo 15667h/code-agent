@@ -1,6 +1,13 @@
 # code-agent
 
-对标 Codex 的综合 agent。当前进度：**前端 IDE 工作台原型（纯静态，假数据驱动）**。
+对标 Codex 的综合 agent。当前进度：**前端 IDE 工作台 + 后端 harness（可跑通）**。
+
+架构基线来自两处权威依据：
+
+- **《AI Agent Book》**（`docs/book-notes.md` 是提炼出的纪律清单）——核心公式
+  `Agent = LLM + 上下文 + 工具`，而 **Harness = 上下文管理 + 工具接口 + 约束 + 验证 + 纠正**。
+- **Codex 的实现**（`docs/codex-architecture.md`、`docs/harness-architecture.md`）——
+  架构参考与逐条对照。
 
 ## 目录
 
@@ -10,32 +17,79 @@
 | `styles/tokens.css` | 设计令牌（色彩 / 字体 / 空间 / 圆角 / 动效） |
 | `styles/app.css` | 布局与组件样式 |
 | `styles/ui-kit.css` | 交互原语样式（Toast / 弹窗 / 右键菜单 / 命令面板 / Tooltip） |
-| `scripts/mock-data.js` | 演示数据（文件树 / 正文 / 事件流 / 会话 / 命令） |
+| `scripts/mock-data.js` | 演示数据（后端不在时的离线原型用） |
 | `scripts/ui-kit.js` | 交互原语层（焦点陷阱、Toast、确认框、右键菜单、命令面板、无障碍播报） |
+| `scripts/harness-bridge.js` | **桥接层**：把 harness 事件翻译成前端视图模型 |
 | `scripts/app.js` | 业务与交互逻辑 |
-| `docs/codex-architecture.md` | **Codex 架构原理调研**（复刻基线） |
-| `docs/design-plan.md` | 设计计划（方向 / 令牌 / 布局 / 自审） |
+| `harness/protocol.py` | 中立轨迹格式 + 事件类型（`seq` 单调不变式） |
+| `harness/context.py` | 静态前缀冻结 + append-only + `prefix_hash()` 断言 |
+| `harness/policy.py` | 沙箱 × 审批 **9 格判定表** + 危险动作专项检查 |
+| `harness/tools/` | `registry` / `router` / `fs` / `search` / `patch`(V4A) / `shell` |
+| `harness/verify.py` | 只读结构化字段的验证 + 编辑后即时 lint |
+| `harness/correct.py` | 四级故障分类 + 熔断 + 重复指纹 + 看门狗 + 死亡螺旋防护 |
+| `harness/loop.py` | ReAct 主循环 + 五功能闭环 + 事件发射 |
+| `harness/server.py` | 零依赖 HTTP + SSE，同源托管前端 |
+| `harness/test_harness.py` | **118 项测试**，每项标注书中出处 |
+| `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
+| `docs/codex-architecture.md` | Codex 架构原理调研 |
+| `docs/harness-architecture.md` | 后端架构设计（含逐条对照与待验证清单） |
+| `docs/design-plan.md` | 前端设计计划 |
 
-## 打开方式
+## 运行
+
+### 方式一：只看前端原型（后端不在）
 
 无构建、无依赖，直接双击 `index.html` 即可（`file://` 可用）。
+桥接层探测不到后端时会**静默降级**，页面用 mock 数据演示，不白屏。
 
-若要用探针做几何/交互测量，需要本地 HTTP（`file://` 下 iframe 是跨源，测不了）：
+### 方式二：跑完整链路（推荐）
 
 ```bash
-python -m http.server 8712 --bind 127.0.0.1
-# 浏览器打开 http://127.0.0.1:8712/index.html
+python harness/server.py --port 8787
+# 打开 http://127.0.0.1:8787/index.html
+# 顶栏 chip 变绿、输入坞提示「已连接 harness · 发送即真实运行」即表示已接上
 ```
+
+服务同源托管前端 —— 不需要 CORS，消除一整类问题（书 §1 的边界治理）。
+
+无 API key 时用**离线脚本**也能看到真实驱动的事件流（不是前端伪造的假事件）：
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/run \
+  -H 'Content-Type: application/json' \
+  -d '{"provider":"stub","prompt":"看看工作区","offline_script":["list:.","read:src/a.py","final:完成"]}'
+```
+
+配置 API key 后自动切换到真实模型（`provider=openai` / `anthropic`，见 `harness/model.py`）。
+
+## 后端对标要点
+
+- **前缀冻结**：`StaticPrefix` 冻结系统提示与工具定义，`assert_prefix_stable()` 每次调用前自检
+  —— 保住 KV-cache 命中率。动态信息（状态栏）只**追加到末尾**，绝不插入前缀。
+- **append-only 轨迹**：模型可见的记录一律追加，不做历史重排（否则击穿缓存前缀）。
+- **工具顺序固定**：注册顺序即输出顺序，`specs()` 字节级一致。
+- **中立轨迹格式**：`tool_calls` 只记 `name`/`args`，不可移植的凭证（思考签名）单独存。
+- **沙箱 × 审批正交双轴**：`read-only`/`workspace-write`/`danger-full-access` ×
+  `untrusted`/`on-request`/`never`，9 格判定表；危险动作（`rm -rf` 等）即使策略允许也强制征询，
+  且**不接受"批准并记住"**。
+- **审批闸门是阻塞式的**：工具线程原地等待外部决定，而非"先拒绝再补执行"
+  —— 后者会给同一次调用开出两条执行路径，制造重复副作用。超时**故障安全为拒绝**。
+- **apply_patch 用 V4A 格式**：补丁必须唯一匹配，越界即拒绝。
+- **工具输出上限**：超限截断（保留前 60% / 后 40%），全文落盘供按需查看。
+- **验证只看结构化字段**：不看模型自由生成的文本（可能已被提示注入操纵）。
+- **四级故障分类**：API / 工具 / 上下文 / 控制流；每层恢复路径独立计数与上限。
+- **重复调用指纹**：`工具名 + 参数` 哈希，相同指纹反复出现 = 无进展循环。
+- **看门狗**：长连接最危险的失败是静默卡死，需独立活性信号。
+- **事件唯一性**：一次执行 = 一条 `tool.output` 事件（有测试锁住）。
 
 ## 前端对标要点（对应 Codex 架构）
 
 - **四栏 IDE**：活动栏 / 侧栏 / 编辑器+终端 / Agent 面板
-- **事件流**：逐事件流式渲染 `reasoning` · `tool_call` · `tool_result` · `patch` · `response_complete`
+- **事件流**：逐事件流式渲染 `reasoning` · `tool_call` · `tool_output` · `file_changed` · `check`
 - **审批闸门**（本页记忆点）：沙箱 × 审批的**正交双轴**，受门控动作在事件流里原地凝固
 - **计划视图**：逐步推进（不是「一次性完美计划」）
 - **自证检查**：对应 Codex 的 Ralph Loop / Evaluator 模型
 - **沙箱模式选择器**：`read-only` / `workspace-write` / `danger-full-access`
-- **可中断**：Codex 的已知短板，本项目作为差异化能力
 
 ## 交互细节（大厂级操作）
 
@@ -46,31 +100,17 @@ python -m http.server 8712 --bind 127.0.0.1
 - 右键菜单：标签、文件、会话、状态栏各项都有自己的上下文菜单，全程键盘可达
 - 统一 Tooltip：只在文本被截断时才出现（`data-tip="auto"`）
 - 焦点管理：浮层打开即入焦、关闭即归还，模态内 Tab 循环不逃逸
-- 全站 `aria-live` 播报关键状态变化
 
-**文件树**
-- 完整键盘导航：`↑↓` 移动、`→` 展开、`←` 折叠/回父级、`Home/End`、`Enter` 打开、`F2` 重命名
-- 双击内联重命名（只选中主文件名，不含扩展名）
-- `Ctrl+Shift+E` 聚焦资源管理器
+**文件树** —— 完整键盘导航（`↑↓→← Home/End Enter F2`）、双击内联重命名
 
-**标签**
-- 中键关闭、拖拽重排、`Ctrl+W` 关闭、`Ctrl+PgUp/PgDn` 轮换
-- 关闭脏标签前弹确认框
-- 溢出时左右渐隐遮罩 + 「更多」下拉 + 计数
+**标签** —— 中键关闭、拖拽重排、脏标签关闭前确认、溢出渐隐 + 更多下拉 + 计数
 
-**终端**
-- 真实命令输入行，`↑↓` 翻阅命令历史
-- 支持 `git status` / `tsc` / `npm test` / `ls` / `clear` / `help` 的模拟回显
-- `Ctrl+L` 清屏、一键复制全部输出、可拖拽调高
+**终端** —— 真实输入行、`↑↓` 命令历史、模拟回显、`Ctrl+L` 清屏、可拖拽调高
 
-**输入坞**
-- `@` 触发文件补全（模糊匹配，`↑↓` 选择，`Enter` 插入）
-- `/` 触发斜杠命令菜单（对齐 Codex 的 7 条命令）
+**输入坞** —— `@` 文件补全、`/` 斜杠命令菜单
 
-**状态与持久化**
-- 主题跟随系统偏好，手动切换后覆盖；`localStorage` 记住主题 / 面板开合 / 侧栏宽度 / 终端高度 / 当前视图 / 事件筛选
-- 首屏骨架屏；流与终端有滚动渐隐提示
-- 侧栏可拖拽调宽（双击复位）
+**状态与持久化** —— 主题跟随系统；`localStorage` 记住主题 / 面板 / 侧栏宽 / 终端高 / 视图 / 筛选；
+首屏骨架屏；滚动渐隐；侧栏可拖拽调宽
 
 ## 设计基线
 
@@ -80,15 +120,25 @@ python -m http.server 8712 --bind 127.0.0.1
 
 ## 开发环境
 
-- Node.js：`>=22`
-- Python：`>=3.12`
+- Node.js：`>=22`（仅用于语法校验）
+- Python：`>=3.12`（后端**零第三方依赖**，只用标准库）
 
 ## 已验证
 
-- 语法：`node --check` 三个脚本全通过；CSS 花括号配平（tokens 5/5、app 467/467、ui-kit 180/180）；HTML 12 类标签配平
-- 结构：行号 = 正文行数 = diff 行数，四个文件一致
-- 几何：12 档宽度（320/375/480/700/768/860/900/1024/1100/1280/1440/1600）页面横向溢出 **全部为 0**
-- 交互：命令面板（38 项 / 9 分组 / 模糊检索 / 空状态）、Toast（自动消失 + 撤销 + 关闭）、确认框（焦点陷阱 + 焦点归还 + 取消/确认双路径）、右键菜单（鼠标 + 键盘 + Esc）、快捷键面板、事件筛选、闸门批准、终端历史、`@` 与 `/` 补全、标签中键与轮换、五视图切换、侧栏拖拽、持久化 —— 全部通过
-- 热区：10 类控件中心点命中测试全通过（伪元素外扩到 40px+）
-- 无障碍：无未命名按钮；`aria-live` 播报；78 个可聚焦元素；`prefers-reduced-motion` 全量降级
-- JS 错误：**0**
+**后端**（`python -m harness.test_harness`）
+- **118 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
+  重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
+
+**端到端**
+- 离线运行：`status=completed`、事件 `seq` 连续、`tool.requested` 与 `tool.output` 一一对应、
+  读取结果带行号、中立格式只含 `name/args`、危险命令被识别并拒绝 —— 全通过
+- 闸门：挂起 → 幽灵 `call_id` 被拒（404）→ 回灌批准**恰好执行一次** → 拒绝路径不执行 —— 全通过
+- 浏览器：前端接上 harness 后真实渲染 live 事件卡片，**JS 错误 0**
+
+**前端**
+- 语法：`node --check` 四个脚本全通过；CSS 花括号配平；HTML 标签配平
+- 结构：行号 = 正文行数 = diff 行数
+- 几何：多档宽度（320→1600）页面横向溢出 **全部为 0**，无被裁控件，无未命名按钮
+- 交互：命令面板、Toast、确认框、右键菜单、快捷键面板、事件筛选、闸门、终端历史、
+  `@` 与 `/` 补全、五视图切换、侧栏拖拽、持久化 —— 全部通过

@@ -49,3 +49,12 @@ temp/
 .workbuddy/backups/
 .workbuddy/tools/
 .workbuddy/video-tools/
+# 演示工作区与验收脚本：一次性产物
+.workbuddy/demo/
+
+# ---- harness 运行时产物 ----
+# 会话落盘（trajectory / events / meta）与工具产出的 artifacts，
+# 都是"跑一次就有一份"的运行数据，属本机工作区私有。
+# 但 .crucibleignore 之类的**配置**要入库，所以用 `**` 精确匹配运行目录。
+**/.crucible/runs/
+**/.crucible/artifacts/

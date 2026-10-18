@@ -1195,9 +1195,12 @@
       case "patch": node = buildPatch(ev); break;
       case "gate": node = buildGate(ev); break;
       case "check": node = buildCheck(ev); break;
-      default: node = el("div"); break;
+      default:
+        // 未知 kind 一律不渲染。绝不产出空白卡片 ——
+        // 一张空的白卡片比不渲染更容易被误判成"渲染成功"。
+        return null;
     }
-    node.setAttribute("data-ev-idx", String(idx || 0));
+    node.setAttribute("data-ev-idx", String(idx == null ? 0 : idx));
     return node;
   }
 
@@ -1302,6 +1305,29 @@
     return wrap;
   }
 
+  /* 把后端给的 unified diff 文本解析成前端 diff 行。
+     harness 的 apply_patch 返回的是标准 @@ 头 +  +/-/空格 前缀，
+     和前端已有的 rows 结构只差一层转换 —— 不做推断，只做映射。 */
+  function parseUnifiedDiff(text) {
+    if (!text || typeof text !== "string") return null;
+    var out = [];
+    var lines = text.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var l = lines[i];
+      if (l === "" && i === lines.length - 1) continue;
+      if (/^diff --git |^index |^--- |^\+\+\+ /.test(l)) continue;
+      if (/^@@/.test(l)) {
+        out.push({ t: "meta", text: l });
+        continue;
+      }
+      if (l.charAt(0) === "+") out.push({ t: "add", text: l.slice(1) });
+      else if (l.charAt(0) === "-") out.push({ t: "del", text: l.slice(1) });
+      else if (l.charAt(0) === " ") out.push({ t: "ctx", text: l.slice(1) });
+      else out.push({ t: "ctx", text: l });
+    }
+    return out.length ? out : null;
+  }
+
   function buildPatch(ev) {
     var wrap = el("div", "ev ev--tool");
     var card = el("div", "tool");
@@ -1320,7 +1346,8 @@
 
     var bodyEl = el("div", "tool__body");
 
-    var rows = buildDiffFor(ev.patch || ev.file);
+    // 优先用后端给的真实 diff；没有才回退到 mock 的 PATCHES
+    var rows = parseUnifiedDiff(ev.diffText) || buildDiffFor(ev.patch || ev.file);
     var meta = PATCHES[ev.patch || ev.file] || {};
 
     if (rows) {
@@ -1438,6 +1465,8 @@
     btnAlways.type = "button";
     btnAlways.appendChild(el("span", null, "批准，并在本会话记住"));
     btnAlways.addEventListener("click", function () {
+      // live 模式下后端才有"会话记忆"的真状态；本地反映只是让用户看得见
+      ev._remember = true;
       var ap = $("[data-approval]");
       if (ap) ap.textContent = "never";
       resolveGate("approved", ev);
@@ -1467,6 +1496,19 @@
   }
 
   function resolveGate(decision, ev) {
+    // live 模式：把决定真正回灌给后端，而不是只改前端状态。
+    if (window.Harness && window.Harness.isLive() && ev && ev._callId) {
+      window.Harness.approve(ev._callId, decision, decision === "approved" && !!ev._remember)
+        .then(function (ok) {
+          if (!ok) {
+            UI.toast({
+              tone: "warning", title: "后端未接受这次决定",
+              desc: "该审批可能已超时或已被自动放行，状态未改变。",
+              duration: 5000,
+            });
+          }
+        });
+    }
     state.gateResolved = decision;
     cancelAnimationFrame(gateRaf);
     renderStream();
@@ -1602,7 +1644,8 @@
     if (b) b.setAttribute("aria-expanded", "false");
   }
 
-  /* 发送：往事件流里追加用户消息 + 一次上下文装配 */
+  /* 发送：往事件流里追加用户消息 + 一次上下文装配
+     —— 若已连上 harness 后端，这里改走真实运行（见 harness-bridge.js）。 */
   function sendPrompt(text) {
     if (!text.trim()) return;
     var stream = D.stream;
@@ -1614,6 +1657,13 @@
     ub.textContent = text;
     u.appendChild(ub);
     stream.appendChild(u);
+    stream.scrollTop = stream.scrollHeight;
+    applyFilter();
+    UI.announce("已发送指令");
+
+    if (window.Harness && window.Harness.isLive()) {
+      return sendToHarness(text);
+    }
 
     var think = el("div", "ev ev--reasoning");
     var th = el("div", "ev__head");
@@ -1627,7 +1677,6 @@
     stream.scrollTop = stream.scrollHeight;
     if (refreshStreamFade) refreshStreamFade();
     applyFilter();
-    UI.announce("已发送指令");
 
     // 演示：1.6s 后替换为「思考完成」
     setTimeout(function () {
@@ -1641,6 +1690,56 @@
       if (refreshStreamFade) refreshStreamFade();
       applyFilter();
     }, 1600);
+  }
+
+  /* ---------- 接到 harness：真实运行 ---------- */
+  function sendToHarness(text) {
+    var pending = el("div", "ev ev--reasoning");
+    var ph = el("div", "ev__head");
+    var psp = el("span", "ev__spin");
+    psp.setAttribute("aria-hidden", "true");
+    ph.appendChild(psp);
+    ph.appendChild(el("span", "ev__kind", "连接 harness"));
+    pending.appendChild(ph);
+    pending.appendChild(el("p", "ev__text", "正在发起运行…"));
+    D.stream.appendChild(pending);
+    D.stream.scrollTop = D.stream.scrollHeight;
+
+    window.Harness.run(text, {
+      sandbox: $("[data-sandbox]") ? $("[data-sandbox]").textContent : "workspace-write",
+      approval: $("[data-approval]") ? $("[data-approval]").textContent : "on-request",
+      workspace: persisted.workspace,
+      offline_script: persisted.offlineScript,
+      provider: persisted.provider || "stub",
+    }).then(function (info) {
+      pending.remove();
+      UI.toast({
+        tone: "info", title: "已连接 harness",
+        desc: "run_id " + info.run_id + " · 前缀哈希 " + (info.prefix_hash || "—"),
+        duration: 4000,
+      });
+    }).catch(function (err) {
+      pending.remove();
+      var bad = el("div", "ev ev--check");
+      var c = el("div", "checkcard");
+      var hh = el("div", "checkcard__head");
+      hh.appendChild(svg(ICONS.warning));
+      hh.appendChild(el("span", "checkcard__title", "harness 拒绝这次运行"));
+      hh.appendChild(el("span", "checkcard__model", "server"));
+      c.appendChild(hh);
+      var ul = el("ul", "checklist");
+      var li = el("li");
+      li.appendChild(svg(ICONS.warning));
+      li.appendChild(el("span", null, String((err && err.message) || err)));
+      ul.appendChild(li);
+      c.appendChild(ul);
+      bad.appendChild(c);
+      D.stream.appendChild(bad);
+      UI.toast({
+        tone: "danger", title: "运行未启动",
+        desc: String((err && err.message) || err), duration: 6000,
+      });
+    });
   }
 
   /* ============================================================
@@ -2496,6 +2595,65 @@
     }
   }
 
+  /* ============================================================
+     会话桥接：把 harness 的真实事件接到同一套渲染器
+     ============================================================ */
+  var liveVMs = [];   // 本次真实运行的全部视图模型（重画时的唯一真相）
+
+  function attachHarness() {
+    if (!window.Harness) return;
+    window.Harness.attach({
+      push: function (vm) {
+        liveVMs.push(vm);
+        var node = buildEvent(vm, "live" + liveVMs.length);
+        if (!node) return;
+        node.classList.add("ev--live");
+        D.stream.appendChild(node);
+        D.stream.scrollTop = D.stream.scrollHeight;
+        if (refreshStreamFade) refreshStreamFade();
+        applyFilter();
+        expandLiveCard(node);
+      },
+      refresh: function () {
+        // tool.output 已就地合并进对应 requested 卡片 —— 从同一份 liveVMs 重画，
+        // 保证"渲染出来的"与"模型持有的"永远一致（避免两套真相）。
+        rerenderLive();
+      },
+      onDone: function (data) {
+        if (data && data.status) UI.announce("运行结束：" + data.status);
+      },
+    });
+  }
+
+  function rerenderLive() {
+    $$(".ev--live", D.stream).forEach(function (n) { n.remove(); });
+    var frag = document.createDocumentFragment();
+    liveVMs.forEach(function (vm, i) {
+      var node = buildEvent(vm, "live" + (i + 1));
+      if (node) {
+        node.classList.add("ev--live");
+        frag.appendChild(node);
+        expandLiveCard(node);
+      }
+    });
+    D.stream.appendChild(frag);
+    D.stream.scrollTop = D.stream.scrollHeight;
+    if (refreshStreamFade) refreshStreamFade();
+    applyFilter();
+  }
+
+  /* 真实的工具输出默认展开 —— 用户要看到 harness 实际做了什么 */
+  function expandLiveCard(node) {
+    var head = node.querySelector(".tool__head");
+    var body = node.querySelector(".tool__body");
+    if (head && body) {
+      head.setAttribute("aria-expanded", "true");
+      body.hidden = false;
+      var ml = node.querySelector(".tool__metaline");
+      if (ml) ml.hidden = true;
+    }
+  }
+
   function init() {
     cacheDom();
     initTheme();
@@ -2517,6 +2675,28 @@
     UI.initTooltips(document.body);
     applyFilter();
     updateTabOverflow();
+
+    // 探测 harness 后端：通了就把这一页从「原型」切到「真实运行」。
+    // 探测失败（file:// 直接打开）时静默维持 mock 演示，不打扰用户。
+    attachHarness();
+    if (window.Harness) {
+      window.Harness.probe().then(function (live) {
+        if (!live) return;
+        var chip = $(".ctxchip");
+        if (chip) {
+          chip.setAttribute("title", "已连接 harness 后端：真实运行可用");
+          chip.classList.add("ctxchip--live");
+          var dot = chip.querySelector(".ctxchip__dot");
+          if (dot) dot.style.background = "var(--jade)";
+        }
+        var hint = $(".dock__hint");
+        if (hint) {
+          hint.textContent = "";
+          hint.appendChild(el("span", null, "已连接 harness · 发送即真实运行"));
+        }
+        UI.announce("已连接 harness 后端");
+      });
+    }
 
     // 首屏骨架淡出：数据已就绪
     var boot = $("#boot");

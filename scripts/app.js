@@ -111,7 +111,8 @@
     gateResolved: null,      // null | "approved" | "rejected"
     planOpen: true,
     termCollapsed: false,
-    mobile: window.matchMedia("(max-width: 1024px)").matches,
+    railDrawer: window.matchMedia("(max-width: 860px)").matches,
+    agentDrawer: window.matchMedia("(max-width: 1024px)").matches,
     ctxRefs: [],
     filter: persisted.filter || "all",
     focusIdx: 0,             // 文件树的键盘游标
@@ -240,13 +241,46 @@
     D.mine = $("#mention");
   }
 
-  /* ---------- 主题：跟随系统偏好，同时允许手动覆盖 ---------- */
+  /* ---------- 主题：跟随系统偏好，同时允许手动覆盖 ----------
+     ## 图标必须与动作一致
+     旧版顶栏那个主题按钮画的是一个「+」—— 于是它被当成"新建"；
+     而活动栏底部的"设置"图标是圆+八条射线，看着就是亮度图标，
+     点下去却是模型接入。**图标语义错位比没有图标更糟**：功能明明存在，
+     用户却找不到，还会认为"点了没用"。
+     现在：主题在活动栏底部，图标随当前主题切换（深色显示太阳=切到浅色），
+     并且 tooltip 里明说当前是什么、点一下会变成什么。 */
+  var ICON_SUN = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+    + '<circle cx="12" cy="12" r="4.1" fill="none" stroke="currentColor" stroke-width="1.7"/>'
+    + '<path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2'
+    + 'M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4L17 7M7 17l-1.6 1.6"'
+    + ' stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/></svg>';
+  var ICON_MOON = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+    + '<path d="M20 14.2A8.2 8.2 0 0 1 9.8 4a8.6 8.6 0 1 0 10.2 10.2z"'
+    + ' fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>';
+
+  function themeLabel(t) { return t === "light" ? "浅色" : "深色"; }
+
   function applyTheme(t) {
     document.documentElement.setAttribute("data-theme", t);
     var mc = document.querySelector('meta[name="theme-color"]');
     if (mc) mc.setAttribute("content", t === "light" ? "#f2f0eb" : "#10141a");
     var b = $("#btn-theme");
-    if (b) b.setAttribute("aria-label", t === "light" ? "切换到深色主题" : "切换到浅色主题");
+    if (b) {
+      // 图标画的是**将要切到**的那一侧：深色时显示太阳。
+      var toLight = t !== "light";
+      b.innerHTML = toLight ? ICON_SUN : ICON_MOON;
+      var label = (toLight ? "切换到浅色主题" : "切换到深色主题")
+        + "（当前：" + themeLabel(t) + "）";
+      b.setAttribute("aria-label", label);
+      b.setAttribute("data-tip", label);
+      b.title = label;
+    }
+    // 设置页里的主题单选项要跟着同步（两处入口、同一份状态）
+    $$(".settings__theme-btn").forEach(function (x) {
+      var on = x.dataset.theme === t;
+      x.classList.toggle("is-on", on);
+      x.setAttribute("aria-checked", on ? "true" : "false");
+    });
   }
   function initTheme() {
     var sys = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
@@ -1931,13 +1965,9 @@
       { sep: true },
       { label: t.dirty ? "保存" : "已保存", icon: ICONS.check, disabled: !t.dirty, onClick: function () { markSaved(t.path); } },
       { label: "在资源管理器中显示", icon: ICONS.dirClosed, onClick: function () {
-          state.railView = "explorer";
-          $$(".actbar__btn[data-view]").forEach(function (x2) {
-            x2.classList.toggle("is-on", x2.dataset.view === "explorer");
-            x2.setAttribute("aria-pressed", x2.dataset.view === "explorer" ? "true" : "false");
-          });
-          renderRail();
-          openRailIfMobile();
+          // 走 goView 而不是自己抄一遍按钮状态：
+          // 抄的那份会漏掉"侧栏被折叠时要展开"，于是点了没反应。
+          goView("explorer");
         } },
     ]);
   }
@@ -3169,34 +3199,48 @@
      ============================================================ */
   function bind() {
     // ---------- 活动栏切换 ----------
+    /* ## 点活动栏图标的行为（曾经是坏的）
+       原来的判定只有一句「窄屏才 openRail，且当前已选中就跳过」：
+         · 宽屏下点图标**永远不展开侧栏** —— 一旦侧栏被折叠，
+           唯一的"展开"控件（侧栏头部那个 ‹）就跟着侧栏一起变成 0 宽，
+           **用户再也回不去**。实测：折叠后点遍所有图标，rail 宽度始终 1px。
+         · 窄屏下点**当前已选中的图标**什么也不发生（already=true 直接跳过），
+           于是"关了抽屉之后点同一个图标打不开"。
+       现在按 VS Code 的语义：点当前视图 = 开/关，点其它视图 = 切换并展开。 */
     $$(".actbar__btn[data-view]").forEach(function (b) {
       b.addEventListener("click", function () {
         var v = b.dataset.view;
-        var already = b.classList.contains("is-on");
-        $$(".actbar__btn[data-view]").forEach(function (x) {
-          x.classList.remove("is-on");
-          x.setAttribute("aria-pressed", "false");
-        });
-        b.classList.add("is-on");
-        b.setAttribute("aria-pressed", "true");
+        var sameView = state.railView === v;
+        setActiveViewButton(v);
         state.railView = v;
         persisted.activeView = v;
         save();
         state.focusIdx = 0;
         renderRail();
-        // 窄屏下点活动栏把侧栏拉开；再点同一个则收起
-        if (state.mobile && !already) openRail();
-        UI.announce(RAIL_TITLES[v] || v);
+
+        if (state.railDrawer) {
+          // 窄屏：侧栏是抽屉。点当前视图 → 开/关；点别的 → 切换并保持打开
+          if (sameView) toggleRailDrawer();
+          else openRail();
+        } else if (sameView) {
+          // 宽屏：点当前视图 = 折叠/展开（这是折叠后唯一能恢复的入口）
+          toggleRailCollapsed();
+          return;
+        } else {
+          // 宽屏：切到别的视图时，如果侧栏是折叠的，顺手展开 ——
+          // 点了图标却什么都没出现是最容易让人以为"功能坏了"的形态
+          expandRail();
+        }
+        UI.announce((sameView ? "" : (RAIL_TITLES[v] || v))
+          + (state.railDrawer
+              ? (D.shell.classList.contains("is-rail-open") ? " · 侧栏已打开" : " · 侧栏已收起")
+              : (isRailCollapsed() ? " · 侧栏已折叠" : "")));
       });
     });
 
     // ---------- 侧栏折叠（记忆状态） ----------
     $("#btn-collapse-rail").addEventListener("click", function () {
-      if (state.mobile) { closeRail(); return; }
-      var collapsed = D.shell.classList.toggle("is-rail-collapsed");
-      persisted.railCollapsed = collapsed;
-      save();
-      UI.announce(collapsed ? "侧栏已折叠" : "侧栏已展开");
+      toggleRailCollapsed();
     });
 
     // ---------- 侧栏宽度拖拽 ----------
@@ -3205,7 +3249,7 @@
       if (!h) return;
       // 指针按下即拖，不需要先点准 1px 的边
       h.addEventListener("pointerdown", function (e) {
-        if (state.mobile) return;
+        if (state.railDrawer) return;
         e.preventDefault();
         h.classList.add("is-active");
         document.body.classList.add("is-col-resizing");
@@ -3292,7 +3336,11 @@
     // ---------- 设置（活动栏底部）----------
     var btnSettings = $("#btn-settings");
     if (btnSettings) {
-      btnSettings.addEventListener("click", function () { openModelSettings(); });
+      // 设置是**一页**，不是只有模型接入。默认落在哪个分区按状态决定：
+      // 还没配模型 → 直接进"模型接入"（这是最可能的意图）；已配好 → 外观。
+      btnSettings.addEventListener("click", function () {
+        openSettings(state.endpoint && state.endpoint.configured ? "appearance" : "model");
+      });
       // 右键给一个"清除配置"的口子 —— 不放在主表单里，避免误触，
       // 但必须存在：否则用户想换 key / 换端点时只能手动删文件。
       btnSettings.addEventListener("contextmenu", function (e) {
@@ -3336,6 +3384,13 @@
 
       cmds.push({ label: "切换明暗主题", sub: "当前：" + (document.documentElement.getAttribute("data-theme") === "light" ? "浅色" : "深色"),
         group: "外观", icon: ICONS.edit, onRun: toggleTheme });
+      // 设置是一个**页面**（外观 / 模型接入 / 工作区），所以给它一条独立命令 ——
+      // 只靠活动栏底部那个图标，用户得先猜到它是设置。
+      cmds.push({ label: "打开设置…", sub: "外观 · 模型接入 · 工作区",
+        group: "外观", icon: ICONS.plug,
+        onRun: function () {
+          openSettings(state.endpoint && state.endpoint.configured ? "appearance" : "model");
+        } });
 
       cmds.push({ label: "键盘快捷键总览", sub: "查看全部快捷键", group: "帮助", icon: ICONS.terminal, keys: ["?"], onRun: openShortcuts });
 
@@ -3344,7 +3399,7 @@
       cmds.push({ label: "显示 / 隐藏终端", group: "视图", icon: ICONS.terminal, keys: ["Ctrl", "`"],
         onRun: function () { toggleTerminal(); } });
       cmds.push({ label: "折叠 / 展开侧栏", group: "视图", icon: ICONS.dirClosed,
-        onRun: function () { $("#btn-collapse-rail").click(); } });
+        onRun: function () { toggleRailCollapsed(); } });
 
       ["explorer", "search", "scm", "sessions", "mcp"].forEach(function (v) {
         cmds.push({ label: "打开" + RAIL_TITLES[v], group: "侧栏", icon: ICONS.file,
@@ -3530,15 +3585,25 @@
       "on-request": "沙箱内自动放行，越界才问你。",
       never: "全自动，不再打断你。",
     };
+    /* 状态栏的模型按钮。原来这里弹的是一个**编造的模型清单**
+       ——列出的模型页面上根本不存在，点任何一个只会弹一条 toast。
+       现在它指向真正的设置页；"查看 token 消耗"仍然保留（那是真实数据）。 */
     $("#btn-model").addEventListener("click", function (e) {
       var r = this.getBoundingClientRect();
-      UI.contextMenu(r.left, r.top - 96, [
-        { label: "gpt-5.4-codex", icon: ICONS.play, onClick: function () { UI.toast({ tone: "info", title: "模型：gpt-5.4-codex", desc: "主推理模型，用于实际编码。", duration: 3000 }); } },
-        { label: "gpt-5.4-mini", icon: ICONS.play, onClick: function () { UI.toast({ tone: "info", title: "模型：gpt-5.4-mini", desc: "轻量，适合子代理与目标检查。", duration: 3000 }); } },
+      UI.contextMenu(r.left, r.top - 88, [
+        { label: state.endpoint && state.endpoint.configured
+            ? ("当前：" + state.endpoint.model)
+            : "尚未接入模型",
+          icon: ICONS.plug, disabled: true },
         { sep: true },
+        { label: "模型接入设置…", icon: ICONS.plug, onClick: function () { openSettings("model"); } },
         { label: "查看 token 消耗", icon: ICONS.clock, onClick: showTokenDetail },
       ]);
     });
+    var agentModelBtn = $("#btn-agent-model");
+    if (agentModelBtn) {
+      agentModelBtn.addEventListener("click", function () { openSettings("model"); });
+    }
     $("#btn-index").addEventListener("click", function (e) {
       var r = this.getBoundingClientRect();
       UI.contextMenu(r.left, r.top - 84, [
@@ -3821,7 +3886,7 @@
 
     // ---------- Agent 面板开合 ----------
     function setAgentOpen(open) {
-      if (state.mobile) D.shell.classList.toggle("is-agent-open", open);
+      if (state.agentDrawer) D.shell.classList.toggle("is-agent-open", open);
       else D.shell.classList.toggle("is-agent-hidden", !open);
       var t = $("#btn-agent-toggle");
       if (t) t.setAttribute("aria-expanded", open ? "true" : "false");
@@ -3830,7 +3895,7 @@
       UI.announce(open ? "Agent 面板已展开" : "Agent 面板已收起");
     }
     function agentIsOpen() {
-      return state.mobile
+      return state.agentDrawer
         ? D.shell.classList.contains("is-agent-open")
         : !D.shell.classList.contains("is-agent-hidden");
     }
@@ -3896,7 +3961,8 @@
       if (e.key === "Escape") {
         if (!D.mine.hidden) { hideMention(); return; }
         if (popOpen) { closePop(); return; }
-        if (state.mobile) { setAgentOpen(false); closeRail(); return; }
+        if (state.agentDrawer) { setAgentOpen(false); return; }
+        if (state.railDrawer) { closeRail(); return; }
         if (document.activeElement === D.termInput) D.termInput.blur();
         return;
       }
@@ -4110,20 +4176,83 @@
     });
 
     // ---------- 媒体查询变化 ----------
-    var mq = window.matchMedia("(max-width: 1024px)");
-    var onChange = function (m) {
-      state.mobile = m.matches;
-      D.shell.classList.remove("is-agent-open");
-      closeRail();
-    };
-    if (mq.addEventListener) mq.addEventListener("change", onChange);
-    else if (mq.addListener) mq.addListener(onChange);
+    // 两个断点**分别监听**。合成一个 mobile 标志会让 861–1024px 这段
+    // 出现"JS 认为是抽屉、CSS 认为不是"的错位（实测：那个 ‹ 按钮点了没反应）。
+    function watch(mqStr, apply) {
+      var mq = window.matchMedia(mqStr);
+      apply(mq.matches);
+      var onChange = function (m) { apply(m.matches); };
+      if (mq.addEventListener) mq.addEventListener("change", onChange);
+      else if (mq.addListener) mq.addListener(onChange);
+    }
+    watch("(max-width: 860px)", function (m) {
+      state.railDrawer = m;
+      // 从窄变宽时清掉抽屉态，否则宽屏会残留一个看不见的 is-rail-open
+      if (!m) closeRail();
+    });
+    watch("(max-width: 1024px)", function (m) {
+      state.agentDrawer = m;
+      if (!m) D.shell.classList.remove("is-agent-open");
+    });
+  }
+
+  /* ---------- 侧栏开合：一个状态，四个入口 ----------
+     入口：活动栏图标、侧栏头部 ‹、命令面板、快捷键。
+     **不能让某个入口只在特定宽度下有效** —— 之前那个 ‹ 在 861–1024px
+     区间里点了完全没反应（因为那个标志用的是 1024、而 CSS 的抽屉
+     断点用的是 860，两处断言不一致）。现在断点从 CSS 抄过来只写一次。 */
+  function isRailCollapsed() {
+    return D.shell.classList.contains("is-rail-collapsed");
+  }
+  function toggleRailCollapsed(force) {
+    if (state.railDrawer) { toggleRailDrawer(force); return; }
+    var collapsed = (force == null) ? !isRailCollapsed() : !force;
+    D.shell.classList.toggle("is-rail-collapsed", collapsed);
+    persisted.railCollapsed = collapsed;
+    save();
+    // 折叠后焦点若还留在侧栏里，Tab 键会走进一块 0 宽的区域（看不见却可聚焦）。
+    // 把焦点交回活动栏当前视图按钮，键盘用户才有办法再展开。
+    if (collapsed && D.rail && D.rail.contains(document.activeElement)) {
+      var btn = $('.actbar__btn[data-view="' + state.railView + '"]');
+      if (btn) btn.focus();
+    }
+    UI.announce(collapsed ? "侧栏已折叠（点活动栏图标展开）" : "侧栏已展开");
+  }
+  function expandRail() {
+    if (state.railDrawer) { openRail(); return; }
+    if (isRailCollapsed()) toggleRailCollapsed(true);
+  }
+  function toggleRailDrawer(force) {
+    var open = (force == null)
+      ? !D.shell.classList.contains("is-rail-open")
+      : !!force;
+    D.shell.classList.toggle("is-rail-open", open);
+    UI.announce(open ? "侧栏已打开" : "侧栏已收起");
+  }
+  function setActiveViewButton(v) {
+    $$(".actbar__btn[data-view]").forEach(function (x) {
+      var on = x.dataset.view === v;
+      x.classList.toggle("is-on", on);
+      x.setAttribute("aria-pressed", on ? "true" : "false");
+    });
   }
 
   function goView(v) {
-    var btn = $('.actbar__btn[data-view="' + v + '"]');
-    if (btn) btn.click();
+    setActiveViewButton(v);
+    state.railView = v;
+    persisted.activeView = v;
+    save();
+    state.focusIdx = 0;
+    renderRail();
+    // 命令面板/快捷键/菜单过来的调用，语义是"打开这个视图"，
+    // 所以必须是**展开**而不是切换 —— 否则在已选中该视图时按 Ctrl+Shift+E
+    // 会把侧栏收起来，与"打开资源管理器"完全相反。
+    expandRail();
   }
+
+  function openRail() { D.shell.classList.add("is-rail-open"); }
+  function closeRail() { D.shell.classList.remove("is-rail-open"); }
+  function openRailIfMobile() { /* 窄屏点文件后保留侧栏，方便连续操作 */ }
 
   function expandAll(open) {
     Object.keys(treeState).forEach(function (k) {
@@ -4132,10 +4261,6 @@
     renderRail();
     UI.toast({ tone: "info", title: open ? "已全部展开" : "已全部折叠", duration: 2200 });
   }
-
-  function openRail() { D.shell.classList.add("is-rail-open"); }
-  function closeRail() { D.shell.classList.remove("is-rail-open"); }
-  function openRailIfMobile() { /* 窄屏点文件后保留侧栏，方便连续操作 */ }
 
   /* ============================================================
      模型接入设置 —— 只有三个字段
@@ -4159,177 +4284,596 @@
     return s + "/chat/completions";
   }
 
-  function openModelSettings() {
-    if (!window.Harness || !window.Harness.isLive()) {
-      UI.toast({
-        tone: "warning",
-        title: "后端未连接",
-        desc: "模型接入配置由 harness 后端持久化。启动 `python harness/server.py` 后刷新页面即可。",
-        duration: 6000,
+  /* ============================================================
+     设置页（外观 / 模型接入 / 工作区 / 关于）
+     ============================================================
+     ## 为什么从"弹一个小表单"改成"一页设置"
+
+     上一版只有 `openModelSettings()`：一个三字段的模态，入口是活动栏底部
+     那个图标。问题是：
+
+     1. **入口不像入口**。图标画成圆+八条射线（看着是亮度），标签只写
+        "设置"，而它只做模型接入。用户点了以为要换主题，没反应就认为坏了。
+     2. **主题没有真正的入口**。真正的换主题按钮在顶栏、图标是个「+」，
+        被当成"新建"。
+     3. **后端没连上时只剩一句 toast**，用户看不到任何可操作的东西。
+
+     所以这里做成一个真正的设置页：左侧分栏、右侧内容。主题与模型接入
+     是**同一页的两个分区**，不再靠猜图标。后端未连接时也照常打开，
+     只是把"为什么现在不能保存"写在页面上，而不是弹个提示就消失。
+
+     ## 模型接入只有三个字段
+
+     接口地址 / API Key / 模型名称。不设「厂家下拉」—— 任何厂家下拉都会
+     过时，而这三个字段能接任意 OpenAI 兼容端点（含中转）。
+     几条必须保持的语义：
+       · 地址归一化**实时可见**（把最终请求 URL 显示出来）
+       · 测试连接是一等公民（填完先验一次）
+       · key 留空 = **沿用**旧值（不是清空）
+       · 只存在服务端的 .crucible/config.json，不回传明文
+     ============================================================ */
+
+  var _settingsClose = null;      // 当前打开的设置页关闭函数（防叠层）
+
+  function normalizeBase(u) {
+    var s = String(u || "").trim().replace(/\/+$/, "");
+    if (!s) return "";
+    if (/\/chat\/completions$/.test(s)) return s;
+    return s + "/chat/completions";
+  }
+
+  function currentThemeChoice() {
+    return persisted.theme || "auto";
+  }
+
+  function openSettings(tab) {
+    if (_settingsClose) _settingsClose();
+
+    var live = !!(window.Harness && window.Harness.isLive());
+    var ws = state.workspace;
+    var curTab = tab || "appearance";
+
+    var back = el("div", "modalback");
+    var dlg = el("div", "modal modal--settings");
+    dlg.setAttribute("role", "dialog");
+    dlg.setAttribute("aria-modal", "true");
+    var titleId = "settings-title";
+    dlg.setAttribute("aria-labelledby", titleId);
+
+    var head = el("div", "settings__head");
+    var h2 = el("h2", "modal__title", "设置");
+    h2.id = titleId;
+    head.appendChild(h2);
+    var closeBtn = el("button", "iconbtn iconbtn--sm");
+    closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "关闭设置");
+    closeBtn.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">'
+      + '<path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>';
+    head.appendChild(closeBtn);
+    dlg.appendChild(head);
+
+    var body = el("div", "settings__body");
+    var nav = el("nav", "settings__nav");
+    nav.setAttribute("role", "tablist");
+    nav.setAttribute("aria-label", "设置分区");
+    var pane = el("div", "settings__pane");
+    pane.setAttribute("role", "tabpanel");
+    body.appendChild(nav);
+    body.appendChild(pane);
+    dlg.appendChild(body);
+
+    var foot = el("div", "settings__foot");
+    var hint = el("span", "settings__foothint",
+      live ? "配置保存在服务端 .crucible/config.json（已在 .gitignore，不随仓库提交）。"
+           : "后端未连接：可以先看，连上后才能保存。");
+    foot.appendChild(hint);
+    var doneBtn = el("button", "btn", "关闭");
+    doneBtn.type = "button";
+    doneBtn.addEventListener("click", function () { close(); });
+    foot.appendChild(doneBtn);
+    dlg.appendChild(foot);
+
+    back.appendChild(dlg);
+    document.body.appendChild(back);
+    UI.lockScroll(true);
+    var releaseTrap = UI.trapFocus(dlg);
+    closeBtn.focus();
+
+    var TABS = [
+      ["appearance", "外观"],
+      ["model", "模型接入"],
+      ["workspace", "工作区"],
+      ["about", "关于"],
+    ];
+
+    function setTab(name) {
+      curTab = name;
+      $$(".settings__navitem", nav).forEach(function (b) {
+        var on = b.dataset.tab === name;
+        b.classList.toggle("is-on", on);
+        b.setAttribute("aria-selected", on ? "true" : "false");
+        b.tabIndex = on ? 0 : -1;
       });
-      return;
+      pane.innerHTML = "";
+      if (name === "appearance") pane.appendChild(appearancePane());
+      else if (name === "model") pane.appendChild(modelPane());
+      else if (name === "workspace") pane.appendChild(workspacePane());
+      else pane.appendChild(aboutPane());
     }
 
-    var ws = state.workspace;
-    var dlg = null, api = null;
-    var current = { base_url: "", model: "", has_key: false, api_key_masked: "" };
-
-    // 先读现有配置，再用它作为表单初值 —— 让「改一个字段」成为默认操作
-    window.Harness.getConfig(ws).then(function (r) {
-      var ep = (r && r.endpoint) || {};
-      current = ep;
-      dlg = UI.formDialog({
-        title: "模型接入",
-        desc: "填这三项即可接任意 OpenAI 兼容端点（含中转）。",
-        submitLabel: "保存",
-        focusName: "base_url",
-        extraActions: [{ act: "test", label: "测试连接" }],
-        fields: [
-          {
-            name: "base_url", label: "接口地址", type: "text", required: true,
-            placeholder: "https://api.deepseek.com/v1",
-            autocomplete: "off", spellcheck: false,
-            value: ep.base_url || "",
-            hint: "填到 /v1 即可；末尾带不带 /chat/completions 都行，会自动补。",
-          },
-          {
-            name: "api_key", label: "API Key", type: "password", required: !ep.has_key,
-            placeholder: ep.has_key ? ("已保存：" + (ep.api_key_masked || "••••") + "（留空则沿用）") : "sk-…",
-            autocomplete: "new-password", spellcheck: false,
-            value: "",
-            hint: ep.has_key
-              ? "已有一份保存的服务端。这里留空即沿用，填入则替换。"
-              : "只存在服务端的 .crucible/config.json（已在 .gitignore），不会回传明文。",
-          },
-          {
-            name: "model", label: "模型名称", type: "text", required: true,
-            placeholder: "deepseek-chat",
-            autocomplete: "off", spellcheck: false,
-            value: ep.model || "",
-            hint: "该端点上可用的模型 id，原样填即可。",
-          },
-        ],
-        onSubmit: submit,
-      });
-      api = dlg;
-      wireLiveHints();
-    }).catch(function (err) {
-      UI.toast({ tone: "danger", title: "读取配置失败", desc: String(err.message || err), duration: 6000 });
+    TABS.forEach(function (t) {
+      var b = el("button", "settings__navitem", t[1]);
+      b.type = "button";
+      b.dataset.tab = t[0];
+      b.setAttribute("role", "tab");
+      b.addEventListener("click", function () { setTab(t[0]); });
+      nav.appendChild(b);
     });
 
-    /* ---------- 表单内：地址预览 + 测试连接 ---------- */
-    function wireLiveHints() {
-      var root = document.querySelector(".modal--form");
-      if (!root) return;
-      var baseInput = root.querySelector('input[name="base_url"]');
-      var keyInput = root.querySelector('input[name="api_key"]');
-      var modelInput = root.querySelector('input[name="model"]');
-      var extra = root.querySelector(".fd__extra");
-      var testBtn = root.querySelector('[data-act="test"]');
+    /* ---------------- 外观 ---------------- */
+    function appearancePane() {
+      var wrap = el("div", "settings__sect");
+      wrap.appendChild(el("h3", "settings__h", "主题"));
+      wrap.appendChild(el("p", "settings__p",
+        "明暗随时可切。选「跟随系统」时不写死，操作系统改了这里跟着变。"));
 
-      // —— 实时地址预览：把「最终会请求什么」摆在用户眼前 ——
-      var preview = document.createElement("p");
-      preview.className = "field__hint";
-      preview.style.marginTop = "6px";
-      baseInput.parentElement.parentElement.appendChild(preview);
+      var group = el("div", "settings__opts");
+      group.setAttribute("role", "radiogroup");
+      group.setAttribute("aria-label", "主题");
+      var cur = currentThemeChoice();
+      [["dark", "深色"], ["light", "浅色"], ["auto", "跟随系统"]].forEach(function (o) {
+        var b = el("button", "settings__opt settings__theme-btn");
+        b.type = "button";
+        b.dataset.theme = o[0];
+        b.setAttribute("role", "radio");
+        b.setAttribute("aria-checked", cur === o[0] ? "true" : "false");
+        b.classList.toggle("is-on", cur === o[0]);
+        // 小色块：让人不用点就知道这个选项长什么样
+        var chip = el("span", "settings__swatch settings__swatch--" + o[0]);
+        b.appendChild(chip);
+        b.appendChild(el("span", null, o[1]));
+        b.addEventListener("click", function () {
+          if (o[0] === "auto") {
+            persisted.theme = null;
+            save();
+            var sys = window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light" : "dark";
+            applyTheme(sys);
+          } else {
+            persisted.theme = o[0];
+            save();
+            applyTheme(o[0]);
+          }
+          $$(".settings__theme-btn", group).forEach(function (x) {
+            var on = x.dataset.theme === o[0];
+            x.classList.toggle("is-on", on);
+            x.setAttribute("aria-checked", on ? "true" : "false");
+          });
+          UI.announce("主题：" + o[1]);
+        });
+        group.appendChild(b);
+      });
+      wrap.appendChild(group);
+
+      var note = el("p", "settings__note");
+      note.textContent = "主题选择存在浏览器本地（不占服务端配置）。";
+      wrap.appendChild(note);
+      return wrap;
+    }
+
+    /* ---------------- 模型接入 ---------------- */
+    function modelPane() {
+      var wrap = el("div", "settings__sect");
+      wrap.appendChild(el("h3", "settings__h", "模型接入"));
+      wrap.appendChild(el("p", "settings__p",
+        "填这三项即可接任意 OpenAI 兼容端点（含中转）。不需要选厂家。"
+        + "不填也能用 —— 此时运行走离线脚本，只演示流程不真的调模型。"));
+
+      if (!live) {
+        var warn = el("div", "settings__warn");
+        warn.appendChild(el("strong", null, "后端未连接"));
+        warn.appendChild(el("span", null,
+          "模型配置由 harness 后端读写（.crucible/config.json），所以现在读不到也存不了。"));
+        var retry = el("button", "btn btn--sm", "重试连接");
+        retry.type = "button";
+        retry.addEventListener("click", function () {
+          retry.disabled = true;
+          retry.textContent = "连接中…";
+          window.Harness.probe().then(function (ok) {
+            if (ok) {
+              refreshConnectionUI();
+              close();
+              openSettings("model");
+            } else {
+              retry.disabled = false;
+              retry.textContent = "重试连接";
+              UI.toast({ tone: "warning", title: "仍然连不上",
+                         desc: "确认后端已启动：python harness/server.py --port 8787",
+                         duration: 5000 });
+            }
+          });
+        });
+        warn.appendChild(retry);
+        wrap.appendChild(warn);
+      }
+
+      // 先用 state.endpoint（启动时已从服务端读过）预填，再异步刷新。
+      // 不预填的话，打开这一页会先闪一下"尚未配置"——
+      // 一个**已有模型在跑**的界面短暂显示"未配置"是会让人怀疑配置丢了的。
+      var form = {
+        base: null, key: null, model: null,
+        cur: state.endpoint || {
+          base_url: "", model: "", has_key: false,
+          api_key_masked: "", chat_url: "", configured: false,
+        },
+        result: el("div", "settings__result"),
+      };
+
+      var status = el("div", "settings__status");
+      wrap.appendChild(status);
+      wrap.appendChild(form.result);
+
+      form.base = textField("接口地址", "https://api.deepseek.com/v1",
+        "填到 /v1 即可；末尾带不带 /chat/completions 都行，会自动补。");
+      wrap.appendChild(form.base.wrap);
+      form.key = textField("API Key", "sk-…",
+        "只存在服务端，不回传明文。已有 key 时留空 = 沿用。", "password");
+      wrap.appendChild(form.key.wrap);
+      form.model = textField("模型名称", "deepseek-chat",
+        "该端点上可用的模型 id，原样填即可。");
+      wrap.appendChild(form.model.wrap);
+
+      var preview = el("p", "field__hint settings__preview");
+      preview.hidden = true;
+      wrap.appendChild(preview);
       function refreshPreview() {
-        var full = normalizeBase(baseInput.value);
+        var full = normalizeBase(form.base.input.value);
         preview.textContent = full ? ("将请求：" + full) : "";
         preview.hidden = !full;
       }
-      baseInput.addEventListener("input", refreshPreview);
-      refreshPreview();
+      form.base.input.addEventListener("input", refreshPreview);
 
-      // —— 填入新 key 时解除"必填"约束（留空=沿用） ——
-      keyInput.addEventListener("input", function () {
-        if (dlg) dlg.clearErrors();
-      });
+      var acts = el("div", "settings__acts");
+      var testBtn = el("button", "btn", "测试连接");
+      testBtn.type = "button";
+      var saveBtn = el("button", "btn btn--primary", "保存");
+      saveBtn.type = "button";
+      var clearBtn = el("button", "btn btn--danger", "清除配置");
+      clearBtn.type = "button";
+      acts.appendChild(testBtn);
+      acts.appendChild(saveBtn);
+      var spacer = el("span", "settings__spacer");
+      acts.appendChild(spacer);
+      acts.appendChild(clearBtn);
+      wrap.appendChild(acts);
 
-      if (testBtn) {
-        testBtn.addEventListener("click", function () {
-          var payload = collect(testBtn);
-          extra.innerHTML = "";
-          extra.appendChild(checkBar("busy", "正在连接该端点…", ""));
-          testBtn.disabled = true;
-          window.Harness.testConfig(ws, payload, 20).then(function (rep) {
-            testBtn.disabled = false;
-            extra.innerHTML = "";
-            extra.appendChild(checkBar(
-              rep.ok ? "ok" : "bad",
-              rep.message || (rep.ok ? "连通" : "失败"),
-              (rep.url ? rep.url : "") + (rep.elapsed_s != null ? ("　" + rep.elapsed_s + "s") : "")
-            ));
-            if (rep.ok) UI.announce("连接测试通过");
-            else UI.announce("连接测试未通过");
-          }).catch(function (err) {
-            testBtn.disabled = false;
-            extra.innerHTML = "";
-            extra.appendChild(checkBar("bad", String(err.message || err), ""));
-          });
-        });
+      if (!live) {
+        [testBtn, saveBtn, clearBtn].forEach(function (b) { b.disabled = true; });
       }
 
-      function collect(testBtn) {
-        // 测试用当前表单值；key 留空则沿用已保存的（服务端会合并）
+      function paintStatus() {
+        status.innerHTML = "";
+        var c = form.cur;
+        var dotCls = c.configured ? "is-ok" : (c.has_key ? "is-warn" : "is-off");
+        var row = el("div", "settings__statusrow");
+        row.appendChild(el("span", "settings__dot " + dotCls));
+        row.appendChild(el("span", null, c.configured
+          ? ("已配置：" + c.model + " @ " + (c.chat_url || c.base_url))
+          : (c.has_key ? "不完整：有 API Key，但缺接口地址或模型名" : "尚未配置")));
+        status.appendChild(row);
+        if (c.has_key) {
+          status.appendChild(el("div", "settings__sub",
+            "已保存的 key：" + (c.api_key_masked || "••••") + "（留空即沿用）"));
+        }
+      }
+
+      function fillForm() {
+        form.base.input.value = form.cur.base_url || "";
+        form.model.input.value = form.cur.model || "";
+        form.key.input.value = "";
+        form.key.input.placeholder = form.cur.has_key
+          ? ("已保存：" + (form.cur.api_key_masked || "••••") + "（留空则沿用）")
+          : "sk-…";
+        refreshPreview();
+      }
+
+      function readForm() {
         var v = {
-          base_url: (baseInput.value || "").trim(),
-          model: (modelInput.value || "").trim(),
+          base_url: (form.base.input.value || "").trim(),
+          model: (form.model.input.value || "").trim(),
         };
-        var k = (keyInput.value || "").trim();
-        if (k) v.api_key = k;
+        var k = (form.key.input.value || "").trim();
+        if (k) v.api_key = k;                 // 填了 → 替换
+        else if (!form.cur.has_key) v.api_key = "";   // 本来没有也没填 → 明确空
+        // 有 key 且留空 → **不带该字段**，服务端沿用旧值
         return v;
       }
-      void collect;
-    }
 
-    function checkBar(kind, text, meta) {
-      var box = el("div", "fdcheck fdcheck--" + kind);
-      var icon = kind === "ok"
-        ? '<path d="M3.5 8.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
-        : '<path d="M8 2.5l6 11H2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 6.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>';
-      box.appendChild(svg(icon));
-      var body = el("div");
-      body.appendChild(document.createTextNode(text));
-      if (meta) {
-        var m = el("span", "fdcheck__meta", meta);
-        body.appendChild(m);
-      }
-      box.appendChild(body);
-      return box;
-    }
-
-    /* ---------- 提交 ---------- */
-    function submit(v, formApi) {
-      formApi.busy(true, "保存中…");
-      var payload = {
-        base_url: (v.base_url || "").trim(),
-        model: (v.model || "").trim(),
-      };
-      var k = (v.api_key || "").trim();
-      if (k) payload.api_key = k;                 // 填了 → 替换
-      else if (!current.has_key) payload.api_key = "";  // 本来没有也没填 → 明确空
-      // 有 key 且留空 → **不带该字段**，服务端沿用旧值
-
-      return window.Harness.saveConfig(ws, payload).then(function (r) {
-        formApi.busy(false);
-        applyEndpoint(r.endpoint);
-        UI.toast({
-          tone: "success",
-          title: "模型接入已保存",
-          desc: r.endpoint.configured
-            ? (r.endpoint.model + " @ " + r.endpoint.chat_url)
-            : "配置不完整，运行时仍走离线脚本。",
-          duration: 5000,
+      if (live) {
+        paintStatus();
+        window.Harness.getConfig(ws).then(function (r) {
+          form.cur = (r && r.endpoint) || form.cur;
+          paintStatus();
+          fillForm();
+        }).catch(function (e) {
+          form.result.innerHTML = "";
+          form.result.appendChild(el("div", "settings__warn",
+            "读取配置失败：" + String(e && e.message || e)));
         });
-        return true;
-      }).catch(function (err) {
-        formApi.busy(false);
-        formApi.setError("base_url", "保存失败：" + (err.message || err));
-        UI.toast({ tone: "danger", title: "保存失败", desc: String(err.message || err), duration: 6000 });
-        return false;   // 保持打开，别把用户填的内容丢掉
+      } else {
+        paintStatus();
+        fillForm();
+      }
+
+      testBtn.addEventListener("click", function () {
+        form.result.innerHTML = "";
+        var busy = el("div", "settings__resultrow is-busy", "正在连接该端点…");
+        form.result.appendChild(busy);
+        testBtn.disabled = true;
+        window.Harness.testConfig(ws, readForm(), 20).then(function (rep) {
+          testBtn.disabled = false;
+          form.result.innerHTML = "";
+          var row = el("div", "settings__resultrow "
+            + (rep.ok ? "is-ok" : "is-bad"));
+          row.appendChild(el("span", null, rep.message || (rep.ok ? "连通" : "失败")));
+          if (rep.url || rep.elapsed_s != null) {
+            row.appendChild(el("span", "settings__meta",
+              (rep.url || "") + (rep.elapsed_s != null ? ("　" + rep.elapsed_s + "s") : "")));
+          }
+          form.result.appendChild(row);
+          UI.announce(rep.ok ? "连接测试通过" : "连接测试未通过");
+        }).catch(function (e) {
+          testBtn.disabled = false;
+          form.result.innerHTML = "";
+          form.result.appendChild(el("div", "settings__resultrow is-bad",
+            String(e && e.message || e)));
+        });
       });
+
+      saveBtn.addEventListener("click", function () {
+        if (!form.base.input.value.trim()) {
+          form.base.markError("接口地址必填。没配置就留空整页不填 —— 运行会走离线脚本。");
+          form.base.input.focus();
+          return;
+        }
+        if (!form.model.input.value.trim()) {
+          form.model.markError("模型名称必填。");
+          form.model.input.focus();
+          return;
+        }
+        if (!form.cur.has_key && !form.key.input.value.trim()) {
+          form.key.markError("还没有 API Key，这里必须填一个。");
+          form.key.input.focus();
+          return;
+        }
+        saveBtn.disabled = true;
+        saveBtn.textContent = "保存中…";
+        window.Harness.saveConfig(ws, readForm()).then(function (r) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = "保存";
+          form.cur = (r && r.endpoint) || form.cur;
+          applyEndpoint(form.cur);
+          paintStatus();
+          fillForm();
+          UI.toast({
+            tone: "success",
+            title: "模型接入已保存",
+            desc: form.cur.configured
+              ? (form.cur.model + " @ " + form.cur.chat_url)
+              : "配置不完整，运行时仍走离线脚本。",
+            duration: 5000,
+          });
+        }).catch(function (e) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = "保存";
+          form.result.innerHTML = "";
+          form.result.appendChild(el("div", "settings__resultrow is-bad",
+            "保存失败：" + String(e && e.message || e)));
+        });
+      });
+
+      clearBtn.addEventListener("click", function () {
+        UI.confirm({
+          title: "清除模型配置？",
+          desc: "会删除服务端保存的接口地址、API Key 与模型名称。清除后运行回到离线脚本模式。",
+          confirmLabel: "清除", tone: "danger",
+        }).then(function (ok) {
+          if (!ok) return;
+          window.Harness.clearConfig(ws).then(function (r) {
+            form.cur = (r && r.endpoint) || {
+              base_url: "", model: "", has_key: false,
+              api_key_masked: "", chat_url: "", configured: false,
+            };
+            applyEndpoint(form.cur);
+            paintStatus();
+            fillForm();
+            form.result.innerHTML = "";
+            UI.toast({ tone: "info", title: "已清除模型配置",
+                       desc: r && r.removed ? "配置已删除。" : "本来就没有配置文件。",
+                       duration: 4000 });
+          }).catch(function (e) {
+            UI.toast({ tone: "danger", title: "清除失败",
+                       desc: String(e && e.message || e), duration: 5000 });
+          });
+        });
+      });
+
+      return wrap;
     }
+
+    /* 一个带标签 / 提示 / 错误位的字段。不用 formDialog 的字段系统，
+       因为设置页是**分区**的，一个 form 装不下四个分区。 */
+    function textField(label, placeholder, hint, type) {
+      var wrap = el("div", "field");
+      var id = "set-" + label.replace(/\s+/g, "-");
+      var lb = el("label", "field__label", label);
+      lb.setAttribute("for", id);
+      wrap.appendChild(lb);
+      var box = el("div", "field__box");
+      var input = document.createElement("input");
+      input.className = "field__input";
+      input.id = id;
+      input.type = type || "text";
+      input.placeholder = placeholder || "";
+      input.spellcheck = false;
+      input.autocomplete = type === "password" ? "new-password" : "off";
+      box.appendChild(input);
+      if (type === "password") {
+        var eye = el("button", "field__reveal");
+        eye.type = "button";
+        eye.setAttribute("aria-label", "显示内容");
+        eye.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">'
+          + '<path d="M2 10s3-5 8-5 8 5 8 5-3 5-8 5-8-5-8-5z" fill="none" stroke="currentColor" stroke-width="1.4"/>'
+          + '<circle cx="10" cy="10" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
+        eye.addEventListener("click", function () {
+          var shown = input.type === "text";
+          input.type = shown ? "password" : "text";
+          eye.setAttribute("aria-label", shown ? "显示内容" : "隐藏内容");
+          input.focus();
+        });
+        box.appendChild(eye);
+      }
+      wrap.appendChild(box);
+      var hintEl = el("div", "field__hint", hint || "");
+      if (!hint) hintEl.hidden = true;
+      wrap.appendChild(hintEl);
+      var errEl = el("div", "field__error");
+      errEl.hidden = true;
+      wrap.appendChild(errEl);
+      input.addEventListener("input", function () { errEl.hidden = true; });
+      return {
+        wrap: wrap, input: input,
+        markError: function (msg) {
+          errEl.textContent = msg;
+          errEl.hidden = false;
+        },
+      };
+    }
+
+    /* ---------------- 工作区 ---------------- */
+    function workspacePane() {
+      var wrap = el("div", "settings__sect");
+      wrap.appendChild(el("h3", "settings__h", "工作区"));
+      wrap.appendChild(el("p", "settings__p",
+        "只读。这里展示的是**真实状态** —— 读不到就写读不到，不留占位数字。"));
+
+      var rows = el("dl", "settings__kv");
+      function kv(k, v) {
+        rows.appendChild(el("dt", null, k));
+        rows.appendChild(el("dd", null, v == null || v === "" ? "—" : String(v)));
+      }
+      // 没带 ?workspace= 时 state.workspace 是空串，真实工作区由服务端决定。
+      // 这时要显示**服务端回报的路径**（wsInfo.workspace），
+      // 而不是一个"—"——"不知道"和"没有"是两件事。
+      var wsPath = state.workspace
+        || (state.wsInfo && state.wsInfo.workspace)
+        || "(服务端默认工作区，尚未读到路径)";
+      kv("路径", wsPath);
+      var parts = String(wsPath).split(/[\\/]/).filter(Boolean);
+      kv("名称", parts.length ? parts[parts.length - 1] : "—");
+
+      var g = state.gitStatus;
+      kv("分支", g && g.is_repo ? (g.branch || "—") : "非 git 仓库");
+      kv("改动", g && g.is_repo
+        ? (g.changed + " 个文件 · +" + g.added_lines + " / −" + g.deleted_lines + " 行")
+        : "—");
+
+      var ix = state.indexInfo;
+      kv("代码索引", ix
+        ? (ix.unique_symbols + " 个符号 · " + ix.files + " 个文件")
+        : (state.indexError ? "建立失败" : "尚未建立"));
+      if (ix) {
+        kv("索引语言", Object.keys(ix.languages || {}).join("、") || "—");
+        kv("索引边界", "符号索引 + 词表倒排，不是语义索引；不含跨文件调用关系");
+      }
+
+      kv("沙箱", (document.querySelector("[data-sandbox]") || {}).textContent || "—");
+      kv("审批策略", (document.querySelector("[data-approval]") || {}).textContent || "—");
+      wrap.appendChild(rows);
+
+      var acts = el("div", "settings__acts");
+      var rebuild = el("button", "btn", "重建索引");
+      rebuild.type = "button";
+      rebuild.addEventListener("click", function () {
+        if (!Backend.available()) {
+          UI.toast({ tone: "warning", title: "后端未连接", duration: 4000 });
+          return;
+        }
+        rebuild.disabled = true;
+        rebuild.textContent = "重建中…";
+        Backend.loadIndex(true).then(function () {
+          rebuild.disabled = false;
+          rebuild.textContent = "重建索引";
+          setTab("workspace");
+          UI.toast({ tone: "success", title: "索引已重建", duration: 3500 });
+        });
+      });
+      acts.appendChild(rebuild);
+      wrap.appendChild(acts);
+      return wrap;
+    }
+
+    /* ---------------- 关于 ---------------- */
+    function aboutPane() {
+      var wrap = el("div", "settings__sect");
+      wrap.appendChild(el("h3", "settings__h", "Crucible"));
+      wrap.appendChild(el("p", "settings__p",
+        "一个 harness 原型：模型只负责选动作，约束、验证与纠正都在 harness 里。"));
+      var rows = el("dl", "settings__kv");
+      rows.appendChild(el("dt", null, "前端"));
+      rows.appendChild(el("dd", null, "静态页面，无构建步骤"));
+      rows.appendChild(el("dt", null, "后端"));
+      rows.appendChild(el("dd", null, live ? "已连接 · Python 标准库零依赖" : "未连接"));
+      rows.appendChild(el("dt", null, "模型"));
+      rows.appendChild(el("dd", null, state.endpoint && state.endpoint.configured
+        ? state.endpoint.model : "未配置（运行走离线脚本）"));
+      wrap.appendChild(rows);
+
+      var acts = el("div", "settings__acts");
+      var help = el("button", "btn", "键盘快捷键总览");
+      help.type = "button";
+      help.addEventListener("click", function () { close(); openShortcuts(); });
+      acts.appendChild(help);
+      wrap.appendChild(acts);
+      return wrap;
+    }
+
+    function close() {
+      if (_settingsClose !== close) return;
+      _settingsClose = null;
+      if (releaseTrap) releaseTrap();
+      UI.lockScroll(false);
+      document.removeEventListener("keydown", onKey, true);
+      back.classList.add("modalback--out");
+      setTimeout(function () {
+        if (back.parentNode) back.parentNode.removeChild(back);
+      }, 190);
+    }
+    function onKey(e) {
+      if (e.key !== "Escape") return;
+      // ★ 设置页上面可能还压着一个确认框（"清除模型配置？"）。
+      //   这个监听是 capture 阶段的，不分层的话 Esc 会**先把设置页关掉**，
+      //   而那个确认框还留在屏幕上 —— 用户按 Esc 想取消，结果整页没了。
+      //   判据：只有自己是最后一个模态时才处理 Esc。
+      var backs = document.querySelectorAll(".modalback");
+      if (backs.length && backs[backs.length - 1] !== back) return;
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+    document.addEventListener("keydown", onKey, true);
+    closeBtn.addEventListener("click", close);
+    doneBtn.addEventListener("click", close);
+    back.addEventListener("mousedown", function (e) {
+      if (e.target === back) close();
+    });
+    _settingsClose = close;
+
+    setTab(curTab);
   }
+
+  /* 兼容旧调用点：这些地方只想直接落到"模型接入"这一页 */
+  function openModelSettings() { openSettings("model"); }
 
   /* 把某个 endpoint 的公开展示形态应用到界面上 */
   function applyEndpoint(ep) {
@@ -4379,13 +4923,37 @@
     }).catch(function () { return null; });
   }
 
+  /* ---------- 连接状态变化后重画界面 ----------
+     这一页里有十余处文案是"有后端 / 没后端"两套（空状态、状态栏、
+     执行轨迹说明、编辑器占位…）。它们都在**首屏**渲染过一次，
+     而连通性探测是**异步**的 —— 如果连上之后不重画，就会出现
+     "底部说已连接、面板说未连接"这种自相矛盾的屏幕。
+     所以把"需要重画的东西"收在一个函数里，连通后调一次。
+     **新增依赖连接状态的区块时，记得加到这里**（漏加的后果就是这次的 bug）。 */
+  function refreshConnectionUI() {
+    try {
+      renderRail();
+      renderTabs();
+      renderEditor();
+      renderPlan();
+      renderStream();
+      if (uiHooks.renderStatusbar) uiHooks.renderStatusbar();
+      if (uiHooks.renderBranchChip) uiHooks.renderBranchChip();
+      if (uiHooks.renderStatusMetrics) uiHooks.renderStatusMetrics();
+      if (uiHooks.updateMeter) uiHooks.updateMeter();
+    } catch (e) {
+      // 重画失败不能连"已连接"这个事实一起吞掉 —— 至少留一条可查的痕迹
+      if (window.console) console.error("连接后重画界面失败：", e);
+    }
+  }
+
   /* ============================================================
      启动
      ============================================================ */
   function restorePersisted() {
     document.documentElement.style.setProperty("--rail-w", (persisted.railW || 248) + "px");
     if (persisted.railCollapsed) D.shell.classList.add("is-rail-collapsed");
-    if (persisted.agentHidden && !state.mobile) D.shell.classList.add("is-agent-hidden");
+    if (persisted.agentHidden && !state.agentDrawer) D.shell.classList.add("is-agent-hidden");
     if (persisted.termH) document.documentElement.style.setProperty("--terminal-h", persisted.termH + "px");
     var btn = $('.actbar__btn[data-view="' + state.railView + '"]');
     if (btn) {
@@ -4537,6 +5105,11 @@
         Backend.loadGitStatus();
         Backend.loadIndex(false);
         uiHooks.updateMeter();
+        // ★ 探针是异步的，首屏渲染早已跑完 —— 必须把"依赖连接状态"的文案
+        //   重画一遍。否则执行轨迹面板会一直挂着"后端未连接。这是演示占位"，
+        //   而底部提示写的是"已连接 harness"。**同一屏两个结论相反的文案**
+        //   比只显示一个错的更糟：用户没法判断该信哪个。
+        refreshConnectionUI();
         // 把已保存的模型接入配置反映到界面。
         // 若未配置，状态栏模型会显示"未配置"并在 title 里提示点此接入 ——
         // 不静默显示一个假模型名，否则用户会以为真的在用那个模型。

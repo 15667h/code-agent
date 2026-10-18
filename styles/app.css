@@ -2475,3 +2475,292 @@ kbd {
 }
 /* 次级分组标题（"提到该词的文件"）—— 比主标题淡，表明它是弱证据 */
 .sect__head--sub { opacity: 0.72; }
+
+/* ============================================================
+   活动栏底部：主题 + 设置
+   ============================================================ */
+/* 两个按钮装在一个列里。原来底部只有一个按钮直接做 .actbar 的
+   space-between 末端，加第二个必须包一层，否则它会跟按钮组挤在一起。 */
+.actbar__foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+  padding-top: var(--sp-2);
+}
+
+/* Agent 面板头部的模型名现在是个按钮（点开设置）。
+   它原来是 span；改成 button 后必须显式清掉浏览器的默认外观，
+   否则会出现边框、字体不一致、内容居中这些"不像标签"的样子。 */
+button.agentpanel__model {
+  appearance: none;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+  transition-property: background-color, color;
+  transition-duration: var(--dur-fast);
+}
+button.agentpanel__model:hover {
+  background: var(--brass-a20);
+  color: var(--brass-bright);
+}
+button.agentpanel__model:focus-visible { outline: 2px solid var(--brass); outline-offset: 1px; }
+
+/* ============================================================
+   设置页（外观 / 模型接入 / 工作区 / 关于）
+   ============================================================ */
+/* 注意选择器写成 `.modalback .modal--settings`（0,2,0）而不是 `.modal--settings`（0,1,0）：
+   ui-kit.css 是在 app.css **之后**加载的，而 `.modal` 里写了 width: min(460px,100%)。
+   同级选择器后加载者胜 —— 结果设置页被压回 460px、左栏挤成一团。
+   实测截图才看出来（DOM 检查显示宽度是 453px）。 */
+.modalback .modal--settings {
+  width: min(780px, 100%);
+  max-height: min(88vh, 760px);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.settings__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-5) var(--sp-6) var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.settings__head .modal__title { margin: 0; }
+
+.settings__body {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.settings__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-4);
+  border-right: 1px solid var(--border);
+  background: var(--bg-inset);
+  overflow-y: auto;
+}
+.settings__navitem {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  text-align: left;
+  padding: 7px var(--sp-3);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition-property: background-color, color;
+  transition-duration: var(--dur-fast);
+}
+.settings__navitem:hover { background: var(--surface-hover); color: var(--text); }
+.settings__navitem.is-on {
+  background: var(--brass-a12);
+  color: var(--brass-bright);
+  font-weight: 600;
+  /* 左侧标记条：与活动栏选中的语汇一致 */
+  box-shadow: inset 2px 0 0 var(--brass);
+}
+
+.settings__pane {
+  padding: var(--sp-5) var(--sp-6) var(--sp-6);
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.settings__sect { display: flex; flex-direction: column; gap: var(--sp-3); }
+.settings__h {
+  margin: 0;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+.settings__p {
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.65;
+  color: var(--text-muted);
+  text-wrap: pretty;
+}
+.settings__note {
+  margin: 0;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+}
+
+/* 主题三选一：色块让人不用点就知道长什么样 */
+.settings__opts { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.settings__opt {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 7px var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition-property: border-color, color, background-color;
+  transition-duration: var(--dur-fast);
+}
+.settings__opt:hover { border-color: var(--border-strong); color: var(--text); }
+.settings__opt.is-on {
+  border-color: var(--brass);
+  background: var(--brass-a12);
+  color: var(--brass-bright);
+}
+.settings__swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  flex: 0 0 auto;
+}
+.settings__swatch--dark { background: #10141a; }
+.settings__swatch--light { background: #f2f0eb; }
+.settings__swatch--auto {
+  background: linear-gradient(135deg, #10141a 0 50%, #f2f0eb 50% 100%);
+}
+
+/* 状态行 / 结果行 */
+.settings__status { display: flex; flex-direction: column; gap: 3px; margin-bottom: var(--sp-1); }
+.settings__statusrow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--text);
+}
+.settings__sub { font-size: var(--fs-2xs); color: var(--text-faint); padding-left: 16px; }
+.settings__dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-faint);
+  flex: 0 0 auto;
+}
+.settings__dot.is-ok { background: var(--jade); }
+.settings__dot.is-warn { background: var(--amber); }
+.settings__dot.is-off { background: var(--text-faint); }
+
+.settings__result:empty { display: none; }
+.settings__resultrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: 7px var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-2xs);
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--surface);
+}
+.settings__resultrow.is-ok { border-color: var(--jade); background: var(--jade-a14); }
+.settings__resultrow.is-bad { border-color: var(--vermilion); background: var(--vermilion-a14); }
+.settings__resultrow.is-busy { color: var(--text-muted); }
+.settings__meta { color: var(--text-faint); font-family: var(--font-mono); }
+
+/* 后端未连接时的告警：页面内说明，不是转瞬即逝的 toast */
+.settings__warn {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--amber);
+  border-radius: var(--r-sm);
+  background: var(--amber-a14);
+  font-size: var(--fs-2xs);
+  line-height: 1.6;
+  color: var(--text);
+}
+.settings__warn strong { font-weight: 600; }
+
+.settings__preview { font-family: var(--font-mono); color: var(--text-faint); }
+
+.settings__acts {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  flex-wrap: wrap;
+}
+.settings__spacer { flex: 1 1 auto; }
+
+.settings__kv {
+  display: grid;
+  grid-template-columns: minmax(88px, max-content) minmax(0, 1fr);
+  gap: 4px var(--sp-4);
+  margin: 0;
+  font-size: var(--fs-2xs);
+  line-height: 1.6;
+}
+.settings__kv dt { color: var(--text-faint); }
+.settings__kv dd {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.settings__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-6);
+  border-top: 1px solid var(--border);
+  background: var(--bg-inset);
+  flex: 0 0 auto;
+}
+.settings__foothint {
+  flex: 1 1 auto;
+  font-size: var(--fs-2xs);
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+/* 字段错误位。ui-kit 里只有 .field__hint，没有错误态 —— 设置页需要一个
+   显式的"这里为什么不能保存"，否则校验失败时输入框毫无变化。 */
+.field__error {
+  margin-top: 4px;
+  font-size: var(--fs-2xs);
+  color: var(--vermilion);
+  line-height: 1.5;
+}
+.field__error[hidden] { display: none; }
+.field__input:disabled { opacity: 0.6; cursor: not-allowed; }
+
+@media (max-width: 700px) {
+  .modal--settings { max-height: 92vh; }
+  .settings__body { grid-template-columns: minmax(0, 1fr); }
+  .settings__nav {
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: var(--sp-2) var(--sp-3);
+  }
+  .settings__navitem { white-space: nowrap; box-shadow: none; }
+  .settings__navitem.is-on { box-shadow: inset 0 -2px 0 var(--brass); }
+  .settings__pane { padding: var(--sp-4); }
+  .settings__head { padding: var(--sp-4); }
+  .settings__foot { padding: var(--sp-3) var(--sp-4); }
+  .settings__foothint { display: none; }
+}

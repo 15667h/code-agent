@@ -3951,6 +3951,159 @@ class TestServerStartupModes(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 14.5 前端接线（静态检查）
+# ══════════════════════════════════════════════════════════════════
+class TestFrontendWiring(unittest.TestCase):
+    """前端接线检查：**按钮在不在、点它有没有接上**。
+
+    这一组测试存在的理由，是本项目反复踩到的一类缺陷：
+    **代码读起来完全正确，但从来没有被调用过。**
+    （恢复深度闸门零调用、GoalVerifier.record 零调用、loadGitStatus 只调了
+    一半的渲染函数……）它们的共同症状是"功能看着在，点下去什么都不发生"。
+
+    浏览器探针是主判据，但它跑在 .workbuddy/probe（不随仓库提交）。
+    这里补一层**随仓库走**的静态断言：只断言结构与接线存在，不断言像素。
+    """
+
+    def _read(self, *parts):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_theme_button_lives_in_activity_bar_with_sun_or_moon(self):
+        """主题按钮必须在活动栏（用户对「左下角」的预期），且图标不是「+」。
+
+        历史：主题按钮原本在顶栏、图标画成加号 —— 被当成「新建」；
+        而活动栏底部那个「设置」按钮画成圆+八条射线，被当成「换主题」。
+        两个图标各自指向对方的心理预期，结果两个功能都「点了没用」。
+        """
+        html = self._read("index.html")
+        # 顶栏里不能再有主题按钮
+        topbar = html.split('<nav class="actbar"', 1)[0]
+        self.assertNotIn('id="btn-theme"', topbar,
+                         "主题按钮不该留在顶栏（那里原来是个加号，被当成新建）")
+        actbar = html.split('<nav class="actbar"', 1)[1].split("</nav>", 1)[0]
+        self.assertIn('id="btn-theme"', actbar,
+                      "主题按钮必须在活动栏底部")
+        self.assertIn('id="btn-settings"', actbar)
+        # 图标不能是加号路径
+        self.assertNotIn("M10 3.2v13.6M3.2 10h13.6", html,
+                         "主题图标还是那个加号 —— 会被当成「新建」")
+
+    def test_settings_button_is_a_gear_not_a_brightness_icon(self):
+        """设置按钮的图形必须明显区别于太阳（否则又被当成换主题）。"""
+        html = self._read("index.html")
+        seg = html.split('id="btn-settings"', 1)[1].split("</button>", 1)[0]
+        # 齿轮的经典路径（Material settings 图标）。只判"是不是齿轮"，
+        # 不判具体实现 —— 换一套齿轮图标不该让测试失败。
+        self.assertTrue("12 15.6c-1.98" in seg or "19.14 12.94" in seg,
+                        "设置按钮用的不是齿轮轮廓，容易与太阳图标混淆")
+
+    def test_no_hardcoded_fake_model_names(self):
+        """页面上不许出现编造的模型名。
+
+        `gpt-5.4-codex` 曾经写死在 index.html 里，状态栏点它还会弹一个
+        **假的模型清单**。这属于「看起来像真数据」的假数据，比空白更坏。
+        """
+        html = self._read("index.html")
+        for fake in ("gpt-5.4-codex", "gpt-5.4-mini"):
+            self.assertNotIn(fake, html,
+                             f"index.html 里还写死着假模型名 {fake}")
+        app = self._read("scripts", "app.js")
+        for fake in ("gpt-5.4-codex", "gpt-5.4-mini"):
+            self.assertNotIn(fake, app,
+                             f"app.js 里还在用假模型名 {fake}")
+
+    def test_activity_bar_click_can_both_collapse_and_expand(self):
+        """点活动栏图标必须既能折叠也能展开 —— 否则侧栏会变成单向门。
+
+        实测过的最坏形态：折叠之后，唯一的恢复控件（侧栏头部的 ‹）
+        跟着侧栏一起变成 0 宽，用户再也回不去。
+        """
+        app = self._read("scripts", "app.js")
+        seg = app.split('.actbar__btn[data-view]").forEach(function (b) {', 1)
+        self.assertEqual(len(seg), 2, "找不到活动栏的绑定代码")
+        body = seg[1].split("});", 1)[0]
+        self.assertIn("toggleRailCollapsed", body,
+                      "点当前视图必须能折叠/展开侧栏")
+        self.assertIn("expandRail", body,
+                      "点别的视图必须把折叠的侧栏展开（不能「点了没反应」）")
+        self.assertIn("toggleRailDrawer", body,
+                      "窄屏下侧栏是抽屉，需要独立的开合路径")
+        # 折叠后必须有恢复路径
+        self.assertIn("function expandRail", app)
+        self.assertIn('is-rail-collapsed', app)
+
+    def test_rail_drawer_and_agent_drawer_use_separate_breakpoints(self):
+        """侧栏抽屉（860）与 Agent 面板抽屉（1024）断点不同，不能共用一个标志。
+
+        实测故障：两者都用 state.mobile（1024），于是 861–1024px 这段
+        「JS 认为是抽屉、CSS 认为不是」，那个 ‹ 按钮点了没任何反应。
+        """
+        app = self._read("scripts", "app.js")
+        self.assertIn('(max-width: 860px)', app, "缺侧栏抽屉断点")
+        self.assertIn('(max-width: 1024px)', app, "缺 Agent 面板抽屉断点")
+        self.assertIn("state.railDrawer", app)
+        self.assertIn("state.agentDrawer", app)
+        self.assertNotIn("state.mobile", app,
+                         "state.mobile 会把两个断点混成一个 —— 已经因此出过一次错")
+        css = self._read("styles", "app.css")
+        self.assertIn("max-width: 860px", css,
+                      "CSS 的侧栏抽屉断点与 JS 不一致会再次出现「点了没反应」")
+
+    def test_connection_state_refreshes_dependent_ui(self):
+        """连通后端之后，必须重画那些「有后端/没后端」两套文案的区域。
+
+        实测故障：探针异步完成时首屏早已渲染完，于是同一屏上
+        「已连接 harness」（底部）与「后端未连接」（执行轨迹面板）同时存在。
+        """
+        app = self._read("scripts", "app.js")
+        self.assertIn("function refreshConnectionUI", app)
+        seg = app.split("function refreshConnectionUI", 1)[1].split("}\n", 1)[0]
+        for fn in ("renderPlan", "renderStream", "renderRail",
+                   "renderStatusMetrics"):
+            self.assertIn(fn, seg,
+                          f"refreshConnectionUI 没重画 {fn} —— 连上后端后它仍显示旧文案")
+        # 探针成功后必须真的调用它
+        probe_seg = app.split("window.Harness.probe().then(function (live) {", 1)
+        self.assertEqual(len(probe_seg), 2, "找不到 probe 回调")
+        self.assertIn("refreshConnectionUI()", probe_seg[1][:4000],
+                      "probe 成功后没调用 refreshConnectionUI")
+
+    def test_settings_page_has_model_section_and_is_reachable(self):
+        """模型配置必须有**页面**和**入口**（后端早就做好了）。"""
+        app = self._read("scripts", "app.js")
+        self.assertIn("function openSettings", app)
+        for tab in ('"appearance"', '"model"', '"workspace"', '"about"'):
+            self.assertIn(tab, app, f"设置页缺少分区 {tab}")
+        # 三个入口：设置按钮、状态栏模型按钮、Agent 面板模型名
+        for sel in ('$("#btn-settings")', '$("#btn-model")', '$("#btn-agent-model")'):
+            self.assertIn(sel, app, f"缺少入口 {sel}")
+        # 状态栏模型按钮不能再弹假清单
+        seg = app.split('$("#btn-model").addEventListener("click"', 1)[1][:600]
+        self.assertIn("openSettings", seg,
+                      "状态栏模型按钮没有指向设置页")
+
+    def test_settings_esc_respects_stacked_modals(self):
+        """Esc 不能越过上层的确认框把设置页关掉。
+
+        设置页的 Esc 监听挂在 document 的 capture 阶段；确认框的监听挂在
+        对话框上。不分层时，Esc 会先关设置页 —— 用户想取消「清除配置」，
+        结果整页设置消失、确认框留在屏幕上。
+        """
+        app = self._read("scripts", "app.js")
+        # app.js 里有多个 onKey（UI.confirm 里也有一个）。用「唯一带 capture 的
+        # 注册点」当锚点，再往前取**最近一处**定义 —— 否则会取到确认框那个。
+        anchor = 'document.addEventListener("keydown", onKey, true);'
+        self.assertIn(anchor, app, "设置页的 Esc 监听没注册在 capture 阶段")
+        seg = app.split(anchor, 1)[0].rsplit("function onKey(e) {", 1)[1]
+        self.assertIn("modalback", seg,
+                      "Esc 处理没有检查模态层级 —— 会越过确认框关掉整页")
+        self.assertIn("backs[backs.length - 1] !== back", seg,
+                      "判据必须是「自己是最后一个模态」才处理 Esc")
+
+
+# ══════════════════════════════════════════════════════════════════
 # 15. 轨迹诊断（`trace` → `eval` 闭环，G-4）
 # ══════════════════════════════════════════════════════════════════
 class TestTraceEvaluation(unittest.TestCase):

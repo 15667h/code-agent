@@ -3369,6 +3369,7 @@ class TestServerStartupModes(unittest.TestCase):
     def test_script_mode_starts_and_serves(self):
         import socket
         import urllib.request
+        import urllib.error
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         port = self._port()
         proc = subprocess.Popen(
@@ -3407,6 +3408,91 @@ class TestServerStartupModes(unittest.TestCase):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+    def test_events_endpoint_falls_back_to_replay(self):
+        """**历史 run 的事件流必须能回放** —— 这是本次补的功能缺口。
+
+        实测踩到：`/events` 原本只走 SSE 实时流（只认内存态 RUNS），
+        于是**进程一重启，所有历史 run 的事件流全部 404**。
+        而事件流恰恰是这类 agent 最该被回看的东西（哪一步做了什么），
+        只留 summary 等于把最有价值的证据锁起来。
+
+        修法：内存态有 → SSE；没有 → 读 events.jsonl 一次性返回，
+        并在响应里标 `mode: "replay"`（前端据此显示"历史回放"）。
+        """
+        import urllib.request
+        import urllib.parse
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        port = self._port()
+        ws = TempWorkspace()
+        proc = None
+        try:
+            # 造一个"别的进程留下的" run：只有落盘文件，没有内存态
+            run_dir = os.path.join(ws.path, ".crucible", "runs", "histrun01")
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump({"session_id": "histrun01", "workspace": ws.path,
+                           "model": "m", "created_at": 1.0}, f)
+            events = [
+                {"type": "turn.started", "seq": 1, "ts": 100.0,
+                 "turn_id": "histrun01", "data": {"workspace": ws.path}},
+                {"type": "reasoning", "seq": 2, "ts": 101.0,
+                 "turn_id": "histrun01", "data": {"text": "想一下"}},
+                # 故意放一行坏 JSON：一次崩溃的运行恰恰最该被回看，
+                # 此时轨迹尾部可能就缺记录 —— 不该因一行坏数据整份失败。
+                {"type": "message", "seq": 3, "ts": 102.0,
+                 "turn_id": "histrun01", "data": {"text": "答完了"}},
+            ]
+            with open(os.path.join(run_dir, "events.jsonl"), "w", encoding="utf-8") as f:
+                for e in events:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                f.write("{ 这行不是合法 JSON\n")
+
+            proc = subprocess.Popen(
+                [sys.executable, "harness/server.py", "--port", str(port)],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(60):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/api/health", timeout=1) as r:
+                        if json.load(r).get("ok"):
+                            break
+                except Exception:
+                    time.sleep(0.1)
+
+            q = urllib.parse.urlencode({"workspace": ws.path})
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/run/histrun01/events?{q}",
+                    timeout=8) as r:
+                self.assertEqual(r.status, 200, "历史 run 的 events 端点应返回 200")
+                body = json.load(r)
+
+            self.assertEqual(body.get("mode"), "replay",
+                             "必须标明这是回放，而不是实时流")
+            self.assertEqual(body.get("count"), 3,
+                             f"坏行应被跳过，其余 3 条照常返回：{body}")
+            self.assertEqual([e["seq"] for e in body["events"]], [1, 2, 3])
+            # 事件本体要完整带出来（前端靠 type/ts/data 渲染）
+            self.assertEqual(body["events"][1]["data"]["text"], "想一下")
+            self.assertIn("ts", body["events"][0],
+                          "必须带 ts，否则前端无法算时间偏移")
+
+            # 找不到的 run：404 且**给出怎么排查**
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/run/nosuchrun/events", timeout=5)
+            self.assertEqual(cm.exception.code, 404)
+            err = json.loads(cm.exception.read().decode("utf-8"))
+            self.assertIn("workspace", err.get("detail", ""),
+                          "404 要提示可能是工作区口径不对")
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            ws.cleanup()
 
     def test_run_detail_endpoints_accept_workspace(self):
         """**详情端点必须接受 workspace 参数。**

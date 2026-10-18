@@ -514,7 +514,49 @@ class Handler(BaseHTTPRequestHandler):
                 "summary": st.session.summary() if st.session else None,
             })
         if path.startswith("/api/run/") and path.endswith("/events"):
-            return self._sse(path.split("/")[3])
+            # 两种形态，靠**运行是否还在内存里**区分：
+            #   · 在跑 / 刚跑完（RUNS 有）→ SSE 实时流，前端 EventSource 订阅
+            #   · 历史 run（进程已重启）→ **一次性回放**落盘事件
+            #
+            # 为什么必须支持第二种：历史 run 的事件流原本**看不到** ——
+            # `/events` 只认内存态，进程一重启就全部 404。
+            # 而事件流是这类 agent 最该被回看的东西（哪一步做了什么），
+            # 只留 summary 等于把最有价值的证据锁起来。
+            rid = path.split("/")[3]
+            if rid in RUNS:
+                return self._sse(rid)
+            run_dir = self._resolve_run_dir(rid, q)
+            if run_dir is None:
+                return self._json(404, {
+                    "error": "run not found",
+                    "detail": "既不在本次进程的运行表里，也没能在落盘目录中找到。"
+                              "若这是另一个工作区跑出来的，请带上 workspace 参数。",
+                })
+            ev_path = os.path.join(run_dir, "events.jsonl")
+            if not os.path.isfile(ev_path):
+                return self._json(404, {
+                    "error": "no events recorded",
+                    "detail": "这个 run 目录里没有 events.jsonl。",
+                })
+            events = []
+            with open(ev_path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        events.append(json.loads(ln))
+                    except json.JSONDecodeError:
+                        # 坏行跳过而不是整份失败：一次崩溃的运行**恰恰**是最该
+                        # 被回看的那次，因为它尾部可能就缺记录。
+                        continue
+            return self._json(200, {
+                "run_id": rid,
+                "mode": "replay",      # 前端据此显示"历史回放"而不是"实时"
+                "run_dir": run_dir,
+                "count": len(events),
+                "events": events,
+            })
 
         # ── 事件链核验（防篡改可核验记录）──
         # 这是"外部可核验"的落点：任何人拿到这份 JSON 就能离线重算，

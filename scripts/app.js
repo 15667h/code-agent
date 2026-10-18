@@ -130,6 +130,19 @@
     detailError: null,
     tools: null,             // 工具清单（mcp 视图）
     chainSummary: null,      // 批量哈希链核验
+
+    // ── 事件流模式 ──
+    // `stream` 只有三种值，**不允许第四种**：
+    //   "mock"   —— 后端未连接，展示原型演示数据
+    //   "live"   —— 正在跑一次真实任务（实时事件流）
+    //   "replay" —— 回放某条历史 run 的落盘事件
+    // 为什么不用布尔量：需要区分"实时"与"历史"，
+    // 而这两者的混淆是最危险的（会把已结束的运行看成正在跑）。
+    streamMode: "mock",
+    replayRunId: null,
+    replayDetail: null,      // { runId, model, status, count, workspace }
+    replayVMs: null,         // 回放出的视图模型数组
+    replayError: null,       // 回放失败原因（与"没有事件"分开）
   };
 
   var dirtyFile = { "src/transport/reconnect.ts": true };
@@ -556,7 +569,79 @@
         .then(function (p) { state.chainSummary = window.Harness.toChainVerify(p); return state.chainSummary; })
         .catch(function () { state.chainSummary = null; });
     },
+
+    /* 回放一条历史 run 的事件流。
+       与"实时运行"共用同一套渲染（buildEvent），
+       但**换掉 context 的时间基准**（见桥接层 resetReplay）——
+       否则时间列会显示成 1970 年附近的某个时刻。 */
+    replayRun: function (runId, workspace, meta) {
+      if (!this.available()) return Promise.resolve(null);
+      state.streamMode = "replay";
+      state.replayRunId = runId;
+      state.replayVMs = null;
+      state.replayError = null;
+      state.replayDetail = { runId: runId, workspace: workspace, model: (meta || {}).model || "",
+                             status: (meta || {}).status || "", count: 0 };
+      renderStream();
+      updateStreamStat();
+      return window.Harness.runReplayEvents(runId, workspace)
+        .then(function (r) {
+          state.replayVMs = r.viewModels;
+          state.replayDetail.count = r.payload.count;
+          renderStream();
+          updateStreamStat();
+          return r;
+        })
+        .catch(function (e) {
+          // 回放失败必须**退出回放态并说明原因** ——
+          // 停在一个空的事件流上会被读成"这条 run 没有事件"。
+          state.replayVMs = null;
+          state.replayError = String(e && e.message || e);
+          renderStream();
+          updateStreamStat();
+          return null;
+        });
+    },
+
+    exitReplay: function () {
+      state.streamMode = Backend.available() ? "live" : "mock";
+      state.replayRunId = null;
+      state.replayVMs = null;
+      state.replayError = null;
+      state.replayDetail = null;
+      renderStream();
+      updateStreamStat();
+      UI.announce("已退出历史回放");
+    },
   };
+
+  /* 事件流统计条：把"当前看的是什么"写清楚。
+     实时 / 回放 / 演示三态在这一行里必须能分辨 ——
+     它是用户判断"agent 是否在动"的第一入口。
+
+     过滤信息也在这里拼：**只保留一处格式化**。
+     早期 applyFilter 自己写了一遍，于是模式前缀会被它覆盖掉
+     （回放标识刚显示出来就被替换掉）。 */
+  function updateStreamStat(shown) {
+    var st = $("#stream-stat");
+    if (!st) return;
+    var nodes = $$(".ev", D.stream).length;
+    var total = nodes;
+    var f = state.filter;
+    var filt = (f === "all") ? "" : "（筛选中 " + (shown == null ? total : shown) + "/" + total + "）";
+
+    var prefix;
+    if (state.streamMode === "replay") {
+      var d = state.replayDetail || {};
+      prefix = "历史回放" + (d.status ? " · " + d.status : "") + " · ";
+    } else if (state.streamMode === "live") {
+      prefix = "实时 · ";
+    } else {
+      prefix = "演示数据 · ";
+    }
+    st.textContent = prefix + total + " 个事件" + filt
+      + " · " + state.tabs.length + " 个文件已打开";
+  }
 
   /* 一条"数据来源"提示条。
      存在它的唯一理由是：**让"读不到"和"没有"在视觉上分开**。
@@ -605,6 +690,30 @@
       return;
     }
     if (!det) return;
+
+    // ── 回放入口（放在最前，因为这是最常用的动作）──
+    var runCard = null;
+    (state.runs || []).forEach(function (r) {
+      if (r.id === det.runId) runCard = r;
+    });
+    var act = el("div", "dblock");
+    act.appendChild(el("div", "dblock__head", "事件流"));
+    var actBody = el("div", "dblock__body");
+    var btn = el("button", "dbtn dbtn--play", "▶ 回放这条运行的完整事件流");
+    btn.type = "button";
+    btn.addEventListener("click", function () {
+      Backend.replayRun(det.runId, det.workspace, {
+        model: runCard && runCard.model,
+        status: det.diagnose && det.diagnose.ok
+          ? (window.Harness.toDiagnoseCards(det.diagnose.data).stats || {}).status : "",
+      });
+      UI.announce("正在回放运行 " + det.runId);
+    });
+    actBody.appendChild(btn);
+    actBody.appendChild(el("div", "dnote",
+      "回放的是落盘事件，不是实时运行 —— 事件流顶部会标明「历史回放」。"));
+    act.appendChild(actBody);
+    host.appendChild(act);
 
     // ── 诊断（过程缺陷）──
     var dg = det.diagnose;
@@ -1509,6 +1618,26 @@
   function renderStream() {
     var stream = D.stream;
     stream.innerHTML = "";
+
+    // ── 按模式分派 ──
+    // 三种模式互斥，且**都在这里显式写出来** —— 漏掉一种会退化成
+    // "什么都不画"，而那看起来像"没有事件"，不像"代码有分支没接上"。
+    if (state.streamMode === "replay") {
+      renderReplayStream(stream);
+      applyFilter();
+      if (refreshStreamFade) refreshStreamFade();
+      return;
+    }
+    if (state.streamMode === "live") {
+      // 实时模式下由 rerenderLive() 负责（它在 SSE 回调里被反复调用），
+      // 这里主动画一次只是为了切模式时立刻有内容。
+      rerenderLive();
+      applyFilter();
+      if (refreshStreamFade) refreshStreamFade();
+      return;
+    }
+
+    // mock 模式（后端未连接时的原型演示）
     EVENT_STREAM.forEach(function (ev, i) { stream.appendChild(buildEvent(ev, i)); });
 
     // 闸门已批准 → 注入后续事件
@@ -1528,6 +1657,59 @@
 
     applyFilter();
     if (refreshStreamFade) refreshStreamFade();
+  }
+
+  /* ---------- 历史回放渲染 ----------
+     放在事件流顶部的一条"回放标识"。**这条不能省**：
+     没有它，用户会把一份已经跑完的历史轨迹看成"agent 正在跑"。
+     而 agent 类的界面里，"现在到底有没有在动"是最要紧的一件事。 */
+  function replayBanner() {
+    var d = state.replayDetail || {};
+    var b = el("div", "replaybar");
+    var dot = el("span", "replaybar__dot");
+    b.appendChild(dot);
+    var txt = el("span", "replaybar__text");
+    txt.textContent = "历史回放 · " + (d.model || "未知模型")
+      + " · " + (d.count || 0) + " 个事件"
+      + (d.status ? " · 结束状态 " + d.status : "")
+      + " · 已结束，不会继续产生事件";
+    b.appendChild(txt);
+    var btn = el("button", "replaybar__btn", "退出回放");
+    btn.type = "button";
+    btn.addEventListener("click", function () {
+      Backend.exitReplay();
+    });
+    b.appendChild(btn);
+    return b;
+  }
+
+  function renderReplayStream(stream) {
+    stream.appendChild(replayBanner());
+
+    // 回放失败要说清原因，而不是留一个空事件流 ——
+    // 空的会被读成"这条运行没有事件"，而实际是"读不到"。
+    if (state.replayError) {
+      stream.appendChild(emptyHint("回放失败", state.replayError
+        + " —— 这不等于「这条运行没有事件」。"));
+      return;
+    }
+
+    var vms = state.replayVMs;
+    if (vms === null) {
+      stream.appendChild(el("div", "dloading", "读取落盘事件…"));
+      return;
+    }
+    if (!vms.length) {
+      stream.appendChild(emptyHint("这条运行没有可显示的事件",
+        "落盘事件为空，或全部属于未识别类型。"));
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    vms.forEach(function (vm, i) {
+      var node = buildEvent(vm, "replay" + (i + 1));
+      if (node) frag.appendChild(node);
+    });
+    stream.appendChild(frag);
   }
 
   /* ---------- 事件过滤 ---------- */
@@ -1564,11 +1746,7 @@
     }
 
     var total = nodes.length;
-    var st = $("#stream-stat");
-    if (st) {
-      st.textContent = (f === "all" ? total + " 个事件" : shown + " / " + total + " 个事件")
-        + " · " + state.tabs.length + " 个文件已打开";
-    }
+    updateStreamStat(shown);
 
     ["all", "tools", "gate"].forEach(function (k) {
       var b = $("#btn-filter-" + k);
@@ -3298,6 +3476,19 @@
     if (!window.Harness) return;
     window.Harness.attach({
       push: function (vm) {
+        // 收到真实事件说明"现在正在跑"—— 立即退出回放态。
+        // 不退出的话，会把一个新运行的事件追加到历史回放的画面上，
+        // 那是最糟的一种混淆（两条运行的卡片混在一起）。
+        if (state.streamMode !== "live") {
+          if (state.streamMode === "replay") {
+            D.stream.innerHTML = "";
+          }
+          state.streamMode = "live";
+          state.replayRunId = null;
+          state.replayVMs = null;
+          state.replayDetail = null;
+          liveVMs = [];
+        }
         liveVMs.push(vm);
         var node = buildEvent(vm, "live" + liveVMs.length);
         if (!node) return;

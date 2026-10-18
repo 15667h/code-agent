@@ -2258,3 +2258,58 @@ kbd {
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+
+/* ============================================================
+   历史回放标识条
+   ============================================================
+   唯一目的：让"这是已结束的历史"一眼可见。
+   缺了它，用户会把一份跑完的轨迹当成"agent 正在跑" ——
+   在 agent 类界面里，这是最要紧的一个状态区分。
+   因此用**琥珀色**（不是常规的品牌黄铜色）：它是一个"注意"信号，
+   而不是装饰。
+   ============================================================ */
+.replaybar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-3);
+  padding: 6px var(--sp-3);
+  border: 1px solid var(--amber);
+  border-radius: 5px;
+  background: var(--amber-a14);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.replaybar__dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  /* 不动的点：回放不会再有新事件，用它和实时的"活点"区分 */
+}
+.replaybar__text { flex: 1 1 auto; min-width: 0; text-wrap: pretty; }
+.replaybar__btn {
+  flex: none;
+  padding: 2px var(--sp-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  transition-property: color, border-color;
+  transition-duration: var(--dur-fast);
+}
+.replaybar__btn:hover { color: var(--text); border-color: var(--amber); }
+
+/* 明细里"回放"按钮：与危险的回滚按钮区分开（回滚是红的，
+   回放是中性偏正向的） */
+.dbtn--play { border-color: var(--border-strong); }
+.dbtn--play:hover {
+  border-color: var(--jade);
+  color: var(--jade);
+  background: var(--jade-a14);
+}

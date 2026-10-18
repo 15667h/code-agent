@@ -479,6 +479,79 @@
     if (e.type === "turn.completed" && host && host.onDone) host.onDone(e.data || {});
   }
 
+  /* ============================================================
+     历史回放：把落盘事件流转成前端视图模型
+     ============================================================
+     与实时流的差别（这是本块唯一要小心的地方）：
+     · 实时流的 tsOffset 基于 `state.startedAt`（会话开始时刻）
+     · 回放的 ts 是**绝对秒**，需要以该 run 的第一个事件为基准
+       重新算偏移 —— 否则时间列会显示成 1970 年附近的某个时刻
+
+     所以回放前必须 `resetReplay(events)`,它会把 startedAt 设成
+     第一条事件的时间戳。**不要复用 live 的 startedAt**。
+     ============================================================ */
+  function resetReplay(events) {
+    state.callIndex = {};
+    state.pendingGate = null;
+    state.seq = 0;
+    // 以第一条事件的绝对时间为基准 —— 这样时间列显示的是
+    // "相对本次运行开始过了多久"，与实时流的语义一致。
+    var first = events && events[0];
+    state.startedAt = first && first.ts ? Math.round(first.ts * 1000) : Date.now();
+  }
+
+  /* 把一条落盘事件翻成视图模型。
+     落盘事件与实时事件的**结构相同**（type/seq/ts/data），
+     所以可以直接复用 translate()。唯一区别是 replay 模式需要
+     保证 viewModel 不丢 seq —— 前端渲染输出卡片时按 seq 排序更稳。 */
+  function translateReplayEvent(e) {
+    var vm = translate(e);
+    if (vm) vm.seq = e.seq;
+    return vm;
+  }
+
+  /* 一整份落盘事件 → 视图模型数组。
+     未识别的事件类型会返回 null 并被**丢掉**（不渲染空白卡片），
+     这与实时流同一策略 —— 保持行为一致，避免"回放少了几张卡"
+     看起来像数据缺失。 */
+  function replayToViewModels(payload) {
+    var events = (payload && payload.events) || [];
+    resetReplay(events);
+    var out = [];
+    events.forEach(function (e) {
+      try {
+        var vm = translateReplayEvent(e);
+        if (vm) out.push(vm);
+      } catch (err) {
+        // 单条事件翻译失败不该让整份回放失败 —— 一次崩溃的运行
+        // 恰恰是最该被回看的那次，此时轨迹里可能有畸形事件。
+        out.push({
+          kind: "check", state: "done", tsOffset: 0, seq: e.seq,
+          title: "事件解析失败（seq " + e.seq + "）",
+          model: "replay",
+          items: [{ ok: false, warn: true,
+                    text: "类型 " + e.type + "：" + String(err && err.message || err) }],
+        });
+      }
+    });
+    return out;
+  }
+
+  function runReplayEvents(runId, workspace) {
+    return get(runPath(runId, "/events", workspace)).then(function (p) {
+      if (p && p.error) {
+        var err = new Error(p.detail || p.error);
+        err.payload = p;
+        throw err;
+      }
+      if (!p || !p.mode) {
+        // 收到了 SSE 形态（不该发生在 replay 路径上）→ 明确报错
+        throw new Error("端点返回了非回放形态的数据");
+      }
+      return { payload: p, viewModels: replayToViewModels(p) };
+    });
+  }
+
   /* ---------- 发起一次真实运行 ---------- */
   function run(prompt, opts) {
     opts = opts || {};
@@ -867,6 +940,9 @@
     listRunsAll: listRunsAll,
     runResult: runResult,
     runEvents: runEvents,
+    runReplayEvents: runReplayEvents,     // 历史事件流回放
+    replayToViewModels: replayToViewModels,
+    resetReplay: resetReplay,
     runDiagnose: runDiagnose,
     runChangesets: runChangesets,
     runCapability: runCapability,

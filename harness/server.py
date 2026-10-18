@@ -306,7 +306,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # ---------- 工具 ----------
-    def _find_run_dir(self, run_id: str) -> Optional[str]:
+    def _find_run_dir(self, run_id: str,
+                      workspace: Optional[str] = None) -> Optional[str]:
         """按 run_id 找出它的落盘目录。
 
         为什么需要它：`RUNS` 是内存态，进程重启就没了。但哈希链的价值恰恰是
@@ -316,32 +317,63 @@ class Handler(BaseHTTPRequestHandler):
         匹配顺序：meta.json 里的 run_id → 目录名 → session_id。
         最先查 run_id 是因为那才是**对外**的标识（session_id 是内部落盘目录名，
         两者独立生成，实测过拿 run_id 去匹配目录名匹配不上）。
+
+        ## `workspace` 参数是后补的，补它的原因值得记
+
+        实测踩到：前端从 `/api/runs` 列出 13 个 run，点进去有一半报 404，
+        而且**看不出为什么**。根因是这里把根目录硬编码成 `default_workspace()`，
+        而 `/api/runs` 是**按传入的 workspace** 列的 —— 两个端点用了不同的
+        工作区口径，于是"列得出来、点不进去"。
+
+        「列表里有、详情取不到」是最坏的一种不一致：用户会以为是 run 坏了。
+        所以详情端点现在也接受 workspace（与 `/api/runs` 同口径），
+        由调用方把列表里那一项的工作区带回来。不带时退回默认工作区
+        （保持旧行为，不破坏既有调用）。
         """
         if not run_id or "/" in run_id or "\\" in run_id or run_id.startswith("."):
             return None              # 拒绝路径穿越
-        root = os.path.join(os.path.realpath(default_workspace()),
-                            ".crucible", "runs")
-        if not os.path.isdir(root):
-            return None
 
-        metas: List[tuple] = []
-        for name in os.listdir(root):
-            d = os.path.join(root, name)
-            if not os.path.isdir(d):
+        # 先查内存态：本次进程自己跑出来的 run 一定有 RunState，
+        # 直接用它记录的 run_dir 最准确（不受工作区口径影响）。
+        st = RUNS.get(run_id)
+        if st is not None and st.session is not None:
+            return st.session.run_dir
+
+        roots = []
+        if workspace:
+            roots.append(os.path.join(os.path.realpath(workspace),
+                                      ".crucible", "runs"))
+        roots.append(os.path.join(os.path.realpath(default_workspace()),
+                                  ".crucible", "runs"))
+
+        for root in roots:
+            if not os.path.isdir(root):
                 continue
-            if name == run_id or name.startswith(run_id):
-                return d
-            mp = os.path.join(d, "meta.json")
-            if os.path.isfile(mp):
-                try:
-                    with open(mp, "r", encoding="utf-8") as f:
-                        m = json.load(f)
-                except (OSError, json.JSONDecodeError):
+            for name in os.listdir(root):
+                d = os.path.join(root, name)
+                if not os.path.isdir(d):
                     continue
-                if m.get("run_id") == run_id or m.get("session_id") == run_id:
+                if name == run_id or name.startswith(run_id):
                     return d
-                metas.append((m.get("created_at") or 0, d))
+                mp = os.path.join(d, "meta.json")
+                if os.path.isfile(mp):
+                    try:
+                        with open(mp, "r", encoding="utf-8") as f:
+                            m = json.load(f)
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if m.get("run_id") == run_id or m.get("session_id") == run_id:
+                        return d
         return None
+
+    def _resolve_run_dir(self, rid: str, q: Dict[str, List[str]]) -> Optional[str]:
+        """详情端点的统一解析：内存态 → 指定工作区 → 默认工作区。
+
+        所有 `/api/run/<id>/*` 端点都走这一个入口，避免"某些端点支持
+        workspace、某些不支持"这种最难排查的参差。
+        """
+        ws = (q.get("workspace") or [None])[0]
+        return self._find_run_dir(rid, ws)
 
     def _json(self, code: int, obj: Any) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -415,6 +447,50 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/runs":
             ws = (q.get("workspace") or [default_workspace()])[0]
             return self._json(200, {"runs": list_runs(ws)})
+
+        if path == "/api/runs/all":
+            # 跨工作区聚合。为什么需要它：
+            # `/api/runs` 只列**一个**工作区的 run，而 session 目录是
+            # 按工作区分散的（每次以不同 workspace 启动就多一份）。
+            # 前端要给出"这个服务一共做过什么"的全局视图，就必须有人聚合。
+            # 顺带把每个 run 的**工作区**带回去 —— 详情端点需要它来定位，
+            # 否则就会出现"列表里有、点进去 404"（本项目刚踩过这个坑）。
+            roots: List[str] = []
+            # 显式传入的工作区优先，其次进程默认工作区。
+            # 另外把工作区**下层**也扫一层 —— 真实运行过的工作区（例如
+            # 演示/临时工作区）是嵌套的：`<root>/.crucible/<name>/.crucible/runs`。
+            # 不扫这一层的结果是"跑过但列不出来"，而列表里少东西
+            # 比列表里多东西更难被发现。
+            #
+            # 判据必须落在 `<候选>/.crucible/runs` 上，而不是 `<候选>/runs` ——
+            # 后者会把 `<root>/.crucible/runs` 自身当成一个"工作区"，
+            # 而它不是（它是 run 目录的容器）。
+            for w in ([q.get("workspace") or []] +
+                      [[default_workspace()]]):
+                if w and w[0]:
+                    roots.append(os.path.realpath(w[0]))
+            for base in list(dict.fromkeys(roots)):
+                sub = os.path.join(base, ".crucible")
+                if not os.path.isdir(sub):
+                    continue
+                for name in os.listdir(sub):
+                    cand = os.path.join(sub, name)
+                    if os.path.isdir(os.path.join(cand, ".crucible", "runs")):
+                        roots.append(cand)
+            seen: Dict[str, Any] = {}
+            for ws_dir in dict.fromkeys(roots):
+                for m in list_runs(ws_dir):
+                    key = m.get("run_id") or m.get("session_id") or m.get("run_dir")
+                    if key in seen:
+                        continue
+                    m = dict(m)
+                    m["workspace_dir"] = ws_dir
+                    seen[key] = m
+            runs = sorted(seen.values(), key=lambda x: x.get("created_at") or 0,
+                          reverse=True)
+            return self._json(200, {"runs": runs, "count": len(runs),
+                                    "sources": list(dict.fromkeys(roots))})
+
         if path == "/api/tools":
             return self._json(200, _tool_manifest())
         if path == "/api/config":
@@ -454,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
             # 注意用**顶部**导入的 verify_chain：局部 `from .chain import`
             # 在脚本直跑模式（`python harness/server.py`）下会
             # ImportError: attempted relative import with no known parent package。
-            run_dir = self._find_run_dir(rid)
+            run_dir = self._resolve_run_dir(rid, q)
             if run_dir is None:
                 return self._json(404, {"error": "run not found"})
             return self._json(200, verify_chain(run_dir))
@@ -467,9 +543,9 @@ class Handler(BaseHTTPRequestHandler):
         # ── 轨迹诊断（trace → eval 闭环）──
         if path.startswith("/api/run/") and path.endswith("/diagnose"):
             rid = path.split("/")[3]
-            st = RUNS.get(rid)
-            run_dir = (st.session.run_dir if (st and st.session)
-                       else self._find_run_dir(rid))
+            rs = RUNS.get(rid)
+            run_dir = (rs.session.run_dir if (rs and rs.session)
+                       else self._resolve_run_dir(rid, q))
             if run_dir is None or not os.path.isdir(run_dir):
                 return self._json(404, {"error": "run not found"})
             from harness.evaluate import analyze_trace
@@ -488,7 +564,7 @@ class Handler(BaseHTTPRequestHandler):
             if st is not None and st.session is not None:
                 cs = st.session.changesets
             else:
-                run_dir = self._find_run_dir(rid)
+                run_dir = self._resolve_run_dir(rid, q)
                 if run_dir is None:
                     return self._json(404, {"error": "run not found"})
                 from harness.changeset import ChangeSetStore
@@ -510,7 +586,7 @@ class Handler(BaseHTTPRequestHandler):
             if st is not None and getattr(st, "loop", None) is not None \
                     and st.loop.ledger is not None:
                 return self._json(200, st.loop.ledger.report())
-            run_dir = self._find_run_dir(rid)
+            run_dir = self._resolve_run_dir(rid, q)
             if run_dir is None:
                 return self._json(404, {"error": "run not found"})
             cap_path = os.path.join(run_dir, "capability.json")
@@ -537,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
             if st is not None and st.session is not None:
                 run_dir = st.session.run_dir
             if run_dir is None:
-                run_dir = self._find_run_dir(rid)
+                run_dir = self._resolve_run_dir(rid, q)
             if run_dir is None:
                 return self._json(404, {"error": "run not found"})
             root = os.path.join(run_dir, "subagents")
@@ -575,7 +651,7 @@ class Handler(BaseHTTPRequestHandler):
             if st is not None and st.session is not None:
                 run_dir = st.session.run_dir
             if run_dir is None:
-                run_dir = self._find_run_dir(rid)
+                run_dir = self._resolve_run_dir(rid, q)
             if run_dir is None:
                 return self._json(404, {"error": "run not found"})
             cert_path = os.path.join(run_dir, "certificate.json")
@@ -743,7 +819,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 # 进程重启后 RUNS 清空 —— 但变更集在盘上，
                 # 回滚**不依赖产生它的进程还活着**（这正是它要解决的问题）。
-                run_dir = self._find_run_dir(rid)
+                run_dir = self._resolve_run_dir(rid, q)
                 if run_dir is None:
                     return self._json(404, {"error": "run not found"})
                 ws = body.get("workspace") or default_workspace()

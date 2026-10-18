@@ -117,6 +117,19 @@
     // 是 undefined，于是抛 TypeError，**整个 app.js 从这一行起全部不执行**。
     // 表现为「页面看着正常、所有交互都是死的」，极难定位。
     workspace: urlParams.workspace || null,
+
+    // ── 后端数据（本次对接新增）──
+    // 全部初始化为 null 而不是空数组：`null` 表示"还没查"，
+    // `[]` 表示"查了，确实没有"。混用会让人把"没加载"读成"没有数据"，
+    // 而这两种状态在前端要给完全不同的提示。
+    runs: null,              // 运行列表（跨工作区）
+    runsError: null,         // 列表查询失败的原因（与"空列表"分开）
+    detailRun: null,         // 当前展开详情的 run id
+    detail: null,            // 该 run 的明细（诊断/证书/能力/…）
+    detailLoading: false,
+    detailError: null,
+    tools: null,             // 工具清单（mcp 视图）
+    chainSummary: null,      // 批量哈希链核验
   };
 
   var dirtyFile = { "src/transport/reconnect.ts": true };
@@ -449,6 +462,313 @@
     }
   }
 
+  /* ============================================================
+     后端数据接入（harness）
+     ============================================================
+     设计取舍：
+     1. **纯真实数据，不做 mock 兜底**。后端不在线时显示"未连接 + 原因"，
+        不退回假数据。理由是假数据会让"对接坏了"看起来像"有数据" ——
+        那正是最难发现的失败。
+     2. **失败要区分三种**：未连接（无后端）/ 查询失败（HTTP 错误）/
+        确实为空。三者给不同文案。混成一句"暂无数据"会把后端 500
+        伪装成"这个项目没跑过任务"。
+     3. **列表项必须带 workspace**。详情端点靠它定位（后端刚补的能力），
+        丢掉它就退化成"列表里有、点进去 404"。
+     ============================================================ */
+  var Backend = {
+    available: function () {
+      return !!(window.Harness && window.Harness.isLive());
+    },
+
+    /* 拉运行列表。成功后缓存到 state.runs 并触发一次侧栏重绘。 */
+    loadRuns: function () {
+      if (!this.available()) {
+        state.runs = null;
+        state.runsError = "not_connected";
+        return Promise.resolve(null);
+      }
+      var self = this;
+      return window.Harness.listRunsAll(state.workspace || null)
+        .then(function (payload) {
+          state.runs = window.Harness.toRunCards(payload);
+          state.runsError = null;
+          renderRail();
+          return state.runs;
+        })
+        .catch(function (e) {
+          // 保留原始信息：`runsError` 是对象不是布尔，
+          // 因为"哪个端点、什么码"决定了用户该做什么。
+          state.runs = null;
+          state.runsError = { kind: "http", message: String(e && e.message || e) };
+          renderRail();
+          return null;
+        });
+    },
+
+    /* 拉一个 run 的全部明细。**并发拉而不是串行** ——
+       六个端点互相独立，串行只会让用户多等六倍。 */
+    loadDetail: function (runId, workspace) {
+      if (!this.available()) return Promise.resolve(null);
+      state.detailLoading = true;
+      state.detailError = null;
+      var H = window.Harness;
+      var wrap = function (p) {
+        // 把 404 也变成"可用但带说明"的数据，而不是 reject ——
+        // 后端对"没记录"和"查不到"都返回 404 + 说明，
+        // 直接 reject 会把那份说明丢掉（而说明才是有用的部分）。
+        return p.then(function (v) { return { ok: true, data: v }; })
+                .catch(function (e) { return { ok: false, error: String(e && e.message || e) }; });
+      };
+      return Promise.all([
+        wrap(H.runDiagnose(runId, workspace)),
+        wrap(H.runCertificate(runId, workspace)),
+        wrap(H.runCapability(runId, workspace)),
+        wrap(H.runChangesets(runId, workspace)),
+        wrap(H.runSubagents(runId, workspace)),
+        wrap(H.runVerifyChain(runId, workspace)),
+      ]).then(function (rs) {
+        state.detail = {
+          runId: runId,
+          workspace: workspace,
+          diagnose: rs[0],
+          certificate: rs[1],
+          capability: rs[2],
+          changesets: rs[3],
+          subagents: rs[4],
+          chain: rs[5],
+        };
+        state.detailLoading = false;
+        renderRail();
+        return state.detail;
+      });
+    },
+
+    loadTools: function () {
+      if (!this.available()) return Promise.resolve(null);
+      return window.Harness.toolManifest()
+        .then(function (p) { state.tools = window.Harness.toToolGroups(p); renderRail(); return state.tools; })
+        .catch(function () { state.tools = null; });
+    },
+
+    loadChainSummary: function () {
+      if (!this.available()) return Promise.resolve(null);
+      return window.Harness.verifyChains(state.workspace || null)
+        .then(function (p) { state.chainSummary = window.Harness.toChainVerify(p); return state.chainSummary; })
+        .catch(function () { state.chainSummary = null; });
+    },
+  };
+
+  /* 一条"数据来源"提示条。
+     存在它的唯一理由是：**让"读不到"和"没有"在视觉上分开**。
+     没有它的话，后端挂了会被读成"这个项目很干净"。 */
+  function dataStateBar() {
+    var bar = el("div", "backendbar");
+    if (!Backend.available()) {
+      bar.className += " backendbar--off";
+      bar.appendChild(el("span", "backendbar__dot"));
+      bar.appendChild(el("span", null, "后端未连接 · 启动 `python harness/server.py` 后刷新"));
+      return bar;
+    }
+    if (state.runsError) {
+      bar.className += " backendbar--err";
+      bar.appendChild(el("span", "backendbar__dot"));
+      bar.appendChild(el("span", null, "运行列表读取失败：" + state.runsError.message));
+      return bar;
+    }
+    bar.className += " backendbar--on";
+    bar.appendChild(el("span", "backendbar__dot"));
+    bar.appendChild(el("span", null, "已连接 harness · " +
+      (state.runs ? state.runs.length + " 次运行记录" : "加载中…")));
+    return bar;
+  }
+
+  /* 详情里的一块小卡：标题 + 若干行。 */
+  function detailBlock(title, tone, rows) {
+    var b = el("div", "dblock" + (tone ? " dblock--" + tone : ""));
+    b.appendChild(el("div", "dblock__head", title));
+    var list = el("div", "dblock__body");
+    (rows || []).forEach(function (r) {
+      var line = el("div", "dline" + (r.ok === false ? " is-bad" : (r.warn ? " is-warn" : "")));
+      if (r.k) line.appendChild(el("span", "dline__k", r.k));
+      line.appendChild(el("span", "dline__v", r.v));
+      list.appendChild(line);
+    });
+    b.appendChild(list);
+    return b;
+  }
+
+  /* 渲染当前展开 run 的明细。 */
+  function renderRunDetail(host) {
+    var det = state.detail;
+    if (state.detailLoading) {
+      host.appendChild(el("div", "dloading", "读取明细…"));
+      return;
+    }
+    if (!det) return;
+
+    // ── 诊断（过程缺陷）──
+    var dg = det.diagnose;
+    if (dg && dg.ok) {
+      var t = window.Harness.toDiagnoseCards(dg.data);
+      var rows = [];
+      if (t.stats) {
+        rows.push({ k: "事件", v: String(t.stats.events) });
+        rows.push({ k: "工具调用", v: String(t.stats.toolCalls) + "（执行 " + t.stats.executed + "）" });
+        rows.push({ k: "迭代", v: String(t.stats.iterations) });
+        rows.push({ k: "结束状态", v: String(t.stats.status) });
+      }
+      t.reasons.forEach(function (r) { rows.push({ ok: false, k: r.code, v: r.text }); });
+      if (!t.reasons.length) {
+        rows.push({ ok: true, k: "结论", v: "本份轨迹没有发现过程缺陷信号" });
+      }
+      host.appendChild(detailBlock(
+        "轨迹诊断 · " + (t.verdict === "flawed" ? "发现问题" : "无问题"),
+        t.verdict === "flawed" ? "bad" : null, rows));
+      if (t.disclaimer) {
+        host.appendChild(el("p", "dnote", t.disclaimer));
+      }
+    } else if (dg) {
+      host.appendChild(detailBlock("轨迹诊断", "muted",
+        [{ warn: true, k: "不可用", v: dg.error }]));
+    }
+
+    // ── 完成证书（ECT）──
+    var ct = det.certificate;
+    if (ct && ct.ok) {
+      var c = window.Harness.toCertificate(ct.data);
+      if (c && c.available) {
+        var rows2 = [];
+        c.claims.forEach(function (x) {
+          rows2.push({
+            ok: true, k: x.kind,
+            v: x.subject + "  ← seq " + x.evidenceSeq.join(", "),
+          });
+        });
+        c.problems.forEach(function (p) {
+          rows2.push({ ok: false, k: p.code, v: p.detail + (p.remedy ? " → " + p.remedy : "") });
+        });
+        if (!rows2.length) rows2.push({ k: "声明", v: "无（只读任务或未收尾）" });
+        rows2.push({
+          ok: c.replayOk !== false, k: "独立重放",
+          v: c.replayOk === false ? "未通过：" + (c.replayCodes || []).join(", ") : "通过",
+        });
+        host.appendChild(detailBlock(
+          "完成证书 · " + (c.signed ? "已签发" : "未签发"),
+          c.signed ? null : "bad", rows2));
+        // 边界说明必须跟着证书一起出现，否则它会被读成"正确性证明"
+        if (c.scope) host.appendChild(el("p", "dnote", c.scope));
+      } else {
+        host.appendChild(detailBlock("完成证书", "muted",
+          [{ warn: true, k: "不可用", v: (c && c.detail) || "无记录" }]));
+      }
+    } else if (ct) {
+      host.appendChild(detailBlock("完成证书", "muted", [{ warn: true, k: "读取失败", v: ct.error }]));
+    }
+
+    // ── 能力账本（CapScope）──
+    var cp = det.capability;
+    if (cp && cp.ok) {
+      var cap = window.Harness.toCapability(cp.data);
+      if (cap && cap.available) {
+        var rows3 = [
+          { ok: cap.outOfScope === 0, k: "越界次数",
+            v: cap.outOfScope + " / " + cap.total + " 次调用" },
+          { k: "分账主体", v: cap.grantee || "（未记录）" },
+          { k: "任务只读", v: cap.readonlyTask ? "是" : "否" },
+        ];
+        Object.keys(cap.byCode || {}).forEach(function (code) {
+          rows3.push({ ok: false, k: code, v: String(cap.byCode[code]) + " 次" });
+        });
+        host.appendChild(detailBlock("能力账本", cap.outOfScope ? "bad" : null, rows3));
+      } else {
+        host.appendChild(detailBlock("能力账本", "muted",
+          [{ warn: true, k: "不可用", v: (cap && cap.detail) || "无记录" }]));
+      }
+    } else if (cp) {
+      host.appendChild(detailBlock("能力账本", "muted", [{ warn: true, k: "读取失败", v: cp.error }]));
+    }
+
+    // ── 变更集（能不能还原）──
+    var ch = det.changesets;
+    if (ch && ch.ok) {
+      var cs = window.Harness.toChangesets(ch.data);
+      if (cs.summary && cs.summary.changes > 0) {
+        var rows4 = [
+          { k: "变更数", v: String(cs.summary.changes) },
+          { k: "涉及文件", v: String(cs.summary.files) },
+        ];
+        cs.history.slice(0, 8).forEach(function (h) {
+          rows4.push({
+            ok: true, k: "seq " + (h.seq == null ? "?" : h.seq),
+            v: (h.paths || []).join(", ") || h.tool,
+          });
+        });
+        var blk = detailBlock("变更集 · 可回滚", null, rows4);
+        // 逐条回滚按钮：回滚的价值只在**能回到具体某一步之前**（后端文档原话）
+        cs.history.slice(0, 8).forEach(function (h) {
+          if (!h.changeId) return;
+          var b = el("button", "dbtn", "回滚到 seq " + h.seq + " 之前");
+          b.type = "button";
+          b.addEventListener("click", function () {
+            if (!Backend.available()) return;
+            UI.confirm({
+              title: "回滚这次改动？",
+              desc: "会把 " + ((h.paths || []).join("、") || h.tool)
+                  + " 还原到该步之前的状态。",
+              confirmLabel: "回滚", tone: "danger",
+            }).then(function (ok) {
+              if (!ok) return;
+              window.Harness.rollback(state.detail.runId, h.changeId, state.detail.workspace)
+                .then(function () {
+                  UI.toast({ tone: "ok", title: "已回滚", desc: "seq " + h.seq + " 之前的改动已还原。" });
+                  Backend.loadDetail(state.detail.runId, state.detail.workspace);
+                })
+                .catch(function (e) {
+                  UI.toast({ tone: "danger", title: "回滚失败", desc: String(e && e.message || e) });
+                });
+            });
+          });
+          blk.querySelector(".dblock__body").appendChild(b);
+        });
+        host.appendChild(blk);
+      } else {
+        host.appendChild(detailBlock("变更集", "muted",
+          [{ k: "状态", v: "本次运行没有可回滚的改动" }]));
+      }
+    }
+
+    // ── 子代理（隔离验证）──
+    var sb = det.subagents;
+    if (sb && sb.ok) {
+      var s2 = window.Harness.toSubagents(sb.data);
+      if (s2 && s2.available && s2.count > 0) {
+        var rows5 = s2.agents.map(function (a) {
+          return { ok: true, k: a.id, v: "有独立能力账本记录" };
+        });
+        rows5.push({ warn: true, k: "说明",
+          v: "子代理上下文与父级隔离：只给规格，不给上游推理" });
+        host.appendChild(detailBlock("子代理 · " + s2.count + " 个", null, rows5));
+      } else {
+        host.appendChild(detailBlock("子代理", "muted",
+          [{ k: "状态", v: (s2 && s2.detail) || "本次运行没有派发子代理" }]));
+      }
+    }
+
+    // ── 哈希链（防篡改）──
+    var ck = det.chain;
+    if (ck && ck.ok) {
+      var c2 = window.Harness.toChainVerify(ck.data);
+      if (c2 && c2.available) {
+        host.appendChild(detailBlock("事件哈希链 · " + (c2.ok ? "完整" : "异常"),
+          c2.ok ? null : "bad", [
+            { ok: c2.ok, k: "核验", v: c2.ok ? "链完整、未被篡改" : "发现问题" },
+            { warn: true, k: "外部锚点", v: c2.withoutAnchor && c2.withoutAnchor.indexOf(state.detail.runId) >= 0
+              ? "无（仅无法防止整链重写，不代表被改过）" : "有" },
+          ]));
+      }
+    }
+  }
+
   function renderRail() {
     var body = $("#rail-body");
     var title = $("#rail-title");
@@ -606,105 +926,151 @@
     }
 
     if (state.railView === "sessions") {
+      // 纯真实数据。三种状态分开处理：
+      //   未连接 / 查询失败 / 有数据（含 0 条）
+      // 合成一句"暂无数据"会让后端故障伪装成"这个项目没跑过任务"。
+      body.appendChild(dataStateBar());
+
+      if (!Backend.available()) {
+        body.appendChild(emptyHint("后端未连接",
+          "会话历史来自 harness 的落盘记录。启动后端后刷新页面即可看到真实运行。"));
+        return;
+      }
+      if (state.runsError) {
+        body.appendChild(emptyHint("读取失败",
+          state.runsError.message + " —— 这不等于「没有运行记录」。"));
+        return;
+      }
+      if (state.runs === null) {
+        body.appendChild(el("div", "dloading", "读取运行记录…"));
+        Backend.loadRuns();
+        return;
+      }
+      if (!state.runs.length) {
+        body.appendChild(emptyHint("还没有运行记录",
+          "在后端连接的状态下，从下方输入框发一条指令就会产生第一条记录。"));
+        return;
+      }
+
       var s = el("div", "sect");
       var sh = el("div", "sect__head");
-      sh.appendChild(el("span", null, "会话"));
-      sh.appendChild(el("span", "sect__tail", SESSIONS.length + " 个 · 按时间倒序"));
+      sh.appendChild(el("span", null, "运行记录"));
+      sh.appendChild(el("span", "sect__tail", state.runs.length + " 次 · 按时间倒序"));
       s.appendChild(sh);
 
-      SESSIONS.forEach(function (x) {
-        var b = el("button", "sess" + (x.active ? " is-on" : ""));
+      state.runs.forEach(function (x) {
+        var isOpen = state.detailRun === x.id;
+        var b = el("button", "sess" + (isOpen ? " is-on" : ""));
         b.type = "button";
-        b.setAttribute("data-tip", x.branch);
+        b.setAttribute("data-tip", x.workspace);
         var top = el("div", "sess__top");
-        top.appendChild(el("span", "sess__title truncate", x.title));
-        if (x.active) top.appendChild(el("span", "sess__badge", "当前"));
-        top.appendChild(el("span", "sess__time", UI.fmtRel(x.tsMin)));
+        top.appendChild(el("span", "sess__title truncate", x.model || "（未知模型）"));
+        top.appendChild(el("span", "sess__time", x.tsMin == null ? "" : UI.fmtRel(x.tsMin)));
         b.appendChild(top);
 
         var sub = el("div", "sess__sub");
+        // 工作区只显示末尾两段 —— 完整路径太长且会挤掉真正有用的信息，
+        // 但**不能省略**它：用户要能分辨"这是哪个目录里的运行"。
+        var shortWs = String(x.workspace || "").split(/[\\/]/).slice(-2).join("/");
         sub.innerHTML =
-          '<span class="sess__branch truncate">' + esc(x.branch) + "</span>" +
-          '<span class="sess__stat"><span class="sess__add">+' + x.add + '</span> <span class="sess__del">−' + x.del + "</span></span>" +
-          '<span class="sess__stat sess__turns">' + x.turns + " 轮</span>" +
-          '<span class="sess__stat">' + UI.fmtTokens(x.tokens) + "</span>";
+          '<span class="sess__branch truncate">' + esc(shortWs) + "</span>" +
+          '<span class="sess__stat">' + esc(x.sandbox || "") + "</span>" +
+          '<span class="sess__stat sess__turns">' + esc(x.approval || "") + "</span>";
         b.appendChild(sub);
 
         b.addEventListener("click", function () {
-          $$(".sess", body).forEach(function (n) {
-            n.classList.remove("is-on");
-            var bd = n.querySelector(".sess__badge");
-            if (bd) bd.remove();
-          });
-          b.classList.add("is-on");
-          if (!b.querySelector(".sess__badge")) {
-            var bdg = el("span", "sess__badge", "当前");
-            b.querySelector(".sess__top").insertBefore(bdg, b.querySelector(".sess__time"));
+          if (state.detailRun === x.id) {
+            state.detailRun = null;
+            state.detail = null;
+            renderRail();
+            return;
           }
-          UI.announce("已切换到会话：" + x.title);
-          UI.toast({ tone: "info", title: "已切到会话「" + x.title + "」", desc: "分支 " + x.branch + " · " + x.turns + " 轮对话", duration: 3400 });
+          state.detailRun = x.id;
+          state.detail = null;
+          state.detailLoading = true;
+          renderRail();
+          Backend.loadDetail(x.id, x.workspace);
+          UI.announce("已打开运行 " + x.id + " 的明细");
         });
+
+        s.appendChild(b);
+
+        // 展开时插入明细块
+        if (isOpen) {
+          var host = el("div", "sessdetail");
+          s.appendChild(host);
+          renderRunDetail(host);
+        }
 
         b.addEventListener("contextmenu", function (ev) {
           ev.preventDefault();
           UI.contextMenu(ev.clientX, ev.clientY, [
-            { label: "继续这个会话", icon: ICONS.play, onClick: function () { b.click(); } },
-            { label: "复制分支名", icon: ICONS.file, onClick: function () { UI.copy(x.branch, "分支名"); } },
+            { label: "复制 run id", icon: ICONS.file, onClick: function () { UI.copy(x.id, "run id"); } },
+            { label: "复制工作区路径", icon: ICONS.file, onClick: function () { UI.copy(x.workspace, "工作区路径"); } },
+            { label: "复制前缀指纹", icon: ICONS.file, onClick: function () { UI.copy(x.prefixHash, "前缀指纹"); } },
             { sep: true },
-            { label: "归档会话", icon: ICONS.book, onClick: function () {
-                UI.toast({ tone: "ok", title: "已归档「" + x.title + "」", duration: 4000,
-                  actions: [{ label: "撤销", primary: true, onClick: function () { UI.toast({ tone: "ok", title: "已恢复", duration: 2000 }); } }] });
-              } },
-            { label: "删除会话", icon: ICONS.x, danger: true, onClick: function () {
-                UI.confirm({
-                  title: "删除这个会话？",
-                  desc: "「" + x.title + "」的对话记录会被移除。分支上的代码改动不受影响。",
-                  confirmLabel: "删除", cancelLabel: "取消", tone: "danger", detail: x.branch,
-                }).then(function (ok) {
-                  if (!ok) return;
-                  UI.toast({ tone: "warn", title: "已删除会话", desc: "演示环境，未真正删除。", duration: 4000,
-                    actions: [{ label: "撤销", primary: true, onClick: function () { UI.toast({ tone: "ok", title: "已撤销", duration: 2000 }); } }] });
-                });
+            { label: "刷新这一条", icon: ICONS.clock, onClick: function () {
+                state.detailRun = x.id;
+                Backend.loadDetail(x.id, x.workspace);
               } },
           ]);
         });
-
-        s.appendChild(b);
       });
       body.appendChild(s);
       return;
     }
 
     if (state.railView === "mcp") {
+      // 这个视图展示**后端真实注册的工具**，不是 MCP 服务开关 ——
+      // 名称沿用 MCP 是因为活动栏图标已定，但内容是 harness 的工具清单。
+      // 刻意不保留"启用开关"：工具是否可用由 policy/沙箱决定，
+      // 前端放一个开关会让人以为它能改变权限，而它不能。
+      body.appendChild(dataStateBar());
+
+      if (!Backend.available()) {
+        body.appendChild(emptyHint("后端未连接",
+          "工具清单由 harness 提供。启动后端后即可看到真实注册的工具与它们的描述。"));
+        return;
+      }
+      if (state.tools === null) {
+        body.appendChild(el("div", "dloading", "读取工具清单…"));
+        Backend.loadTools();
+        return;
+      }
+      if (!state.tools.length) {
+        body.appendChild(emptyHint("没有已注册的工具", "后端返回了空清单。"));
+        return;
+      }
+
       var m = el("div", "sect");
       var mh = el("div", "sect__head");
-      mh.appendChild(el("span", null, "已注册的 MCP 服务"));
-      mh.appendChild(el("span", "sect__tail", MCP_TOOLS.filter(function (t) { return t.enabled; }).length + "/" + MCP_TOOLS.length));
+      var nTools = state.tools.reduce(function (n, g) { return n + g.tools.length; }, 0);
+      mh.appendChild(el("span", null, "已注册工具"));
+      mh.appendChild(el("span", "sect__tail", nTools + " 个 · " + state.tools.length + " 类"));
       m.appendChild(mh);
-      MCP_TOOLS.forEach(function (t) {
-        var row = el("div", "mcpitem");
-        var meta = el("div", "mcpitem__meta");
-        meta.appendChild(el("span", "mcpitem__name", t.name));
-        meta.appendChild(el("span", "mcpitem__desc", t.desc));
-        row.appendChild(meta);
-        var sw = el("button", "switch");
-        sw.type = "button";
-        sw.setAttribute("role", "switch");
-        sw.setAttribute("aria-checked", t.enabled ? "true" : "false");
-        sw.setAttribute("aria-label", "启用 " + t.name);
-        sw.addEventListener("click", function () {
-          t.enabled = !t.enabled;
-          sw.setAttribute("aria-checked", t.enabled ? "true" : "false");
-          renderRail();
+
+      state.tools.forEach(function (g) {
+        m.appendChild(el("div", "mcpgroup__name", g.name));
+        g.tools.forEach(function (t) {
+          var row = el("div", "mcpitem");
+          var meta = el("div", "mcpitem__meta");
+          meta.appendChild(el("span", "mcpitem__name", t.name));
+          var desc = String(t.desc || "");
+          // 只显示第一句：完整描述里还有"什么时候用 / 边界 / 负例"，
+          // 这里是列表，展开阅读交给 tooltip。
+          var first = desc.split(/[。\n]/)[0];
+          meta.appendChild(el("span", "mcpitem__desc", first + (desc.length > first.length ? "…" : "")));
+          row.appendChild(meta);
+          row.setAttribute("data-tip", desc);
+          m.appendChild(row);
         });
-        row.appendChild(sw);
-        m.appendChild(row);
       });
       body.appendChild(m);
 
       var note = el("div");
       note.style.cssText = "padding:8px 16px;font-size:10px;color:var(--text-faint);line-height:1.6;text-wrap:pretty";
-      note.textContent = "工具定义按需呈现：未启用的服务不占用上下文窗口。这是降低上下文膨胀的关键一步。";
+      note.textContent = "工具顺序固定（注册顺序即输出顺序），这是保证提示词前缀可缓存的前提。"
+        + "描述里包含「什么时候用」「边界」「替代工具」，模型据此选择。";
       body.appendChild(note);
       return;
     }
@@ -717,10 +1083,27 @@
     return d;
   }
 
+  /* 转义 HTML。替换表的键有个**实打实的 bug 曾在这里**：
+     早期写成 `"<<"`，于是 `<` 根本不会被转义 ——
+     而 `<` 恰恰是最需要转义的字符（它是标签起始）。
+     这个 bug 在正常数据下看不出来（很少出现裸 `<`），
+     但一旦路径或模型名里带它，就会破坏 DOM 结构。 */
   function esc(s) {
     return String(s).replace(/[&<>"]/g, function (c) {
-      return { "&": "&amp;", "<<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] || c;
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] || c;
     });
+  }
+
+  /* 空状态提示：复用已有的 `.empty` 视觉，避免同一语义出现两套样式。
+     为什么值得单独一个函数：前端有七八处"这里没东西"，
+     而**没东西的原因**往往比"没东西"本身重要得多
+     （未连接 / 读取失败 / 确实为空）。统一成一个函数，
+     就不容易出现"某处忘了说原因"。 */
+  function emptyHint(title, desc) {
+    var b = el("div", "empty");
+    b.appendChild(el("p", "empty__title", title));
+    if (desc) b.appendChild(el("p", "empty__hint", desc));
+    return b;
   }
 
   /* ============================================================
@@ -3006,6 +3389,11 @@
           hint.appendChild(el("span", null, "已连接 harness · 发送即真实运行"));
         }
         UI.announce("已连接 harness 后端");
+        // 后端在线 → 立即把"真实数据"拉起来（运行列表 + 工具清单 + 哈希链概览）。
+        // 三个都是只读查询，并发发出，谁先回来谁先渲染。
+        Backend.loadChainSummary();
+        Backend.loadRuns();
+        if (state.railView === "mcp") Backend.loadTools();
         // 把已保存的模型接入配置反映到界面。
         // 若未配置，状态栏模型会显示"未配置"并在 title 里提示点此接入 ——
         // 不静默显示一个假模型名，否则用户会以为真的在用那个模型。

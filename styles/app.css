@@ -2122,3 +2122,139 @@ kbd {
   .tcursor { animation: none; opacity: 1; }
   .ev__spin, .btn__spin { animation: none; border-top-color: var(--brass); }
 }
+
+/* ============================================================
+   后端数据面板（本次对接新增）
+   ============================================================
+   一条总原则：**"读不到"与"没有"必须视觉上分得开**。
+   所以连接状态条、明细块、失败提示各有一套色调，
+   而不是统一成"灰色小字"。
+   ============================================================ */
+
+/* 连接状态条 */
+.backendbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+  padding: 6px var(--sp-4);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  text-wrap: pretty;
+}
+.backendbar__dot {
+  flex: none;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.backendbar--on .backendbar__dot { background: var(--jade); }
+.backendbar--off .backendbar__dot { background: var(--text-faint); }
+.backendbar--err { color: var(--vermilion); }
+.backendbar--err .backendbar__dot { background: var(--vermilion); }
+
+/* 展开的运行明细容器 */
+.sessdetail {
+  padding: var(--sp-3) var(--sp-3) var(--sp-3) var(--sp-4);
+  background: var(--bg-inset);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+/* 明细块 */
+.dblock { margin-bottom: var(--sp-3); }
+.dblock__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: 5px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.dblock__head::before {
+  content: "";
+  flex: none;
+  width: 3px; height: 11px;
+  border-radius: 1px;
+  background: var(--brass);
+}
+.dblock--bad .dblock__head::before { background: var(--vermilion); }
+.dblock--muted .dblock__head::before { background: var(--text-faint); }
+.dblock__body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-left: var(--sp-2);
+}
+.dline {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: baseline;
+  font-size: 10px;
+  line-height: 1.55;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  text-wrap: pretty;
+}
+.dline__k {
+  flex: none;
+  min-width: 62px;
+  color: var(--text-faint);
+}
+.dline__v { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+.dline.is-bad .dline__v { color: var(--vermilion); }
+.dline.is-warn .dline__v { color: var(--amber); }
+
+/* 明细里的说明句（证书边界、诊断免责）——刻意比正文淡，
+   因为它们是"别把上面读成更强的结论"的提醒，不是结论本身。 */
+.dnote {
+  margin: var(--sp-2) 0 0;
+  padding: 5px var(--sp-2);
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-faint);
+  border-left: 2px solid var(--border-strong);
+  text-wrap: pretty;
+}
+
+/* 明细里的操作按钮 */
+.dbtn {
+  align-self: flex-start;
+  margin-top: 5px;
+  padding: 3px var(--sp-3);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  transition-property: border-color, color, background-color;
+  transition-duration: var(--dur-fast);
+}
+.dbtn:hover {
+  border-color: var(--vermilion);
+  color: var(--vermilion);
+  background: var(--vermilion-a14);
+}
+
+/* 加载中 */
+.dloading {
+  padding: var(--sp-4);
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* 工具清单里的分类名 */
+.mcpgroup__name {
+  padding: var(--sp-2) var(--sp-4) 2px;
+  color: var(--text-faint);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}

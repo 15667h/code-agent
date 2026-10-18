@@ -3408,8 +3408,58 @@ class TestServerStartupModes(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 proc.kill()
 
+    def test_run_detail_endpoints_accept_workspace(self):
+        """**详情端点必须接受 workspace 参数。**
+
+        实测踩到：前端从 `/api/runs` 列出 13 个 run，点进去有一半 404，
+        而且看不出为什么。根因是 `_find_run_dir` 把根目录硬编码成
+        默认工作区，而 `/api/runs` 是按**传入的** workspace 列的 ——
+        两个口径不一致，于是"列得出来、点不进去"。
+
+        「列表里有、详情取不到」是最坏的一种不一致：用户会以为 run 坏了。
+        所以详情端点现在也接受 workspace，与列表端点同口径。
+        """
+        from harness.server import Handler, default_workspace
+        h = Handler.__new__(Handler)
+
+        ws = TempWorkspace()
+        try:
+            # 造一个"另一个工作区"的 run 目录
+            nested = os.path.join(ws.path, ".crucible", "runs", "abcd1234")
+            os.makedirs(nested, exist_ok=True)
+            with open(os.path.join(nested, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump({"session_id": "abcd1234", "run_id": "rid-1",
+                           "workspace": ws.path, "created_at": 1.0}, f)
+
+            # 不带 workspace：应当找不到（它不在默认工作区下）
+            self.assertIsNone(h._find_run_dir("abcd1234", None),
+                              "不该在默认工作区里找到别的目录的 run")
+
+            # 带 workspace：必须找到
+            found = h._find_run_dir("abcd1234", ws.path)
+            self.assertEqual(found, os.path.realpath(nested),
+                             "带上 workspace 后应能定位到该 run")
+
+            # _resolve_run_dir 是统一入口，行为与上面一致
+            self.assertEqual(h._resolve_run_dir("abcd1234", {"workspace": [ws.path]}),
+                             os.path.realpath(nested))
+            self.assertIsNone(h._resolve_run_dir("abcd1234", {}))
+
+            # 按 run_id 匹配（对外标识与目录名不同，实测过匹配不上）
+            self.assertEqual(h._find_run_dir("rid-1", ws.path), os.path.realpath(nested))
+        finally:
+            ws.cleanup()
+
+    def test_find_run_dir_rejects_path_traversal(self):
+        """拒绝路径穿越 —— 这是安全边界，不能被 workspace 参数放宽。"""
+        from harness.server import Handler
+        h = Handler.__new__(Handler)
+        for bad in ("../etc/passwd", "..\windows", "/abs", "\abs", ".hidden"):
+            self.assertIsNone(h._find_run_dir(bad, "/"), f"{bad} 应被拒绝")
+
     def test_route_handlers_avoid_relative_imports(self):
         """静态检查：路由处理函数里不得出现局部相对导入。
+
 
         静态检查是补充（真实启动测试是主判据），但它能给出**具体行号**，
         而启动失败只告诉你"500"。

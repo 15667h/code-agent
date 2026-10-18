@@ -590,6 +590,267 @@
       .then(function (r) { return r.body; });
   }
 
+  /* ============================================================
+     只读查询接口（把后端全部端点封装到一处）
+     ============================================================
+     设计取舍：
+     1. **全部走同一条 get()**。不各写一个 fetch —— 只要有一条
+        自己拼 URL 的路径，就会有人忘记带 workspace，
+        于是又出现"列表里有、详情取不到"（后端刚修过这个坑）。
+     2. **详情查询一律带 workspace**。从 /api/runs 拿到的每一项
+        都带 `workspace`，把它原样带回去，定位就不会失效。
+        这是"列表 → 详情"这条链路上唯一可靠的做法。
+     3. **失败原样抛出**。不在这里吞掉错误、也不编造空数据 ——
+        空数据会被读成"确实没有"，而 404/500 是"读不到"。
+        这两者对用户的意义完全不同。
+     ============================================================ */
+
+  /* ---------- 全局运行列表（跨工作区）---------- */
+  function listRunsAll(workspace) {
+    var qs = workspace ? "?workspace=" + encodeURIComponent(workspace) : "";
+    return get("/api/runs/all" + qs);
+  }
+
+  /* ---------- 单 run 的各类明细 ---------- */
+  function runPath(runId, suffix, workspace) {
+    var p = "/api/run/" + encodeURIComponent(runId) + suffix;
+    if (workspace) p += "?workspace=" + encodeURIComponent(workspace);
+    return p;
+  }
+
+  function runResult(runId, ws) { return get(runPath(runId, "/result", ws)); }
+  function runEvents(runId, ws) { return get(runPath(runId, "/events", ws)); }
+  function runDiagnose(runId, ws) { return get(runPath(runId, "/diagnose", ws)); }
+  function runChangesets(runId, ws) { return get(runPath(runId, "/changesets", ws)); }
+  function runCapability(runId, ws) { return get(runPath(runId, "/capability", ws)); }
+  function runSubagents(runId, ws) { return get(runPath(runId, "/subagents", ws)); }
+  function runCertificate(runId, ws) { return get(runPath(runId, "/certificate", ws)); }
+  function runVerifyChain(runId, ws) { return get(runPath(runId, "/verify-chain", ws)); }
+
+  /* ---------- 批量核验 ---------- */
+  function verifyChains(workspace) {
+    var qs = workspace ? "?workspace=" + encodeURIComponent(workspace) : "";
+    return get("/api/verify-chains" + qs);
+  }
+  function diagnoseWorkspace(workspace, flawedOnly) {
+    var parts = [];
+    if (workspace) parts.push("workspace=" + encodeURIComponent(workspace));
+    if (flawedOnly) parts.push("flawed_only=1");
+    return get("/api/diagnose" + (parts.length ? "?" + parts.join("&") : ""));
+  }
+  function toolManifest() { return get("/api/tools"); }
+
+  /* ---------- 回滚 ---------- */
+  function rollback(runId, changeId, workspace) {
+    return post("/api/run/" + encodeURIComponent(runId) + "/rollback",
+                { change_id: changeId, workspace: workspace })
+      .then(function (r) {
+        if (r.status !== 200 || !r.body) {
+          throw new Error((r.body && r.body.error) || ("HTTP " + r.status));
+        }
+        return r.body;
+      });
+  }
+
+  /* ============================================================
+     结果 → 前端视图模型的翻译
+     ============================================================
+     这些函数**不渲染**，只把后端 JSON 变成前端好用的形状。
+     渲染留给 app.js —— 保持"桥接层只管翻译"这条边界，
+     否则会出现两套格式化逻辑，迟早漂移。
+     ============================================================ */
+
+  /* 运行列表 → 会话卡片所需的字段。
+     `tsMin` 是前端 fmtRel 需要的"多少分钟前"。 */
+  function toRunCards(payload) {
+    var runs = (payload && payload.runs) || [];
+    return runs.map(function (r) {
+      return {
+        id: r.session_id || r.run_id || "",
+        title: r.model || "（未知模型）",
+        model: r.model || "",
+        workspace: r.workspace_dir || r.workspace || "",
+        sandbox: r.sandbox || "",
+        approval: r.approval || "",
+        provider: r.provider || "",
+        prefixHash: r.prefix_hash || "",
+        toolOrder: r.tool_order || [],
+        tsMin: r.created_at ? (Date.now() / 60000 - r.created_at / 60) : null,
+        raw: r,
+      };
+    });
+  }
+
+  /* 诊断报告 → 信号卡片。**verdict 的三态必须守住**：
+     no_issue / flawed / 未知 —— 不能把"没信号"说成"有问题"，
+     也不能把"读不到"说成"没问题"。 */
+  function toDiagnoseCards(report) {
+    if (!report) return { verdict: "unknown", reasons: [], stats: null };
+    var stats = report.stats || {};
+    return {
+      verdict: report.verdict || "unknown",
+      reasons: (report.signals || []).map(function (s) {
+        return {
+          code: s.code || "",
+          text: s.detail || s.reason || String(s),
+        };
+      }),
+      stats: {
+        events: stats.events,
+        toolCalls: stats.tool_calls,
+        executed: stats.executed_tool_calls,
+        filesChanged: stats.files_changed,
+        iterations: stats.iterations,
+        status: stats.status,
+        reason: stats.reason,
+      },
+      disclaimer: report.disclaimer || "",
+    };
+  }
+
+  /* 能力账本 → 一行摘要 + 越界明细。
+     注意 `enabled: false` 与"没有越界"是**两件事**：
+     前者是"没记录"，后者是"记录了且干净"。 */
+  function toCapability(payload) {
+    if (!payload) return null;
+    if (payload.error) {
+      return { available: false, error: payload.error, detail: payload.detail || "" };
+    }
+    var s = payload.summary || {};
+    return {
+      available: true,
+      enabled: s.enabled !== false,
+      outOfScope: s.out_of_scope || 0,
+      total: s.total || 0,
+      byCode: s.by_code || {},
+      grantee: s.grantee || "",
+      readonlyTask: !!(payload.ceiling || {}).readonly_task,
+      allowsWrite: !!(payload.ceiling || {}).allows_write_workspace,
+      details: (payload.out_of_scope || []).map(function (o) {
+        return { code: o.code || "", detail: o.detail || "" };
+      }),
+    };
+  }
+
+  /* 完成证书 → 卡片。`ok` 与 `verification` 都要看：
+     证书自己说"没问题"是不够的，还要独立重放也通过。 */
+  function toCertificate(payload) {
+    if (!payload) return null;
+    if (payload.error) {
+      return { available: false, error: payload.error, detail: payload.detail || "" };
+    }
+    var c = payload.certificate || {};
+    var v = payload.verification || {};
+    return {
+      available: true,
+      ok: !!c.ok,
+      signed: !!(c.ok && v.ok !== false),
+      claims: (c.claims || []).map(function (x) {
+        return {
+          kind: x.kind || "",
+          subject: x.subject || "",
+          evidenceSeq: (x.evidence || []).map(function (e) { return e.seq; }),
+        };
+      }),
+      problems: (c.problems || []).map(function (p) {
+        return { code: p.code || "", detail: p.detail || "", remedy: p.remedy || "" };
+      }),
+      digest: c.digest || "",
+      scope: c.scope || "",
+      replayOk: v.ok,
+      replayCodes: v.reason_codes || [],
+      verification: v,
+    };
+  }
+
+  /* 子代理 → 卡片。产物在前、自述在后并标"非证据"（同渲染层的约定）。 */
+  function toSubagents(payload) {
+    if (!payload) return null;
+    if (payload.error) {
+      return { available: false, error: payload.error, detail: payload.detail || "" };
+    }
+    return {
+      available: true,
+      count: payload.count || 0,
+      agents: (payload.subagents || []).map(function (a) {
+        return {
+          id: a.agent_id || "",
+          runDir: a.run_dir || "",
+          capability: a.capability || null,
+        };
+      }),
+    };
+  }
+
+  /* 变更集 → 摘要 + 历史条目。 */
+  function toChangesets(payload) {
+    if (!payload) return { enabled: false, summary: null, history: [] };
+    var s = payload.summary || {};
+    return {
+      enabled: s.enabled !== false,
+      summary: {
+        changes: s.changes || 0,
+        files: s.files || 0,
+        errors: s.errors || 0,
+      },
+      history: (payload.history || []).map(function (h) {
+        return {
+          changeId: h.change_id || h.id || "",
+          seq: h.seq,
+          tool: h.tool || "",
+          paths: h.paths || [],
+          bytes: h.bytes || 0,
+        };
+      }),
+    };
+  }
+
+  /* 哈希链核验 → 结果。`without_anchor` 不等于失败：
+     没有外部锚点只是"无法防止整链重写"，与"链被改过"不同。 */
+  function toChainVerify(payload) {
+    if (!payload) return null;
+    if (payload.error) {
+      return { available: false, error: payload.error };
+    }
+    return {
+      available: true,
+      ok: payload.ok !== false,
+      runs: payload.runs,
+      okCount: payload.ok,
+      failed: payload.failed || [],
+      withoutAnchor: payload.without_anchor || [],
+    };
+  }
+
+  /* 工具清单 → 分类分组（mcp 视图要用）。 */
+  function toToolGroups(payload) {
+    if (!payload) return [];
+    var order = payload.order || [];
+    var cats = payload.categories || {};
+    var byName = {};
+    (payload.specs || []).forEach(function (s) {
+      var fn = s["function"] || {};
+      byName[fn.name] = fn;
+    });
+    return Object.keys(cats).map(function (cat) {
+      return {
+        name: cat,
+        tools: cats[cat].map(function (n) {
+          var fn = byName[n] || {};
+          return {
+            name: n,
+            desc: fn.description || "",
+            params: (fn.parameters || {}).properties || {},
+          };
+        }),
+      };
+    }).sort(function (a, b) {
+      // 按注册顺序排：分类内首个工具在 order 里的位置
+      return order.indexOf(a.tools[0] && a.tools[0].name)
+           - order.indexOf(b.tools[0] && b.tools[0].name);
+    });
+  }
+
   /* ---------- 对外接口 ---------- */
   global.Harness = {
     probe: probe,
@@ -601,6 +862,32 @@
     saveConfig: saveConfig,
     testConfig: testConfig,
     clearConfig: clearConfig,
+
+    // 只读查询（本次新增，覆盖后端全部端点）
+    listRunsAll: listRunsAll,
+    runResult: runResult,
+    runEvents: runEvents,
+    runDiagnose: runDiagnose,
+    runChangesets: runChangesets,
+    runCapability: runCapability,
+    runSubagents: runSubagents,
+    runCertificate: runCertificate,
+    runVerifyChain: runVerifyChain,
+    verifyChains: verifyChains,
+    diagnoseWorkspace: diagnoseWorkspace,
+    toolManifest: toolManifest,
+    rollback: rollback,
+
+    // 翻译（纯函数，便于单测）
+    toRunCards: toRunCards,
+    toDiagnoseCards: toDiagnoseCards,
+    toCapability: toCapability,
+    toCertificate: toCertificate,
+    toSubagents: toSubagents,
+    toChangesets: toChangesets,
+    toChainVerify: toChainVerify,
+    toToolGroups: toToolGroups,
+
     _state: state,
     attach: function (h) { host = h; },
     isLive: function () { return state.live; },

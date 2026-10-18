@@ -42,8 +42,10 @@
 | `harness/changeset.py` | **变更集与回滚**：改坏了能逐字节还原，不依赖 git |
 | `harness/capability.py` | **能力账本**（CapScope）：从任务文本推导权限上限，越界只观察不阻断 |
 | `harness/subagent.py` | **子代理 + 上下文隔离**：只给规格不给上游推理；验证者读原始产物、不读生成者的话 |
+| `harness/certificate.py` | **完成证书（ECT）**：每条完成声明必须绑定到轨迹里一条可复核证据，否则带回**原因码** |
+| `harness/verify_certificate.py` | **证书离线核验 CLI**：只读、零依赖，退出码可直接接 CI |
 | `harness/retention.py` | **类型化保留**：约束 verbatim 永不进摘要器（防压缩悬崖） |
-| `harness/test_harness.py` | **358 项测试**，每项标注书中出处 |
+| `harness/test_harness.py` | **383 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
 | `docs/harness-research-2026.md` | **2026 前沿调研**：ETCLOVG 七层、架构收敛、ECT、压缩悬崖、CapScope、Self-Harness、AHE |
 | `docs/harness-gap-diagnosis.md` | **差距诊断**：逐层读代码，含两个「空壳」实证 |
@@ -184,7 +186,7 @@ curl -X POST http://127.0.0.1:8787/api/run \
 ## 已验证
 
 **后端**（`python -m harness.test_harness`）
-- **358 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- **383 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
 - 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
   重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
 - 模型接入：地址归一化（中转站四种写法）、api_key 绝不回传明文、掩码可核对、
@@ -199,6 +201,13 @@ curl -X POST http://127.0.0.1:8787/api/run \
   未配置时自动走离线脚本 —— 全通过
 - **目标闸门（真实模型 deepseek-v4.1-flash）**：文件落盘 → `check/scope=goal newly_met`
   → `all_met:true` → `completed`；反向用例（要求创建但指示不动手）正确报 `all_met:false`
+- **完成证书（G-1，ECT）**：`_finish("completed")` 不再能凭一句话成立 ——
+  声称完成的每一件事都必须绑定到轨迹里**一条成功的工具调用**（带 seq），
+  由确定性 replay 回到事件流复核；签不出来就带回**原因码 + 下一步**让模型针对性补。
+  真实模型三场景：真写代码 → 签发（3 条声明各绑 seq，独立重放通过、0 拦截）；
+  纯问答 → 签发（只读任务的合法出口、0 拦截）；
+  空口完成 → 拦下并如实报告未了结的缺口。
+  离线核验 CLI：正常 exit 0、篡改 exit 1、目录缺失 exit 2
 - **子代理 + 上下文隔离（G-9）**：`SubAgentSpec` **没有任何字段能承载上游推理**
   （不是"不建议传"，是没有地方传）；`build_verification_prompt` 的签名里**没有 claim**
   ——它读不到生成者的话。真实模型两阶段实测：生成者落盘 `calc.py` + `test_calc.py`

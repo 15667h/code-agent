@@ -165,6 +165,22 @@ class Session:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
 
+    def write_certificate(self, payload: Dict[str, Any]) -> None:
+        """把完成证书落盘。
+
+        与 `write_capability` 同一个理由：证书的用途是**让外部复核**，
+        而复核者不该需要信任产生它的进程。拿到 run 目录后，
+        用 `certificate.verify_certificate()` 配合 `read_events()`
+        就能独立重放一遍。
+
+        文件名带 `certificate` 而非 `completion`：这个目录里可能还有
+        别的东西叫 completion（事件类型 `turn.completed`），
+        叫得像会让人以为它有特殊语义。
+        """
+        path = os.path.join(self.run_dir, "certificate.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
     def note_persist_failure(self, detail: str = "") -> None:
         """记录一次落盘失败。失败不该终止循环，但必须可被上层检查。
 

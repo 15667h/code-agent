@@ -234,6 +234,13 @@ class ToolRouter:
                       error_layer=res.error_layer,
                       verdict=verdict.decision.value)
 
+        # 回填 seq：让这次结果有一个**可被证书引用的锚点**。
+        # 必须在 emit 之后取 —— emit 内部才把 seq 递增到这一条。
+        # 有了它，ECT 证书里的"证据"就能写成 (seq=42, tool=apply_patch)，
+        # 而确定性校验器可以去事件流里查"第 42 条真的存在且成功吗"。
+        res.seq = int(getattr(self.bus, "seq", 0) or 0)
+        res.call_id = call_id
+
         # 文件改动单独发事件 —— 前端据此更新审查界面（Codex 的 file.changed）
         for p in res.files_changed:
             self.bus.emit(EventType.FILE_CHANGED, path=p, tool=call.name,

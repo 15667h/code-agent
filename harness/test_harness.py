@@ -2932,11 +2932,17 @@ class TestPreCompletionInLoop(unittest.TestCase):
         self.assertEqual(errs, [], "任务真的做完了就不该被拦")
 
     def test_read_only_task_not_blocked_in_loop(self):
-        """纯问答任务不得被完成前检查拦。"""
+        """纯问答任务不得被完成前检查**或完成证书**拦。
+
+        只读任务的合法形态就是"一次工具都没调用、只给答案"。
+        证书若把它判成 `EMPTY_CLAIM`，就会给所有问答类任务凭空加两轮 ——
+        这正是判定器"只会在错误时拦截、不会在正确时放行"的形态。
+        """
         loop, _ = self._loop([final_reply("入口文件是 src/a.py。")])
         res = loop.run("这个项目的入口文件是哪个？")
         self.assertEqual(res.status, "completed")
         self.assertEqual(res.iterations, 1)
+        self.assertEqual(res.reason, "任务完成。")
 
     def test_retry_has_a_cap(self):
         """反复不干活 → 有上限，最后如实报告，不假装完成。"""
@@ -2988,8 +2994,30 @@ class TestPreCompletionInLoop(unittest.TestCase):
         self.assertEqual(res.iterations, 2)
 
     def test_disabled_by_config(self):
-        """开关关闭时中间件完全透明（便于排查"是不是它拦的"）。"""
-        loop, _ = self._loop([final_reply("改好了。")], preflight_enabled=False)
+        """开关关闭时 preflight 完全透明（便于排查"是不是它拦的"）。
+
+        **注意**：关掉 preflight 不等于"一轮就结束" ——
+        完成证书（ECT）是**独立**的另一道闸门，它照样会拒绝
+        「说了改了但其实一次工具都没调用」。
+        所以这里断言的是"**preflight 的**事件不出现"，而不是轮数。
+        """
+        loop, _ = self._loop([final_reply("改好了。"),
+                              final_reply("真的改好了。"),
+                              final_reply("确实改好了。")],
+                             preflight_enabled=False)
+        res = loop.run("把 src/a.py 里的 x 改成 2")
+        self.assertEqual(res.status, "completed")
+        pf = [e for e in loop.bus.events()
+              if e.type == EventType.ERROR
+              and e.data.get("cls") == "preflight_incomplete"]
+        self.assertEqual(pf, [], "关掉后不该再发 preflight 事件")
+
+    def test_certificate_disabled_is_transparent(self):
+        """把 preflight 与证书都关掉 → 确实一轮结束、理由就是"任务完成"。"""
+        from harness.loop import LoopConfig
+        loop, _ = self._loop([final_reply("改好了。")],
+                             preflight_enabled=False,
+                             certificate_enabled=False)
         res = loop.run("把 src/a.py 里的 x 改成 2")
         self.assertEqual(res.iterations, 1)
         self.assertEqual(res.reason, "任务完成。")
@@ -3821,6 +3849,55 @@ class TestCliEntrypoints(unittest.TestCase):
             data = json.loads(p.stdout)
             self.assertEqual(data["verdict"], "flawed")
             self.assertEqual(p.returncode, 1)
+        finally:
+            ws.cleanup()
+
+    def test_verify_certificate_cli_script_mode(self):
+        """证书核验 CLI 在脚本模式下必须能跑（它要脱离仓库单独用）。"""
+        p = self._run_script("verify_certificate.py", ["--help"])
+        self.assertEqual(p.returncode, 0, f"stderr: {p.stderr[-400:]}")
+        self.assertIn("run_dir", p.stdout)
+
+    def test_verify_certificate_cli_end_to_end(self):
+        """造一份真证书 → 核验通过（exit 0）→ 篡改 → 不通过（exit 1）。
+
+        **退出码是接进 CI 的唯一接口**，必须实测，不能只靠阅读代码。
+        """
+        from harness.certificate import build_certificate
+        from harness.policy import SandboxMode
+        ws = TempWorkspace()
+        try:
+            execs = [_cert_exec(5, "apply_patch", files=["a.py"])]
+            cert = build_certificate(prompt="改 a.py", executions=execs,
+                                     status="completed",
+                                     sandbox=SandboxMode.WORKSPACE_WRITE,
+                                     workspace=ws.path, answer="已修改")
+            run_dir = os.path.join(ws.path, "run")
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, "certificate.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"certificate": cert.to_json()}, f, ensure_ascii=False)
+            with open(os.path.join(run_dir, "events.jsonl"), "w",
+                      encoding="utf-8") as f:
+                for e in _cert_events(execs):
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+            p = self._run_script("verify_certificate.py", [run_dir, "--json"])
+            self.assertEqual(p.returncode, 0, f"stdout={p.stdout} stderr={p.stderr}")
+            self.assertTrue(json.loads(p.stdout)["ok"])
+
+            # 篡改 seq → 必须 exit 1
+            with open(os.path.join(run_dir, "certificate.json"), "w",
+                      encoding="utf-8") as f:
+                cert.claims[0].evidence[0].seq = 999
+                json.dump({"certificate": cert.to_json()}, f, ensure_ascii=False)
+            p2 = self._run_script("verify_certificate.py", [run_dir, "--json"])
+            self.assertEqual(p2.returncode, 1, "篡改必须让退出码变成 1")
+            self.assertFalse(json.loads(p2.stdout)["ok"])
+
+            # 目录不存在 → exit 2（用法/文件问题，与"未通过"区分开）
+            p3 = self._run_script("verify_certificate.py", ["/nonexistent-dir-xyz"])
+            self.assertEqual(p3.returncode, 2)
         finally:
             ws.cleanup()
 
@@ -5442,6 +5519,374 @@ class TestSubAgentInLoop(unittest.TestCase):
                      sandbox=SandboxMode.WORKSPACE_WRITE)
         self.assertFalse(os.path.exists(os.path.join(self.ws.path, "sneaky.txt")),
                          "只读验证者竟然写成功了 —— 它能改产物让自己通过")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 完成证书（ECT，arXiv 2608.23623）
+# ══════════════════════════════════════════════════════════════════
+# 论文的核心数字：不安全完成 0/288（ECT）vs 252/288（对照）。
+# 它治的病是「**哪一次观测支持了哪一条最终声明**」这个问题无人回答。
+#
+# 本测试类的重点是两条同时成立：
+#   1. 假完成必须被拒，且**给出可修正的原因码**
+#   2. 真完成与只读任务必须被签发（否则闸门退化成噪音）
+# 第 2 条是本项目踩过五次的坑，这里必须每次都测。
+def _cert_exec(seq, tool, ok=True, ec=None, files=None, args=None):
+    return {"seq": seq, "tool": tool, "ok": ok, "exit_code": ec,
+            "files_changed": files or [], "args": args or {},
+            "side_effect": True, "error_kind": None}
+
+
+def _cert_events(execs):
+    return [{"seq": e["seq"], "type": "tool.output", "data": e} for e in execs]
+
+
+class TestCompletionCertificate(unittest.TestCase):
+    """证书的生成与拒签理由。"""
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def _build(self, prompt, execs, answer, status="completed", sandbox=None):
+        from harness.certificate import build_certificate
+        from harness.policy import SandboxMode
+        return build_certificate(
+            prompt=prompt, executions=execs, status=status,
+            sandbox=sandbox or SandboxMode.WORKSPACE_WRITE,
+            workspace=self.ws.path, answer=answer)
+
+    # ---------- 签发面 ----------
+    def test_real_completion_is_signed(self):
+        """真做完的必须签发 —— 否则闸门只会拦不会放行。"""
+        cert = self._build(
+            "修好 calc.py 的 add 并写测试",
+            [_cert_exec(3, "read_file", args={"path": "calc.py"}),
+             _cert_exec(5, "apply_patch", files=["calc.py"]),
+             _cert_exec(7, "shell", ec=0, args={"command": "python -m unittest"})],
+            "已修改 calc.py，测试通过。")
+        self.assertTrue(cert.ok, f"真完成被拒：{[p.code.value for p in cert.problems]}")
+        kinds = {c.kind for c in cert.claims}
+        self.assertEqual(kinds, {"wrote", "ran"})
+        # 每条声明都必须绑到具体 seq
+        for c in cert.claims:
+            self.assertTrue(c.evidence)
+            for e in c.evidence:
+                self.assertGreater(e.seq, 0, "证据没有可引用的 seq")
+
+    def test_readonly_task_is_signed(self):
+        """只读任务是合法出口。
+
+        **实测修正**：早期版本在这里 `ok=False` 但 `problems=[]` ——
+        拒绝却给不出任何理由，是最坏的一种状态。
+        另有版本把问答任务报成 `EMPTY_CLAIM`，导致所有问答凭空多跑两轮。
+        """
+        cert = self._build("这个项目的入口文件是哪个？", [],
+                           "入口文件是 calc.py。")
+        self.assertTrue(cert.ok,
+                        f"只读任务被拒：{[p.code.value for p in cert.problems]}")
+        self.assertEqual(cert.claims, [])
+
+    def test_read_task_with_reads_is_signed(self):
+        cert = self._build(
+            "读一下 README 说明这个项目做什么",
+            [_cert_exec(2, "read_file", args={"path": "README.md"})],
+            "这是一个演示项目。")
+        self.assertTrue(cert.ok)
+
+    # ---------- 拒签面 ----------
+    def test_fake_completion_is_rejected_with_code(self):
+        """说了改了但没动手 → 必须拒，且给出**可修正**的原因码。"""
+        cert = self._build("修好 calc.py",
+                           [_cert_exec(3, "read_file", args={"path": "calc.py"})],
+                           "已修改 calc.py，改好了。")
+        self.assertFalse(cert.ok)
+        codes = cert.reason_codes()
+        self.assertIn("write_claimed_no_evidence", codes)
+        # 每个原因码都必须给出下一步（原因码是给模型的输入）
+        for p in cert.problems:
+            self.assertTrue(p.code.remedy, f"{p.code} 没有 remedy")
+            self.assertGreater(len(p.code.remedy), 10)
+
+    def test_failed_tool_is_never_evidence(self):
+        """失败的工具输出不能当证据 —— 这是 ECT 的一条硬约束。"""
+        cert = self._build(
+            "修好 calc.py",
+            [_cert_exec(4, "apply_patch", ok=False, files=["calc.py"])],
+            "已修改 calc.py")
+        self.assertFalse(cert.ok)
+        self.assertEqual(cert.claims, [],
+                         "失败的操作不该产生任何声明")
+
+    def test_non_completed_status_cannot_be_signed(self):
+        """escalated / max_iterations 不能签成 COMPLETE。
+
+        否则"中途失败"会被包装成"完成" —— 那是把问题藏起来而不是解决。
+        """
+        cert = self._build(
+            "修好 calc.py",
+            [_cert_exec(5, "apply_patch", files=["calc.py"])],
+            "已修改", status="escalated")
+        self.assertFalse(cert.ok)
+        self.assertIn("unsafe_completion", cert.reason_codes())
+
+    def test_zero_calls_on_write_task_is_rejected(self):
+        cert = self._build("把 a.py 里的 x 改成 2", [], "改好了，完成。")
+        self.assertFalse(cert.ok)
+        self.assertIn("no_artifacts", cert.reason_codes())
+
+    def test_problems_are_not_duplicated(self):
+        """同一个缺口不该报两次 —— 重复的原因码会把真原因挤下去。
+
+        实测踩到：`write_claimed_no_evidence` 曾被两条独立判据各报一次。
+        """
+        cert = self._build("修好 calc.py",
+                           [_cert_exec(3, "read_file", args={"path": "calc.py"})],
+                           "已修改 calc.py")
+        codes = cert.reason_codes()
+        self.assertEqual(len(codes), len(set(codes)),
+                         f"原因码重复：{codes}")
+
+    def test_certificate_digest_detects_change(self):
+        """证书自带指纹 —— 改任何字段都对不上。"""
+        from harness.certificate import _cert_digest
+        cert = self._build(
+            "修好 calc.py",
+            [_cert_exec(5, "apply_patch", files=["calc.py"])],
+            "已修改")
+        before = _cert_digest(cert)
+        self.assertEqual(before, cert.digest)
+        cert.status = "escalated"
+        self.assertNotEqual(_cert_digest(cert), cert.digest,
+                            "改了 status 指纹却没变")
+
+    def test_scope_is_declared(self):
+        """证书必须自述能力边界 —— 不冒称"证明任务正确"。"""
+        cert = self._build("修好 calc.py", [], "好了")
+        scope = cert.to_json()["scope"]
+        self.assertIn("不", scope)
+        self.assertIn("语义", scope)
+
+
+class TestCertificateReplay(unittest.TestCase):
+    """确定性重放：换一个数据源独立再查一遍。"""
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def _signed(self):
+        from harness.certificate import build_certificate
+        from harness.policy import SandboxMode
+        execs = [_cert_exec(5, "apply_patch", files=["calc.py"]),
+                 _cert_exec(9, "shell", ec=0, args={"command": "pytest -q"})]
+        cert = build_certificate(prompt="修好 calc.py", executions=execs,
+                                 status="completed",
+                                 sandbox=SandboxMode.WORKSPACE_WRITE,
+                                 workspace=self.ws.path, answer="已修改")
+        return cert, _cert_events(execs)
+
+    def test_replay_passes_on_clean_evidence(self):
+        from harness.certificate import replay
+        cert, events = self._signed()
+        self.assertEqual(replay(cert, events, self.ws.path), [])
+
+    def test_replay_catches_fabricated_seq(self):
+        """**伪造 seq 必须被检出。**
+
+        build 阶段看不见它（凭空给一个数字也能通过），
+        只有回到事件流里查"那个 seq 真的存在吗"才发现得了。
+        这正是 replay 与 build 的分工。
+        """
+        from harness.certificate import replay
+        cert, events = self._signed()
+        cert.claims[0].evidence[0].seq = 999
+        problems = replay(cert, events, self.ws.path)
+        self.assertTrue(problems)
+        self.assertIn("seq_not_found", [p.code.value for p in problems])
+
+    def test_replay_catches_evidence_that_actually_failed(self):
+        """事件流里那条其实是失败的 → 拒。
+
+        build 用的 facts 可能被上游 bug 污染（内存态）；replay 换落盘数据源，
+        两处都成立才算数。
+        """
+        from harness.certificate import replay
+        cert, events = self._signed()
+        events[0]["data"] = dict(events[0]["data"], ok=False)
+        problems = replay(cert, events, self.ws.path)
+        self.assertIn("evidence_failed", [p.code.value for p in problems])
+
+    def test_replay_catches_non_tool_event(self):
+        from harness.certificate import replay
+        cert, events = self._signed()
+        events[0]["type"] = "message"
+        problems = replay(cert, events, self.ws.path)
+        self.assertIn("seq_not_tool_output", [p.code.value for p in problems])
+
+    def test_replay_catches_artifact_mismatch(self):
+        from harness.certificate import replay
+        cert, events = self._signed()
+        events[0]["data"] = dict(events[0]["data"], files_changed=["other.py"])
+        problems = replay(cert, events, self.ws.path)
+        self.assertIn("artifact_mismatch", [p.code.value for p in problems])
+
+    def test_verify_certificate_combines_all_checks(self):
+        from harness.certificate import verify_certificate
+        cert, events = self._signed()
+        r = verify_certificate(cert, events, self.ws.path)
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r["cert_digest_ok"])
+        # 改一条证据后整体判否
+        cert.claims[0].evidence[0].seq = 999
+        r2 = verify_certificate(cert, events, self.ws.path)
+        self.assertFalse(r2["ok"])
+        self.assertIn("seq_not_found", r2["reason_codes"])
+
+
+class TestCertificateInLoop(unittest.TestCase):
+    """循环集成：证书是最后一道关，且回灌原因码而非一句"没完成"。"""
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        self.ws.write("a.py", "x = 1\n")
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def _loop(self, script, **cfg):
+        from harness.loop import AgentLoop, LoopConfig, build_default_registry
+        from harness.policy import Policy, SandboxMode, ApprovalPolicy
+        from harness.session import Session
+        from harness.context import StaticPrefix
+        from harness.model import ScriptedModel
+        reg, shell = build_default_registry(self.ws.path)
+        prefix = StaticPrefix("测试", reg.specs())
+        sess = Session(self.ws.path, "m", "stub", "workspace-write", "on-request")
+        pol = Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST, self.ws.path)
+        cfg.setdefault("max_iterations", 8)
+        loop = AgentLoop(ScriptedModel(script), reg, prefix, pol, sess,
+                         LoopConfig(**cfg), approval_handler=lambda r: "approved")
+        return loop, shell
+
+    def test_fake_completion_bounced_then_fixed(self):
+        """**这就是 ECT 要治的病**：先说"改好了"，被拦，然后真去改。
+
+        ## 断言为何只看"被拦下过"，不看是谁拦的
+
+        preflight 与证书是**串联**的两道闸门，且 preflight 在前。
+        一条"零写操作却声称改好了"的轨迹，preflight 会先拦下它
+        （`no_write_attempt`），此时证书根本轮不到被调用 ——
+        这是**正确**的分层：更便宜的检查在前。
+
+        所以这里断言的是"拦下过至少一次"，而不是"证书拦过"。
+        强行要求"必须由证书拦"会把实现细节写进断言，
+        将来调整闸门顺序就会毫无理由地失败 —— 那不是回归，是过度耦合。
+        """
+        from harness.model import tool_call_reply, final_reply
+        from harness.protocol import EventType
+        loop, shell = self._loop([
+            final_reply("我已经把 a.py 改成 x = 2 了。"),      # 空口
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("现在真的改好了。"),
+        ])
+        res = loop.run("把 a.py 里的 x 改成 2")
+        shell.reset()
+        self.assertEqual(res.status, "completed")
+        self.assertIn("x = 2", self.ws.read("a.py"), "最终必须真的改了")
+        bounced = [e for e in loop.bus.events()
+                   if e.type == EventType.ERROR
+                   and e.data.get("cls") in ("preflight_incomplete",
+                                             "certificate_rejected")]
+        self.assertGreaterEqual(len(bounced), 1, "空口完成必须被拦下过")
+
+    def test_certificate_alone_catches_what_preflight_misses(self):
+        """**证书的独立价值**：preflight 放行、但证书仍能拒的情形。
+
+        构造方式：任务不点名文件、也不含明显的改动意图词，
+        让 preflight 判定"这不是写任务"而放行；
+        但答案里声称"已修改" —— 证书的 `write_claimed_no_evidence`
+        仍然会抓到它。这证明证书不是 preflight 的复写，
+        而是补在它逻辑缝隙上的另一层。
+        """
+        from harness.model import final_reply
+        from harness.protocol import EventType
+        loop, shell = self._loop(
+            [final_reply("已修改了配置，已创建了脚本。")],
+            preflight_enabled=True)
+        res = loop.run("处理一下这件事")
+        shell.reset()
+        self.assertEqual(res.status, "completed")
+        certs = [e for e in loop.bus.events()
+                 if e.type == EventType.ERROR
+                 and e.data.get("cls") == "certificate_rejected"]
+        self.assertTrue(certs,
+                        "preflight 放行、答案声称改了却零调用 —— 证书应拒签")
+
+    def test_clean_completion_passes_first_time(self):
+        """真做完的不该被拒 —— 一次都不该多跑。"""
+        from harness.model import tool_call_reply, final_reply
+        from harness.protocol import EventType
+        loop, shell = self._loop([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("改好了。"),
+        ])
+        res = loop.run("把 a.py 里的 x 改成 2")
+        shell.reset()
+        self.assertEqual(res.iterations, 2)
+        self.assertEqual(res.reason, "任务完成。")
+        rejected = [e for e in loop.bus.events()
+                    if e.type == EventType.ERROR
+                    and e.data.get("cls") == "certificate_rejected"]
+        self.assertEqual(rejected, [], "真完成被拒签了")
+
+    def test_certificate_is_persisted(self):
+        """证书必须落盘 —— 它的用途是让外部独立复核。"""
+        from harness.model import tool_call_reply, final_reply
+        loop, shell = self._loop([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("改好了。"),
+        ])
+        loop.run("把 a.py 里的 x 改成 2")
+        shell.reset()
+        path = os.path.join(loop.session.run_dir, "certificate.json")
+        self.assertTrue(os.path.isfile(path), "证书没有落盘")
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertIn("certificate", data)
+        self.assertTrue(data["certificate"]["ok"])
+        self.assertTrue(data["certificate"]["claims"])
+
+    def test_certificate_off_is_transparent(self):
+        from harness.model import final_reply
+        loop, shell = self._loop([final_reply("改好了。")],
+                                 certificate_enabled=False,
+                                 preflight_enabled=False)
+        res = loop.run("把 a.py 里的 x 改成 2")
+        shell.reset()
+        self.assertEqual(res.iterations, 1)
+        self.assertEqual(res.reason, "任务完成。")
+
+    def test_facts_carry_seq(self):
+        """facts 里的每次执行都必须带 seq —— 否则证书无法引用证据。"""
+        from harness.model import tool_call_reply, final_reply
+        loop, shell = self._loop([
+            tool_call_reply("read_file", {"path": "a.py"}),
+            final_reply("看完了。"),
+        ])
+        loop.run("看看 a.py")
+        shell.reset()
+        self.assertTrue(loop.facts.executions)
+        for e in loop.facts.executions:
+            self.assertGreater(e.get("seq") or 0, 0,
+                               f"执行记录缺 seq：{e.get('tool')}")
 
 
 # ══════════════════════════════════════════════════════════════════

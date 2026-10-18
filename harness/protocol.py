@@ -391,6 +391,17 @@ class ToolResult:
     side_effect: bool = False
     error_layer: Optional[str] = None      # ERR_API / ERR_TOOL / ...
     retryable: Optional[bool] = None       # None = 未判定，由 correct.py 决定
+    # 这次结果在**事件流里的序号**，由 router 在 emit `tool.output` 后回填。
+    #
+    # 为什么需要它：ECT（arXiv 2608.23623）的核心是**证据要能被引用到
+    # 轨迹里的具体一条**，然后由确定性校验器去查"那一条真的存在吗、
+    # 真的是成功的吗、真的在范围内吗"。没有 seq，证书里的"证据"
+    # 就只能是一句自然语言，而自然语言无法被确定性复核。
+    #
+    # 0 表示尚未回填（工具在 router 之外被直接调用时会出现）。
+    seq: int = 0
+    # 发起这次调用的 call_id，便于与前端卡片、审批记录对齐
+    call_id: str = ""
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> Dict[str, Any]:

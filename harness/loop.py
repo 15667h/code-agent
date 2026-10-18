@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from .capability import CapabilityLedger, LedgerBook, derive_ceiling
+from .certificate import (build_certificate, feedback_text, replay,
+                          Certificate as CompletionCertificate)
 from .context import ContextBuilder, StaticPrefix
 from .correct import Corrector, Fault, FaultClass, LoopDetector, Watchdog, classify
 from .model import BaseModel, ModelReply
@@ -98,6 +100,13 @@ class LoopConfig:
     # 默认开：它不改变任何执行结果，但一次都不开的话，
     # "注入尝试执行了多少次"这个问题在事后永远无法回答（缺历史）。
     capability_ledger: bool = True
+
+    # ── 完成证书（ECT，arXiv 2608.23623）──
+    # agent 要返回 COMPLETE 时，必须出示一份把每条声明绑定到
+    # 轨迹证据的证书；签不出来就带回**原因码**让它补。
+    # 上限取 2，与 goal / preflight 一致（每条恢复路径都要有上限）。
+    certificate_enabled: bool = True
+    certificate_max_rounds: int = 2
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -172,6 +181,11 @@ class AgentLoop:
         # 而构造函数运行在 append_user 之后、读工具之前，时点不对。
         self.ledgers = LedgerBook(session.meta.workspace)
         self.ledger: Optional[CapabilityLedger] = None
+
+        # 完成证书（ECT）。`_certificate` 保存**最近一次**签发/拒签的结果，
+        # 供结果与落盘使用；`_cert_retries` 是拒签后的回灌次数。
+        self._certificate: Optional[CompletionCertificate] = None
+        self._cert_retries = 0
 
         self._consecutive_failures = 0
         self._iterations = 0
@@ -382,6 +396,21 @@ class AgentLoop:
                         continue
                     return self._finish("completed", gate_reason, answer=answer)
 
+                # ── 最后一道关：完成证书（ECT）──
+                #
+                # 前面几道闸门回答的是「**该做的做了吗**」；
+                # 证书回答的是「**你说做了的，凭什么**」。
+                #
+                # 它刻意放在最后：只有在其他闸门都放行、
+                # 马上要 `_finish("completed")` 的那一刻，
+                # "完成"这个声称才需要被要求出示凭据。
+                # 提前跑会对着还没做完的中间状态反复索证，那是噪音。
+                cert_reason = self._issue_certificate(answer)
+                if cert_reason is not None:
+                    if cert_reason == "__retry__":
+                        continue
+                    return self._finish("completed", cert_reason, answer=answer)
+
                 return self._finish("completed", "任务完成。", answer=answer)
 
             # ── 执行工具（含审批闸门）──
@@ -467,6 +496,96 @@ class AgentLoop:
                          + "\n".join(f"  · {f.detail}" for f in cp.warnings))
         self._append_correction(feedback)
         return "__retry__"
+
+    # ------------------------------------------------------------------
+    # 完成证书（ECT，arXiv 2608.23623）
+    # ------------------------------------------------------------------
+    def _issue_certificate(self, answer: str) -> Optional[str]:
+        """要求出示完成证书；签不出来就带回原因码让模型补。
+
+        返回值与 `_run_completion_gate` 同构：
+          · `None`        → 签发成功，可以收尾
+          · `"__retry__"` → 已回灌原因码，主循环应 continue
+          · 其它字符串     → 额度用尽，如实收尾（不假装完成）
+
+        ## 为什么 replay 用内存事件流而不是重读文件
+        `session` 对每条事件做 append-only 落盘，所以落盘与内存是同一份内容。
+        读内存（`bus.events()`）的两个好处：
+          · 不依赖文件句柄与刷新时机（Windows 上尤其容易踩到）
+          · 崩溃时落盘可能缺尾部，而内存一定是本次运行的完整视图
+        真正需要"离线核验"的场景（审计者只有磁盘）由 `verify_certificate`
+        配合 `read_events()` 完成 —— 两处共用同一个 `replay()`。
+        """
+        if not self.cfg.certificate_enabled:
+            return None
+
+        cert = build_certificate(
+            prompt=self._user_prompt,
+            executions=self.facts.executions,
+            status="completed",          # 走到这里说明前面闸门已放行
+            sandbox=self.policy.sandbox,
+            workspace=self.session.meta.workspace,
+            answer=answer,
+        )
+        events = [e.to_json() for e in self.bus.events()]
+        problems = replay(cert, events, self.session.meta.workspace)
+
+        # 把 replay 发现的问题并入证书 —— 它们同样是"签不出来"的原因，
+        # 必须一起回灌，否则模型只会看到一半的缺口。
+        for p in problems:
+            if p not in cert.problems:
+                cert.problems.append(p)
+
+        self._certificate = cert
+        self._persist_certificate(cert, events)
+
+        if cert.ok:
+            self.bus.emit(EventType.CHECK, scope="certificate", ok=True,
+                          claims=len(cert.claims),
+                          digest=cert.digest,
+                          reason=(f"完成证书已签发：{len(cert.claims)} 条声明"
+                                  "全部绑定到轨迹里可复核的证据。"))
+            return None
+
+        # ── 拒签 ──
+        codes = cert.reason_codes()
+        if self._cert_retries < self.cfg.certificate_max_rounds:
+            self._cert_retries += 1
+            self.bus.emit(EventType.ERROR, error_layer=ERR_CONTROL,
+                          cls="certificate_rejected",
+                          reason=f"完成证书无法签发（{len(cert.problems)} 项问题），"
+                                 "已把原因码作为反馈回灌。",
+                          codes=codes,
+                          problems=[p.to_json() for p in cert.problems],
+                          attempt=self._cert_retries)
+            self._append_correction(feedback_text(cert))
+            return "__retry__"
+
+        # 额度用尽：**如实报告**，并说明这次没有证书。
+        # 不写"任务完成" —— 那正是 ECT 要消灭的东西。
+        lines = ["模型多次宣布完成，但完成证书始终无法签发。"
+                 "以下是在结束时**仍未了结**的问题："]
+        for p in cert.problems:
+            lines.append(f"· [{p.code.value}] {p.detail}")
+        lines.append(f"（轨迹摘要 {cert.ledger_digest[:16]}，"
+                     "可在 run 目录的 certificate.json 里查看完整证书）")
+        lines.append("harness **不声称任务已完成**。")
+        return "\n".join(lines)
+
+    def _persist_certificate(self, cert: Any, events: List[Dict[str, Any]]) -> None:
+        """把证书落盘。
+
+        落盘的意义与哈希链、能力账本一致：**不依赖产生它的进程还活着**。
+        审计者拿到 run 目录后，可以自己跑 `verify_certificate()` 复核 ——
+        不需要信任这次运行的任何结论。
+        """
+        try:
+            self.session.write_certificate({
+                "certificate": cert.to_json(),
+                "attempt": self._cert_retries,
+            })
+        except Exception as e:      # noqa: BLE001
+            self.session.note_persist_failure(f"certificate: {e}")
 
     # ------------------------------------------------------------------
     # 模型调用（含重试）
@@ -603,6 +722,10 @@ class AgentLoop:
                 "files_changed": list(result.files_changed or []),
                 "side_effect": bool(result.side_effect),
                 "error_kind": (result.meta or {}).get("kind"),
+                # ECT 证书要用：证据必须能引用到轨迹里的**具体一条**，
+                # 否则"证据"只是一句自然语言，无法被确定性复核。
+                "seq": int(getattr(result, "seq", 0) or 0),
+                "call_id": getattr(result, "call_id", "") or "",
             })
 
             # ── 目标证据绑定（确定性，只吃结构化字段）──

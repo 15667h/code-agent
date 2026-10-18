@@ -564,6 +564,78 @@ class Handler(BaseHTTPRequestHandler):
                 out.append(item)
             return self._json(200, {"subagents": out, "count": len(out)})
 
+        # ── 完成证书（ECT）──
+        # 读落盘而不是内存态：证书的用途是**事后复核**，
+        # 而复核者不该需要"产生它的进程还活着"。
+        # 内存态优先只是为了拿到最新的一次（可能刚签发还没刷盘）。
+        if path.startswith("/api/run/") and path.endswith("/certificate"):
+            rid = path.split("/")[3]
+            run_dir = None
+            st = RUNS.get(rid)
+            if st is not None and st.session is not None:
+                run_dir = st.session.run_dir
+            if run_dir is None:
+                run_dir = self._find_run_dir(rid)
+            if run_dir is None:
+                return self._json(404, {"error": "run not found"})
+            cert_path = os.path.join(run_dir, "certificate.json")
+            if not os.path.isfile(cert_path):
+                # 三种可能，都必须说清楚，不能混成"没有证书"：
+                #   · 运行还没收尾（正常）
+                #   · 证书功能被关掉
+                #   · 运行在那个功能上线前
+                return self._json(404, {
+                    "error": "no certificate",
+                    "detail": "这次运行没有证书记录：可能尚未收尾、"
+                              "或运行时 certificate 被关闭。"
+                              "这**不等于**「任务未完成」。",
+                })
+            with open(cert_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            # 顺带跑一次独立重放 —— 只回"证书说它没问题"是不够的，
+            # 必须让调用方能自己确认"证据真的在事件流里"。
+            try:
+                from harness.certificate import Certificate as _Cert, Claim as _Claim, \
+                    Evidence as _Ev, verify_certificate
+                raw = payload.get("certificate") or {}
+                cert = _Cert(
+                    task_digest=raw.get("task_digest", ""),
+                    ledger_digest=raw.get("ledger_digest", ""),
+                    status=raw.get("status", ""),
+                    digest=raw.get("digest", ""))
+                for c in raw.get("claims") or []:
+                    cert.claims.append(_Claim(
+                        kind=c.get("kind", ""), subject=c.get("subject", ""),
+                        evidence=[_Ev(seq=int(e.get("seq") or 0),
+                                      tool=e.get("tool", ""),
+                                      ok=bool(e.get("ok")),
+                                      exit_code=e.get("exit_code"),
+                                      files_changed=list(e.get("files_changed") or []))
+                                  for e in (c.get("evidence") or [])]))
+                events = []
+                ev_path = os.path.join(run_dir, "events.jsonl")
+                if os.path.isfile(ev_path):
+                    with open(ev_path, "r", encoding="utf-8") as ef:
+                        for ln in ef:
+                            ln = ln.strip()
+                            if not ln:
+                                continue
+                            try:
+                                events.append(json.loads(ln))
+                            except json.JSONDecodeError:
+                                continue
+                ws_guess = os.path.dirname(os.path.dirname(os.path.dirname(run_dir)))
+                payload["verification"] = verify_certificate(cert, events, ws_guess)
+            except Exception as e:      # noqa: BLE001
+                # 重放失败要**说出来**，不能静默当成"没问题"。
+                payload["verification"] = {
+                    "ok": False,
+                    "error": f"重放失败：{type(e).__name__}: {e}",
+                    "detail": "无法确认证据是否成立，请勿把这份证书当作通过。",
+                }
+            return self._json(200, payload)
+
         # 静态：根路径给前端
         if path in ("/", "/index.html"):
             return self._static("index.html")

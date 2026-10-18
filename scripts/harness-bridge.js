@@ -248,6 +248,25 @@
             })),
           };
         }
+        // ── 完成证书（ECT）──
+        // 这里的措辞很关键：证书签发**不是**"任务完成"，而是
+        // "声称的每一件事都能指到轨迹里的一条证据"。
+        // 混成一句"完成"会让人以为证书还验证了语义正确性 —— 它没有。
+        if (d.scope === "certificate") {
+          return {
+            kind: "check", state: "done", tsOffset: tsOffset,
+            title: "完成证书已签发",
+            model: "certificate",
+            items: [
+              { ok: true, text: d.reason || "" },
+              { ok: true, text: "绑定证据的声明：" + (d.claims || 0) + " 条" },
+              { ok: true, text: "证书指纹：" + String(d.digest || "").slice(0, 16) },
+              { ok: false, warn: true,
+                text: "证书只证明「声称的事项在记录的轨迹里有成功证据」，"
+                    + "**不**证明产物在语义上正确。" },
+            ],
+          };
+        }
         // 完成前检查的通过事件（只有提醒、无硬缺口）
         if (d.scope === "preflight" && d.ok) {
           return {
@@ -319,6 +338,23 @@
                 ok: false,
                 text: f.detail + " → 要做的：" + f.remedy
                   + ((f.evidence || []).length ? "（依据：" + f.evidence.join("；") + "）" : ""),
+              };
+            }),
+          };
+        }
+        // 完成证书拒签：带的是 codes + problems（每条含 remedy）。
+        // 原因码是 ECT 让模型"针对性修正"的那部分，必须摆出来 ——
+        // 只显示一句 reason 等于把它退化成一个打回原形的"没完成"。
+        if (d.cls === "certificate_rejected" && (d.problems || []).length) {
+          return {
+            kind: "check", state: "done", tsOffset: tsOffset,
+            title: "完成证书被拒（第 " + (d.attempt || 1) + " 次）",
+            model: "certificate",
+            items: d.problems.map(function (p) {
+              return {
+                ok: false, warn: true,
+                text: "[" + (p.code || "") + "] " + (p.detail || "")
+                    + (p.remedy ? " → " + p.remedy : ""),
               };
             }),
           };

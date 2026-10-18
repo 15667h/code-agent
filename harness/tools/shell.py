@@ -253,11 +253,44 @@ class PersistentShell:
         self._extra_env = {}
 
     def kill(self) -> None:
-        if self._proc and self._proc.poll() is None:
+        """结束子进程并**彻底释放**它占用的资源。
+
+        ## 这里修的是两个真实泄漏（审计发现）
+
+        1. **没有 `wait()`**：`proc.kill()` 只是发信号，不等它真的退出。
+           Windows 上这会留下僵尸进程（句柄不回收），
+           Unix 上会积累未 wait 的子进程。一个长会话反复 reset
+           （每次 shell 超时都会重建）就会累积几十个。
+        2. **三个管道句柄从未关闭**：`stdin` / `stdout` / `stderr`
+           是既有对象，`self._proc = None` 不会关它们。
+           每次重建泄漏三个句柄，而 Windows 的句柄上限并不宽松。
+
+        顺序很重要：先 kill → 再 wait（带超时，防止它卡住不退出）
+        → 最后逐句柄关闭。反过来的话，`wait()` 之前就关闭管道
+        可能让子进程写管道时收到 EPIPE 而行为异常。
+        """
+        proc = self._proc
+        if proc is not None:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            # 等它真的退出。超时后不再纠缠 —— 一个杀不掉的进程
+            # 不该把整个会话拖死（它是外部故障，不是我们的 bug）。
             try:
-                self._proc.kill()
-            except OSError:
+                proc.wait(timeout=5)
+            except Exception:       # subprocess.TimeoutExpired / OSError
                 pass
+            # 逐句柄关闭。`close()` 可能已经因进程退出而失败，逐个 try。
+            for name in ("stdin", "stdout", "stderr"):
+                h = getattr(proc, name, None)
+                if h is None:
+                    continue
+                try:
+                    h.close()
+                except (OSError, ValueError):
+                    pass
         self._proc = None
         # 读线程会因流关闭而自行退出；队列里的残留行也一并清掉，
         # 避免下一轮 _spawn 前读到上一次的陈旧输出。

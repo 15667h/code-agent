@@ -322,6 +322,15 @@ class EventBus:
         self._seq = 0
         self._log: List[Event] = []
         self._subscribers: List[Any] = []
+        # 订阅者异常计数 + 最近几条原因。
+        #
+        # 为什么不直接吞掉就完事：订阅者负责落盘（session._persist_event）
+        # 与前端推送（server 的 SSE 队列）。一旦它持续失败，
+        # **事件流会静默缺条**，而运行结果看起来一切正常 ——
+        # 那正是本项目反复强调的"看上去正常的失败"。
+        # 计数很便宜；要查的时候没有它就什么都查不到。
+        self.subscriber_errors = 0
+        self.subscriber_error_notes: List[str] = []
 
     # ---------- 发射 ----------
     def emit(self, type_: str, **data: Any) -> Event:
@@ -331,10 +340,15 @@ class EventBus:
         for fn in list(self._subscribers):
             try:
                 fn(ev)
-            except Exception:
-                # 订阅者（前端推送、日志）出错不应影响主循环。
-                # 书 §5 的纪律：错误路径上禁止一切会再次调用模型的副作用逻辑。
-                pass
+            except Exception as e:      # noqa: BLE001
+                # 订阅者（前端推送、日志）出错不应影响主循环 ——
+                # 书 §5：错误路径上禁止一切会再次调用模型的副作用逻辑。
+                # 但**必须留痕**：吞掉而不计数，等于把"落盘失败"
+                # 伪装成"什么都没发生"。
+                self.subscriber_errors += 1
+                if len(self.subscriber_error_notes) < 20:
+                    self.subscriber_error_notes.append(
+                        f"{type(e).__name__}: {e}"[:200])
         return ev
 
     def subscribe(self, fn) -> None:
@@ -574,7 +588,26 @@ class Trajectory:
 
     @classmethod
     def from_json(cls, arr: Iterable[Dict[str, Any]]) -> "Trajectory":
+        """从落盘的行重建轨迹，**保留磁盘上的 seq**。
+
+        ## 这里修的是一个"看似正确、实际永远不生效"的问题
+
+        原实现用 `t.append(...)`，而 `append` 会写 `msg.seq = len + 1`
+        —— 于是读回来的 seq 是按行号重算的，**磁盘上的 seq 被丢弃**。
+
+        后果：`assert_seqs()` 断言"第 i 条 seq 必须等于 i"，
+        而它检查的正是刚才被自己重算过的值 —— **恒真**。
+        这条自检即使被调用也永远抓不到任何东西。
+
+        比"没有调用点"更隐蔽：前者一眼能看出来，
+        后者读代码时看起来完全正确（有 append、有断言、有 seq）。
+
+        修法：直接构造 `_msgs` 不经 `append`，让 seq 保留原值，
+        这样 `assert_seqs()` 才有意义 —— 它检查的是**磁盘上的字节**，
+        而不是我们刚刚写进去的值。
+        """
         t = cls()
         for d in arr:
-            t.append(Message.from_json(d))
+            msg = Message.from_json(d)
+            t._msgs.append(msg)      # 刻意绕过 append：它会重写 seq
         return t

@@ -285,22 +285,19 @@ _READ_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep"})
 # 也就是闸门自己在说假话 —— 那比没有闸门更坏。
 _WRITE_TOOLS = frozenset({"apply_patch", "shell"})
 
-# 条件文本里出现这些词 = 该条件要求的是**写**类动作
-_WRITE_INTENT = ("创建", "新建", "写入", "生成", "修改", "改动", "删除", "重命名",
-                 "保存", "添加", "补丁", "输出到",
-                 "create", "write", "generate", "modify", "edit", "delete",
-                 "add", "save", "patch", "produce")
+# 条件文本里出现这些词 = 该条件要求的是**写**类动作。
+#
+# 判据在 `intent.py`（单一来源）。原先这里自带一份 22 个词的表，
+# 而 preflight 有 41 个，**互相缺词** —— 任务「修好这个 bug」在那边判为写任务，
+# 在这里判不出来，于是"目标要求改动"这件事两处结论相反。
+from .intent import PATH_RE as _PATH_RE, WRITE_INTENT as _WRITE_INTENT
 
 # 可以被判定为「已执行」的命令名（出现在条件里即视为要求实际跑一次）
 _COMMAND_TOKENS = ("pytest", "unittest", "npm", "node", "python", "pip",
                    "git", "make", "cargo", "go test", "mvn", "gradle",
                    "npm run", "py_compile")
 
-# 路径样 token：带扩展名，或含 `/`。刻意保守，不把普通英文单词当路径。
-_PATH_RE = re.compile(
-    r"(?:[A-Za-z0-9_.\-]*/)+[A-Za-z0-9_.\-*]+"          # 含斜杠的路径
-    r"|[A-Za-z0-9_\-*]+\.[A-Za-z0-9]{1,8}\b"            # 带扩展名的文件名
-)
+# 路径正则：见 `intent.PATH_RE`（三处原本逐字相同的副本，已合并）
 
 
 @dataclass

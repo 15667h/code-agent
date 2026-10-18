@@ -66,38 +66,27 @@ from .protocol import ToolCall, ToolResult
 # 注意这里读的是 prompt（用户输入），**不是模型的输出**。
 # 用户的任务描述是可信输入；模型的自我声明不是。
 
-_WRITE_INTENT = (
-    "实现", "新建", "创建", "添加", "修改", "改动", "重构", "修复", "修好", "删除",
-    "写一个", "写个", "生成", "补全", "替换", "重命名", "移动", "加上",
-    # 单字与常见变体。别漏这些 —— 中文里「改」是最核心的动词，
-    # 而实测最常见的说法就是「把 X 改成 Y」这种形态。
-    # 早期版本只收了「修改/改动」，导致「改成」「改 a.py」全部漏检。
-    "改", "换成", "变成", "去掉", "干掉", "注释掉", "加上去",
-    "implement", "create", "add", "modify", "fix", "refactor", "write",
-    "delete", "remove", "rename", "generate", "build", "change", "update",
-    "replace", "patch",
-)
+# 判据本身在 `intent.py`（单一来源）。
+#
+# 为什么改成导入：审计发现写意图词在本文件 41 个、在 verify.py 22 个，
+# **互相缺词**（verify 缺 `实现/修复/fix`，本文件缺 `保存/补丁`）。
+# 后果是同一轨迹会得到矛盾结论 —— 任务「修好这个 bug」在这里判为写任务，
+# 在 verify 那边则可能判为不要求改动。
+# 判据只能有一份，这是本项目第四次因为"两处各写一遍"而漂移。
+from .intent import (PATH_RE as _PATH_RE,
+                     READONLY_INTENT as _READONLY_INTENT,
+                     VERIFY_CMDS as _VERIFY_CMDS,
+                     WRITE_INTENT as _WRITE_INTENT,
+                     mentioned_files as _mentioned_files,
+                     mentioned_paths as _mentioned_paths,
+                     wants_readonly as _wants_readonly,
+                     wants_write as _wants_write)
 
 # 这些意图要求"必须有一次真正的写操作"（不是只看不改）
 _VERIFY_HINT = (
     "测试", "验证", "跑通", "通过", "确保", "检验", "检查", "确认能",
     "test", "verify", "validate", "pass", "ensure", "check that",
 )
-
-# 路径样 token（用于把"要改的文件"提取出来）
-_PATH_RE = re.compile(
-    r"(?:[A-Za-z0-9_.\-]*/)+[A-Za-z0-9_.\-*]+"
-    r"|[A-Za-z0-9_\-*]+\.[A-Za-z0-9]{1,8}\b"
-)
-
-# 「验证类命令」的识别 —— 复用 policy 的保守分类思想：
-# 只有明确是验证/构建动作才算，不做语义猜测。
-_VERIFY_CMDS = ("pytest", "unittest", "py_compile", "npm test", "npm run test",
-                "npm run build", "npm run lint", "yarn test", "cargo test",
-                "cargo build", "go test", "go build", "mvn test", "mvn package",
-                "gradle test", "make", "make test", "tsc", "eslint", "flake8",
-                "ruff", "mypy", "jest", "vitest", "dotnet test", "dotnet build")
-
 
 # 纯问答/解释类任务的形态标记。这些任务**不该**被写检查拦住 ——
 # 误拦的代价是凭空多跑两轮、甚至把问答拖成超时。
@@ -112,15 +101,6 @@ _QUESTION_SHAPE = re.compile(
     r"|\b(explain|describe|tell me|what is|how do|how to|difference between)\b",
     re.IGNORECASE,
 )
-
-# 「只读且不改」的明确措辞：出现这些词说明用户主动要求不要动工作区。
-_READONLY_INTENT = (
-    "不要改", "别改", "不要动", "别动", "只读", "不要修改", "别修改",
-    "不要创建", "不要新建", "不用改", "无需改",
-    "don't modify", "do not modify", "don't change", "read only", "readonly",
-    "no changes", "without modifying",
-)
-
 
 def looks_like_edit_task(prompt: str) -> bool:
     """这条任务是否要求"改动工作区"。
@@ -138,11 +118,10 @@ def looks_like_edit_task(prompt: str) -> bool:
         return False
     low = text.lower()
 
-    if any(k in low for k in _READONLY_INTENT):
+    if _wants_readonly(text):
         return False
 
-    hit_write = any(k in low for k in _WRITE_INTENT)
-    if not hit_write:
+    if not _wants_write(text):
         return False
 
     # 有写意图，但整句是提问形态 → 判为问答任务，不施加写检查。
@@ -160,13 +139,23 @@ def wants_verification(prompt: str) -> bool:
 
 
 def mentioned_paths(prompt: str) -> List[str]:
-    """从任务文本里提取提到的文件路径。"""
-    out: List[str] = []
-    for m in _PATH_RE.finditer(prompt or ""):
-        tok = m.group(0).strip("`《》\"'(),;，。：:！!？?")
-        if tok and tok not in out:
-            out.append(tok)
-    return out
+    """从任务文本里提取提到的文件路径（实现见 `intent.mentioned_paths`）。
+
+    **这是"所有路径样 token"，包含模块名与 MIME 类型。**
+    要做"任务点名了哪些**文件**"的判定，请用 `mentioned_files`。
+    """
+    return _mentioned_paths(prompt)
+
+
+def mentioned_files(prompt: str) -> List[str]:
+    """只要看起来是**仓库文件**的路径。
+
+    `named_path_untouched` 必须以它为准 —— 把 Python 模块名
+    （`ansible.module_utils.urls`）或 MIME 类型（`text/plain`）
+    当成"你点名了却没改"的文件，会让诚实完成被误拦。
+    实测：SWE-bench Pro 的 6 道真实题里有 1 道栽在这里。
+    """
+    return _mentioned_files(prompt)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -507,7 +496,11 @@ class PreCompletionMiddleware:
         """
         if not looks_like_edit_task(prompt):
             return
-        named = mentioned_paths(prompt)
+        # 用 `mentioned_files` 而不是 `mentioned_paths`：
+        # 后者会把 Python 模块名（`ansible.module_utils.urls`）与
+        # MIME 类型（`text/plain`）也算进来，于是"你点名了却没改"误报，
+        # 诚实完成被拦。实测：SWE-bench Pro 6 道真实题里 1 道栽在这里。
+        named = mentioned_files(prompt)
         if not named:
             return
         written = facts.wrote_paths()
@@ -560,16 +553,11 @@ class PreCompletionMiddleware:
 
 
 def _covers(pattern: str, actual: str) -> bool:
-    """写入路径是否覆盖了任务点名的路径（含 basename 兜底）。"""
-    import fnmatch
-    p = (pattern or "").replace("\\", "/").strip()
-    a = (actual or "").replace("\\", "/").strip()
-    if not p or not a:
-        return False
-    if p == a:
-        return True
-    if fnmatch.fnmatch(a, p) or fnmatch.fnmatch(a, "*/" + p.lstrip("/")):
-        return True
-    if "/" not in p and (a == p or a.endswith("/" + p)):
-        return True
-    return False
+    """写入路径是否覆盖了任务点名的路径（实现见 `intent.path_covers`）。
+
+    迁到 intent 是因为证书也要用同一套规则 —— 两处各写一遍必然漂移
+    （实测：证书用严格相等，于是"任务说 a.py、实际写 src/a.py"
+    被判成"写的不是该写的地方"，一个正确完成被拦）。
+    """
+    from .intent import path_covers
+    return path_covers(pattern, actual)

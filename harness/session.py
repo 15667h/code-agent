@@ -200,8 +200,26 @@ class Session:
         return _read_jsonl(self._events_path)
 
     def read_trajectory(self) -> Trajectory:
+        """读回轨迹。
+
+        ## 这里做的 seq 自检不是"顺手加一行"
+
+        `Trajectory.assert_seqs()` 原本**没有任何调用点** ——
+        一个从没跑过的自检，与不存在它没有区别，但读代码的人会以为
+        这条不变式被守着。
+
+        为什么放在读回路径而不是写入路径：
+          · 写入时 `append()` 就是 seq 的来源，那时断言恒真（自欺）
+          · 读回时 seq 来自**磁盘上的字节**，是唯一可能被外部损坏的地方
+            （手工编辑、断点续写、跨版本格式变化）
+
+        失败时**抛出**而不是静默修复：轨迹 seq 断裂意味着记录不可信，
+        这是需要人知道的事，不是能悄悄抹平的细节。
+        """
         rows = _read_jsonl(self._traj_path)
-        return Trajectory.from_json(rows)
+        traj = Trajectory.from_json(rows)
+        traj.assert_seqs()
+        return traj
 
     def summary(self) -> Dict[str, Any]:
         evs = self.read_events()

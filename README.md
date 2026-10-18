@@ -44,8 +44,12 @@
 | `harness/subagent.py` | **子代理 + 上下文隔离**：只给规格不给上游推理；验证者读原始产物、不读生成者的话 |
 | `harness/certificate.py` | **完成证书（ECT）**：每条完成声明必须绑定到轨迹里一条可复核证据，否则带回**原因码** |
 | `harness/verify_certificate.py` | **证书离线核验 CLI**：只读、零依赖，退出码可直接接 CI |
+| `harness/intent.py` | **意图判据的单一来源**：写/只读/验证命令/路径匹配，四个模块共用一份 |
+| `harness/bench_swe_pro.py` | **SWE-bench Pro 基准入口**：抓题、列题、跑第 1 层 |
+| `harness/bench_layer1.py` | **基准第 1 层（判定正确性）**：真实题目 × 三种用例，确定性判据 |
+| `harness/bench_layer2.py` | **基准第 2 层（真实仓库行为观察）**：fetch 真实 commit 后跑 agent |
 | `harness/retention.py` | **类型化保留**：约束 verbatim 永不进摘要器（防压缩悬崖） |
-| `harness/test_harness.py` | **383 项测试**，每项标注书中出处 |
+| `harness/test_harness.py` | **398 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
 | `docs/harness-research-2026.md` | **2026 前沿调研**：ETCLOVG 七层、架构收敛、ECT、压缩悬崖、CapScope、Self-Harness、AHE |
 | `docs/harness-gap-diagnosis.md` | **差距诊断**：逐层读代码，含两个「空壳」实证 |
@@ -186,7 +190,7 @@ curl -X POST http://127.0.0.1:8787/api/run \
 ## 已验证
 
 **后端**（`python -m harness.test_harness`）
-- **383 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- **398 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
 - 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
   重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
 - 模型接入：地址归一化（中转站四种写法）、api_key 绝不回传明文、掩码可核对、
@@ -201,6 +205,14 @@ curl -X POST http://127.0.0.1:8787/api/run \
   未配置时自动走离线脚本 —— 全通过
 - **目标闸门（真实模型 deepseek-v4.1-flash）**：文件落盘 → `check/scope=goal newly_met`
   → `all_met:true` → `completed`；反向用例（要求创建但指示不动手）正确报 `all_met:false`
+- **审计（2026-10-18）**：七类机械扫描发现 **9 个真实缺陷**，全部修复。
+  其中 3 个是"看起来正确、实际从不生效"（空壳 / 恒真断言 / 分支不可达）——
+  详见 `docs/harness-audit-2026-10-18.md`
+- **SWE-bench Pro 实测（2026-10-18）**：用官方 `hard` 子集 **51 题**，
+  跑第 1 层判定正确性 **153/153 全过**（假完成必须拒 / 改错位置必须拒 /
+  诚实完成必须放行）。基准同时抓出 **3 个真实判定缺陷**（只查"有没有写"
+  不查"写的位置"、系统路径被当仓库文件、路径匹配两处不一致），已修复。
+  详见 `docs/harness-benchmark-2026-10-18.md`
 - **完成证书（G-1，ECT）**：`_finish("completed")` 不再能凭一句话成立 ——
   声称完成的每一件事都必须绑定到轨迹里**一条成功的工具调用**（带 seq），
   由确定性 replay 回到事件流复核；签不出来就带回**原因码 + 下一步**让模型针对性补。

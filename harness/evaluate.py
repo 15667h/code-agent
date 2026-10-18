@@ -58,6 +58,33 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
+def _ensure_package_path() -> None:
+    """脚本直跑时把项目根塞进 `sys.path`，让 `from harness.x import y` 可用。
+
+    ## 为什么必须单独抽出来，而不是在每处 try/except
+
+    这个坑本项目已经踩了**四次**（verify_chain / server / evaluate / 这次
+    evaluate 引入 intent）。共同的根因是：`python harness/xxx.py` 时
+    `__package__` 为 None，任何 `from .x import y` 都会 ImportError。
+
+    解法统一为：**先把根塞进 sys.path，再用绝对导入**。
+    不要用 exec_module 按文件路径加载 —— 被加载的模块内部
+    `from .protocol import ...` 依然会炸（它也是包内相对导入）。
+
+    这个函数在模块顶层、所有 `from .` 之前调用一次即可。
+    它是幂等的（判重后 insert），多次调用无害。
+    """
+    if __package__ not in (None, ""):
+        return                      # 正常包内导入，什么都不用做
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+_ensure_package_path()
+
+
 def _looks_like_edit_task(prompt: str) -> bool:
     """问"这条任务是否要求改动工作区"。
 
@@ -163,16 +190,27 @@ def load_task_text(run_dir: str) -> str:
 #   info   —— 中性事实，供统计
 SEVERITY_ORDER = {"fail": 0, "warn": 1, "info": 2}
 
-# 验证类命令（与 preflight 保持同一张表 —— 两处必须一致，
-# 否则同一个轨迹在闸门与诊断器里会得出矛盾结论）
-VERIFY_CMDS = ("pytest", "unittest", "py_compile", "npm test", "npm run test",
-               "npm run build", "npm run lint", "yarn test", "cargo test",
-               "cargo build", "go test", "go build", "mvn test", "mvn package",
-               "gradle test", "make", "make test", "tsc", "eslint", "flake8",
-               "ruff", "mypy", "jest", "vitest", "dotnet test", "dotnet build")
+# 验证类命令。判据在 `intent.py`（单一来源）。
+#
+# 这里原先自带一份副本，注释写着"与 preflight 保持同一张表"——
+# 但**没有任何机制保证**它真的一致，那是靠人记性维持的一致性。
+# 审计时写的一条静态检查（TestIntentSingleSource）立刻抓到了它。
+#
+# 导入用**双模式**：包内走相对导入，脚本直跑走绝对导入
+# （`_ensure_package_path()` 已在模块顶部把根塞进 sys.path）。
+if __package__ in (None, ""):
+    from harness.intent import VERIFY_CMDS
+else:
+    from .intent import VERIFY_CMDS
 
-# 改动类工具
-WRITE_TOOLS = ("apply_patch",)
+# 改动类工具。
+#
+# **这里曾有一个真实 bug**：原值是 `("apply_patch",)`，漏了 `shell`。
+# 而实测里模型经常用 `shell` 写文件（`printf 'x' > f.txt`），
+# 于是"这次运行有没有改动工作区"在诊断器里会被判成"没有"，
+# 进而把一个真做了改动的运行误诊为 `false_completion`。
+# 与 `verify._WRITE_TOOLS` 对齐（那里一直是两项），避免再次漏。
+WRITE_TOOLS = ("apply_patch", "shell")
 
 
 @dataclass

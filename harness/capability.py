@@ -109,26 +109,15 @@ _NETWORK_INTENT = (
     "github.com", "gitlab", "pypi", "npmjs", "registry",
 )
 
-# 验证类命令（与 preflight 的判据同源，此处单独列出以避免跨模块耦合）
-_VERIFY_CMDS = ("pytest", "unittest", "py_compile", "npm test", "npm run test",
-                "npm run build", "npm run lint", "yarn test", "cargo test",
-                "cargo build", "go test", "go build", "mvn test", "mvn package",
-                "gradle test", "make", "make test", "tsc", "eslint", "flake8",
-                "ruff", "mypy", "jest", "vitest", "dotnet test", "dotnet build")
-
-# 「用户明说不要改动工作区」的措辞（与 preflight 的 _READONLY_INTENT 同源）。
-# 这是**最强的一条**：明确了任务边界，之后的任何写都是越界。
-_READONLY_INTENT = (
-    "不要改", "别改", "不要动", "别动", "只读", "不要修改", "别修改",
-    "不要创建", "不要新建", "不用改", "无需改", "不要写入", "不要删",
-    "don't modify", "do not modify", "don't change", "read only", "readonly",
-    "no changes", "without modifying", "do not write", "don't write",
-)
-
-_PATH_RE = re.compile(
-    r"(?:[A-Za-z0-9_.\-]*/)+[A-Za-z0-9_.\-*]+"
-    r"|[A-Za-z0-9_\-*]+\.[A-Za-z0-9]{1,8}\b"
-)
+# 判据统一在 `intent.py`。
+#
+# 原先这里自带验证命令与只读措辞两份副本，且只读措辞比 preflight 多 4 条
+# （`不要写入` / `不要删` / `do not write` / `don't write`）——
+# 于是"这个任务是否只读"在两处会得出不同答案。
+from .intent import (PATH_RE as _PATH_RE,
+                     READONLY_INTENT as _READONLY_INTENT,
+                     VERIFY_CMDS as _VERIFY_CMDS,
+                     wants_readonly as _wants_readonly)
 
 
 @dataclass
@@ -199,7 +188,7 @@ def derive_ceiling(prompt: str, sandbox: SandboxMode,
     text = (prompt or "")
     low = text.lower()
 
-    readonly_task = bool(readonly_hint) or any(k in low for k in _READONLY_INTENT)
+    readonly_task = bool(readonly_hint) or _wants_readonly(text)
     requested_network = any(k in low for k in _NETWORK_INTENT)
 
     named: List[str] = []

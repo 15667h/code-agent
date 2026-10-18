@@ -597,6 +597,10 @@ class AgentLoop:
             self.watchdog.beat()
 
             if reply.error_layer is None:
+                # 成功 → 解除错误路径标记。
+                # 书 §5「错误路径上禁用副作用逻辑」需要一个**进出点**：
+                # 只标记不进清除，整个会话一旦出过错就永久处于"禁用"状态。
+                self.corrector.mark_error_path(False)
                 return reply
 
             # 分类 → 决定是否值得重试
@@ -604,15 +608,38 @@ class AgentLoop:
                              error_layer=reply.error_layer,
                              retryable=reply.retryable)
             fault = classify(err)
+            self.corrector.mark_error_path(True)
             plan = self.corrector.plan(fault, attempt, foreground=True)
 
             if plan["action"] == "retry" and attempt < 3:
-                self.bus.emit(EventType.RETRY, attempt=attempt + 1,
-                              delay_s=plan["delay_s"], reason=plan["reason"])
-                self.corrector.note_failure("retry", plan["reason"])
-                time.sleep(plan["delay_s"])
-                attempt += 1
-                continue
+                # ── 恢复深度闸门（书 §5「死亡螺旋」防线）──
+                #
+                # 为什么需要它：恢复路径本身也在调用模型，而它同样会失败。
+                # 若不在深度上设闸，一次失败的恢复会触发下一次恢复，
+                # 形成"恢复的恢复的恢复"—— 那是书里点名的死亡螺旋，
+                # 症状是失败率上升而 token 消耗爆炸，从日志里看不出因果。
+                #
+                # 这段逻辑原先写好了却**从未被调用**（`enter_recovery` 等
+                # 五个方法在生产代码里零引用）。空壳的代价不是"少了功能"，
+                # 而是让人以为这道防线存在。
+                self.corrector.enter_recovery()
+                try:
+                    if self.corrector.depth_exceeded():
+                        self.bus.emit(EventType.ERROR, error_layer=ERR_CONTROL,
+                                      cls="recovery_depth_exceeded",
+                                      reason=(f"恢复嵌套深度超过 "
+                                              f"{self.corrector.MAX_RECOVERY_DEPTH} 层，"
+                                              "判定为死亡螺旋，停止继续恢复。"),
+                                      depth=self.corrector._recovery_depth)
+                        return reply
+                    self.bus.emit(EventType.RETRY, attempt=attempt + 1,
+                                  delay_s=plan["delay_s"], reason=plan["reason"])
+                    self.corrector.note_failure("retry", plan["reason"])
+                    time.sleep(plan["delay_s"])
+                    attempt += 1
+                    continue
+                finally:
+                    self.corrector.exit_recovery()
 
             # 不再重试：交回上层统一处理
             return reply

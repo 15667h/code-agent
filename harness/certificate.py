@@ -81,7 +81,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence
 
 from .policy import SandboxMode
-from .preflight import mentioned_paths
+from .intent import mentioned_files
 
 # ══════════════════════════════════════════════════════════════════
 # 原因码
@@ -347,6 +347,9 @@ _WRITE_CLAIM_HINTS = (
     "i created", "i added", "i modified", "i fixed", "i removed",
 )
 # 回答里表示"纯查询"的措辞（用于给只读任务一条合法出口）。
+# 答案里的"只读声明"。这是**另一个概念**：它不是任务意图，
+# 而是**模型自己说"这是只读任务"**。所以刻意不复用 intent.READONLY_INTENT
+# （那是用户的话），而 intent 的只读措辞用于判断任务本身。
 _READONLY_CLAIM_HINTS = (
     "只读", "没有改动", "未做任何改动", "不需要修改", "无需修改",
     "read-only", "no changes", "did not modify",
@@ -446,7 +449,9 @@ def build_certificate(*, prompt: str, executions: Sequence[Dict[str, Any]],
     # 3.4 任务点名了文件、却没有任何成功的写操作
     #     判据复用 preflight，保证两处口径一致
     #     （同一轨迹不能既"通过闸门"又被判"没做"）。
-    named = mentioned_paths(prompt or "")
+    # 用 mentioned_files：模块名 / MIME 类型不该被当成"点名的文件"，
+    # 否则会把一个诚实完成判成"写的不是该写的地方"。
+    named = mentioned_files(prompt or "")
     named_untouched: List[str] = []
     if named and not write_ev and not is_read:
         named_untouched = [p for p in named if p not in by_path]
@@ -464,6 +469,38 @@ def build_certificate(*, prompt: str, executions: Sequence[Dict[str, Any]],
             subject = ""
         cert.problems.append(Problem(
             RejectCode.WRITE_CLAIMED_NO_EVIDENCE, detail, subject=subject))
+
+    # 3.4b **写了，但写的不是该写的地方**
+    #
+    # ## 这是 SWE-bench Pro 基准跑出来的真实缺口
+    #
+    # 上面的 3.3/3.4 只在"完全没有写操作"时触发。于是一个
+    # **随便改个无关文件**的运行能拿到完整证书 —— 它确实"写了"，
+    # 只是写的地方与任务要求无关。
+    #
+    # 这正是 BenchJack 记录的作弊形态：不改实现、改测试文件
+    # （`conftest.py` 钩住 pytest 把结果改写成 passed）。
+    # 我们当时的证书对此**毫无反应**，6 道真实题里 6 道全部放行。
+    #
+    # 判据：任务点名了文件（`named` 非空）且是写任务时，
+    # **至少一个**被点名文件必须出现在写入产物里。
+    # "至少一个"而不是"全部"：真实任务常有主文件 + 若干附件，
+    # 要求全部会被"只改了主文件"这种合理情形误拦。
+    if write_ev and named and not is_read and not readonly_task:
+        # 用 `path_covers` 而不是严格相等 —— 必须与 preflight 同一套规则。
+        # 实测踩到：任务说 `a.py`、实际写 `src/a.py`，严格相等会判成
+        # "写的不是该写的地方"，把一个正确完成拦掉。
+        from .intent import path_covers
+        written_paths = sorted(by_path)
+        hit_named = [p for p in named
+                     if any(path_covers(p, w) for w in written_paths)]
+        if not hit_named:
+            cert.problems.append(Problem(
+                RejectCode.ARTIFACT_MISMATCH,
+                f"写操作没有触及任务点名的任何文件。"
+                f"任务要求：{', '.join(named[:3])}；"
+                f"实际写入：{', '.join(written_paths[:3])}。",
+                subject=", ".join(written_paths[:3])))
 
     # 3.5 声明为空（既没写也没跑）→ 无法判断完成
     #

@@ -5890,5 +5890,363 @@ class TestCertificateInLoop(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 审计：判据单一来源
+# ══════════════════════════════════════════════════════════════════
+# 审计发现同一套判据在 4 个模块里各有一份，且**已经漂移**：
+# 写意图词 preflight 41 个 / verify 22 个，互相缺词。
+# 后果不是代码难看，而是**同一轨迹得到矛盾结论**。
+#
+# 这组测试的价值不在于"测某个函数"，而在于**阻止副本再次出现**：
+# 任何人在别的模块里重新定义一张词表，这里就会失败。
+class TestIntentSingleSource(unittest.TestCase):
+    """判据只能有一份。"""
+
+    def test_write_intent_has_no_duplicate_definition(self):
+        """`WRITE_INTENT` 这种表不得在 intent.py 之外重新定义。
+
+        判据：在 harness/ 下找 `_WRITE_INTENT = (` / `WRITE_INTENT = (`
+        这类**字面量赋值**，只允许出现在 intent.py。
+        导入（`from .intent import WRITE_INTENT as ...`）不算。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        bad = []
+        for d, _, files in os.walk(os.path.join(root, "harness")):
+            for fn in files:
+                if not fn.endswith(".py") or fn.startswith("test_"):
+                    continue
+                if fn == "intent.py":
+                    continue
+                path = os.path.join(d, fn)
+                with open(path, encoding="utf-8") as f:
+                    for i, ln in enumerate(f, start=1):
+                        s = ln.strip()
+                        # 只看真正的元组/列表字面量赋值
+                        if (s.startswith("_WRITE_INTENT = (")
+                                or s.startswith("WRITE_INTENT = (")
+                                or s.startswith("_READONLY_INTENT = (")
+                                or s.startswith("READONLY_INTENT = (")
+                                or s.startswith("_VERIFY_CMDS = (")
+                                or s.startswith("VERIFY_CMDS = (")
+                                or s.startswith("_PATH_RE = re.compile")
+                                or s.startswith("PATH_RE = re.compile")):
+                            bad.append(f"{fn}:{i}")
+        self.assertEqual(bad, [],
+                         "这些地方重新定义了判据表（应改为从 intent 导入）："
+                         + ", ".join(bad))
+
+    def test_all_modules_agree_on_the_same_task(self):
+        """**最重要的回归**：三个模块对同一任务必须给出同一结论。
+
+        审计时这里就是真出问题的地方 ——
+        「修好这个 bug」在 preflight 是写任务，在 verify 的词表里
+        `修好`/`修复` 都不在，于是"目标要求改动"这件事两处答案相反。
+        """
+        from harness.preflight import looks_like_edit_task
+        from harness.certificate import _is_read_task
+        from harness.intent import wants_write
+
+        write_tasks = [
+            "把 a.py 里的 x 改成 2",
+            "修好这个 bug",           # ← 审计里暴露的那条
+            "实现一个新功能",
+            "新建 notes/hello.txt",
+            "refactor this module",
+            "delete the temp file",
+            "保存一下配置",
+        ]
+        read_tasks = [
+            "这个项目的入口文件是哪个？",
+            "这个项目改用的是什么框架？",   # 含「改」但是提问
+            "解释一下这段代码",
+            "看看工作区里有什么",
+            "不要修改任何文件，只告诉我结构",   # 明确只读
+            "读一下 README 说明项目做什么",
+        ]
+        for t in write_tasks:
+            self.assertTrue(wants_write(t), f"「{t}」应被判为写意图")
+            self.assertTrue(looks_like_edit_task(t),
+                            f"「{t}」preflight 应判为写任务")
+            self.assertFalse(_is_read_task(t),
+                             f"「{t}」证书不该判为只读任务")
+        for t in read_tasks:
+            self.assertFalse(looks_like_edit_task(t),
+                             f"「{t}」不该被判为写任务（误拦会凭空多跑两轮）")
+            self.assertTrue(_is_read_task(t),
+                            f"「{t}」应判为只读任务")
+
+    def test_wants_write_is_low_level_by_design(self):
+        """`wants_write` 只做词面命中，**故意**不带护栏。
+
+        它不排除提问形态、也不排除"不要改" ——
+        那两道护栏属于 `looks_like_edit_task`。
+        这个测试把分工钉住，防止有人把护栏塞进低层函数后
+        让 verify / capability 拿到被过滤过的信号。
+        """
+        from harness.intent import wants_write, wants_readonly
+        # 含「改」的提问 → 底层仍为 True
+        self.assertTrue(wants_write("这个项目改用的是什么框架？"))
+        # 明确只读 → 底层仍为 True（它确实出现了「修改」这个词）
+        self.assertTrue(wants_write("不要修改任何文件"))
+        self.assertTrue(wants_readonly("不要修改任何文件"))
+        # 而最终判定会排掉
+        from harness.preflight import looks_like_edit_task
+        self.assertFalse(looks_like_edit_task("这个项目改用的是什么框架？"))
+        self.assertFalse(looks_like_edit_task("不要修改任何文件"))
+
+    def test_mentioned_paths_is_shared(self):
+        """路径提取也只有一个实现（三处原本逐字相同）。"""
+        from harness.intent import mentioned_paths
+        from harness.preflight import mentioned_paths as pf_paths
+        p = "创建 src/a.py 并更新 notes/x.md"
+        self.assertEqual(mentioned_paths(p), pf_paths(p))
+        self.assertIn("src/a.py", mentioned_paths(p))
+
+
+# ══════════════════════════════════════════════════════════════════
+# 审计回归：把审计发现的问题钉住
+# ══════════════════════════════════════════════════════════════════
+# 这些测试不是为了覆盖率，而是**每一个都对应一次真实的审计发现**。
+# 没有它们，下次重构会悄悄把同样的缺陷带回来。
+class TestAuditRegressions(unittest.TestCase):
+    """审计发现的问题不得回归。"""
+
+    def test_written_tools_lists_agree_across_modules(self):
+        """三个模块的「写类工具」清单必须一致。
+
+        **审计发现**：`evaluate.WRITE_TOOLS` 只有 `("apply_patch",)`，
+        漏了 `shell`；而 `verify` 与 `certificate` 都是两项。
+        后果很具体：模型用 `shell` 写文件（实测里很常见）时，
+        诊断器会认为"这次运行没有改动工作区"，
+        于是一个真正做了改动的运行被误诊为 `false_completion`。
+        """
+        from harness.evaluate import WRITE_TOOLS as EV
+        from harness.verify import _WRITE_TOOLS as VF
+        from harness.certificate import _WRITE_TOOLS as CF
+        self.assertEqual(set(EV), set(VF),
+                         f"evaluate {set(EV)} != verify {set(VF)}")
+        self.assertEqual(set(CF), set(VF),
+                         f"certificate {set(CF)} != verify {set(VF)}")
+        self.assertIn("shell", EV,
+                      "shell 能写文件，必须算作写类工具")
+
+    def test_recovery_depth_gate_is_wired(self):
+        """恢复深度闸门必须真的会触发。
+
+        **审计发现**：`enter_recovery` / `exit_recovery` / `depth_exceeded`
+        三件套在生产代码里**零调用** —— 书 §5 点名的「死亡螺旋」防线
+        写好了却没接上。空壳的代价不是少了功能，而是让人以为它存在。
+        """
+        from harness.correct import Corrector
+        c = Corrector()
+        self.assertFalse(c.depth_exceeded())
+        for _ in range(c.MAX_RECOVERY_DEPTH + 1):
+            c.enter_recovery()
+        self.assertTrue(c.depth_exceeded(), "超过深度上限却仍判未超")
+        for _ in range(c.MAX_RECOVERY_DEPTH + 1):
+            c.exit_recovery()
+        self.assertFalse(c.depth_exceeded(), "退出后应复位")
+        self.assertEqual(c._recovery_depth, 0, "深度不该变成负数")
+
+    def test_error_path_marker_is_cleared_on_success(self):
+        """错误路径标记必须能清除。
+
+        **审计发现**：`mark_error_path` 原本没有调用点。
+        只标不清的话，整个会话一旦出过错就永久处于"禁用副作用"状态 ——
+        一个只会变严不会恢复的开关，最终会被当成阻塞而绕过。
+        """
+        from harness.correct import Corrector
+        c = Corrector()
+        self.assertTrue(c.safe_on_error_path())
+        c.mark_error_path(True)
+        self.assertFalse(c.safe_on_error_path())
+        c.mark_error_path(False)
+        self.assertTrue(c.safe_on_error_path())
+
+    def test_trajectory_seq_assertion_is_actually_run(self):
+        """轨迹 seq 自检必须在读回时真的执行。
+
+        **审计发现**：`Trajectory.assert_seqs()` 零调用点。
+        一个从不执行的自检与不存在没有区别，但读代码的人会以为
+        这条不变式被守着。
+        """
+        ws = TempWorkspace()
+        try:
+            from harness.session import Session
+            from harness.protocol import EventType
+            sess = Session(ws.path, "m", "stub", "workspace-write", "on-request")
+            sess.bus.emit(EventType.TURN_STARTED, workspace=ws.path)
+            # 正常读回不抛
+            sess.read_trajectory()
+            # 人为把轨迹里的 seq 改坏
+            traj_path = os.path.join(sess.run_dir, "trajectory.jsonl")
+            with open(traj_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"role": "user", "content": "x", "seq": 99},
+                                   ensure_ascii=False) + "\n")
+            with self.assertRaises(AssertionError,
+                                   msg="seq 断裂时必须抛出，不能静默通过"):
+                sess.read_trajectory()
+        finally:
+            ws.cleanup()
+
+    def test_event_bus_counts_subscriber_errors(self):
+        """订阅者异常必须被计数，不能完全静默。
+
+        **审计发现**：`EventBus.emit` 里订阅者抛异常时是裸 `pass`。
+        订阅者负责**落盘**与前端推送 —— 它持续失败意味着事件流会缺条，
+        而运行结果看起来一切正常。那正是"看上去正常的失败"。
+        """
+        from harness.protocol import EventBus
+        bus = EventBus()
+        bus.subscribe(lambda ev: (_ for _ in ()).throw(RuntimeError("boom")))
+        self.assertEqual(bus.subscriber_errors, 0)
+        bus.emit("test", x=1)
+        self.assertEqual(bus.subscriber_errors, 1)
+        bus.emit("test", x=2)
+        self.assertEqual(bus.subscriber_errors, 2)
+        self.assertIn("boom", bus.subscriber_error_notes[0])
+        # 主流程不受影响：事件照样进日志
+        self.assertEqual(len(bus.events()), 2)
+
+    def test_shell_kill_releases_pipes(self):
+        """`kill()` 必须释放子进程的管道句柄。
+
+        **审计发现**：`kill()` 只调 `proc.kill()` 就 `self._proc = None`，
+        既没有 `wait()`（Windows 上留僵尸），也没关 `stdin/stdout/stderr`
+        （每次重建泄漏三个句柄）。
+        实测：修前 10 轮 reset 累积 30 个句柄；修后稳定在预热值。
+        """
+        from harness.tools.shell import ShellTool
+        ws = TempWorkspace()
+        tool = ShellTool(ws.path)
+        try:
+            sh = tool.shell
+            sh.ensure()
+            proc = sh._proc
+            self.assertIsNotNone(proc)
+            sh.kill()
+            self.assertIsNone(sh._proc)
+            # 管道确实被关了（已关闭的流再 read 会抛 ValueError）
+            for name in ("stdin", "stdout"):
+                h = getattr(proc, name, None)
+                if h is not None:
+                    self.assertTrue(h.closed, f"{name} 未关闭")
+            self.assertIsNotNone(proc.poll(), "进程应已退出")
+        finally:
+            tool.reset()
+            ws.cleanup()
+
+    def test_apply_patch_is_atomic_on_partial_failure(self):
+        """多文件补丁任一失败，前面已校验通过的文件也不得落盘。
+
+        审计核实过这条**当前成立**（先全量校验再统一写）。
+        写这个测试是为了防止将来有人为了"提前返回"而改掉顺序 ——
+        非原子补丁会让模型以为整体失败、磁盘上却已有半成品。
+        """
+        from harness.tools.patch import apply_patch
+        ws = TempWorkspace()
+        try:
+            ws.write("a.py", "x = 1\n")
+            ws.write("b.py", "y = 1\n")
+            r = apply_patch(ws.path, {"patch": (
+                "*** Begin Patch\n"
+                "*** Update File: a.py\n@@\n-x = 1\n+x = 2\n"
+                "*** Update File: b.py\n@@\n-这一行不存在\n+yy\n"
+                "*** End Patch")})
+            self.assertFalse(r.ok)
+            self.assertEqual(ws.read("a.py"), "x = 1\n",
+                             "a.py 不该被写 —— 补丁不是原子的")
+        finally:
+            ws.cleanup()
+
+
+# ══════════════════════════════════════════════════════════════════
+# SWE-bench Pro 基准跑出来的判定缺陷
+# ══════════════════════════════════════════════════════════════════
+# 这一组测试的每个用例都对应**在真实基准上实际失败过**的一次。
+# 它们的价值不是覆盖率，而是：这些缺陷在自造的干净用例里看不见，
+# 只有拿真实题目的 requirements 与路径才暴露。
+class TestBenchDiscoveredDefects(unittest.TestCase):
+    """真实基准上暴露过的判定缺陷不得回归。"""
+
+    def test_system_paths_are_not_treated_as_repo_files(self):
+        """requirements 里的系统路径与模块名，不算"仓库文件"。
+
+        **基准发现**：ansible 的 `mount_facts` 题，requirements 说
+        "must read `/etc/fstab`, `/proc/mounts`" —— 这些是模块**运行时读取**
+        的系统挂载点，不是要改的代码。提取器把它们当成目标文件，
+        于是 honest 用例被证书判成 `out_of_scope`（"写操作落在工作区之外"），
+        一个诚实完成被误拦。
+        """
+        from harness.intent import is_probable_file, mentioned_files
+        self.assertFalse(is_probable_file("/etc/fstab"))
+        self.assertFalse(is_probable_file("/proc/mounts"))
+        # Python 点分模块名不是文件
+        self.assertFalse(is_probable_file("ansible.module_utils.urls"))
+        self.assertFalse(is_probable_file("email.mime"))
+        # MIME 类型不是文件
+        self.assertFalse(is_probable_file("text/plain"))
+        # 真文件是
+        self.assertTrue(is_probable_file("src/groups/cover.js"))
+        self.assertTrue(is_probable_file("lib/ansible/module_utils/urls.py"))
+        # 提取时一并过滤
+        mf = mentioned_files(
+            "读取 /etc/fstab；从 ansible.module_utils.urls 导入；改 src/a.py")
+        self.assertEqual(mf, ["src/a.py"])
+
+    def test_write_must_touch_a_named_file(self):
+        """**写了，但写的不是该写的地方** → 证书必须拒。
+
+        **基准发现**：6 道真实题里 6 道全部放行 —— 因为证书只检查
+        "有没有写操作"，从不检查"写的位置对不对"。
+        这正是 BenchJack 记录的作弊形态：不改实现、改测试文件
+        （`conftest.py` 钩住 pytest 把结果改写成 passed）。
+        """
+        from harness.certificate import build_certificate
+        from harness.policy import SandboxMode
+        ws = TempWorkspace()
+        try:
+            cert = build_certificate(
+                prompt="修改 src/a.py，让它返回 a + b",
+                executions=[_cert_exec(4, "apply_patch", files=["test/test_a.py"])],
+                status="completed", sandbox=SandboxMode.WORKSPACE_WRITE,
+                workspace=ws.path,
+                answer="我已经修复了问题，测试通过。")
+            self.assertFalse(cert.ok,
+                             "只改了无关的测试文件却签发了证书")
+            self.assertIn("artifact_mismatch", cert.reason_codes())
+        finally:
+            ws.cleanup()
+
+    def test_named_file_match_tolerates_basename(self):
+        """`a.py` 与 `src/a.py` 是同一个文件，不该判成"没触及"。
+
+        **实测发现**：证书最初用严格相等，于是任务说 `a.py`、
+        agent 写出 `src/a.py` 时被判"写的不是该写的地方" ——
+        又一个诚实完成被误拦。
+        但也不能放宽到模糊匹配（`user.py` 不该匹配 `user_repository.py`），
+        否则上一道检查就失效了。
+        """
+        from harness.intent import path_covers
+        self.assertTrue(path_covers("a.py", "src/a.py"))
+        self.assertTrue(path_covers("src/a.py", "src/a.py"))
+        self.assertFalse(path_covers("user.py", "user_repository.py"))
+        self.assertFalse(path_covers("a.py", "b.py"))
+
+    def test_preflight_and_certificate_agree_on_path_matching(self):
+        """两处必须用同一套路径匹配规则。
+
+        各写一遍必然漂移 —— 本项目在写意图词上已经因此吃过一次，
+        路径匹配这次又在基准上吃了一次。
+        """
+        from harness.intent import path_covers
+        from harness.preflight import _covers
+        for want, got in [("a.py", "src/a.py"), ("src/a.py", "src/a.py"),
+                          ("user.py", "user_repository.py"), ("a.py", "b.py"),
+                          ("src/*.py", "src/a.py")]:
+            self.assertEqual(path_covers(want, got), _covers(want, got),
+                             f"「{want}」vs「{got}」两处判定不一致")
+
+
+# ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     unittest.main(verbosity=2)

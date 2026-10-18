@@ -29,12 +29,13 @@
 | `harness/policy.py` | 沙箱 × 审批 **9 格判定表** + 危险动作专项检查 |
 | `harness/tools/` | `registry` / `router` / `fs` / `search` / `patch`(V4A) / `shell` |
 | `harness/verify.py` | 只读结构化字段的验证 + 编辑后即时 lint + **目标证据绑定**（三态：satisfied/pending/unmatched） |
+| `harness/preflight.py` | **完成前检查**：收尾前对照任务规格核查「要求的动作是否真做过」（LangChain 实测 +13.7pp） |
 | `harness/correct.py` | 四级故障分类 + 熔断 + 重复指纹 + 看门狗 + 死亡螺旋防护 |
 | `harness/model.py` | **模型接入**：OpenAI 兼容端点（三字段）+ 连通性自检 + 离线 stub |
 | `harness/loop.py` | ReAct 主循环 + 五功能闭环 + 事件发射 |
 | `harness/server.py` | 零依赖 HTTP + SSE，同源托管前端 |
 | `harness/retention.py` | **类型化保留**：约束 verbatim 永不进摘要器（防压缩悬崖） |
-| `harness/test_harness.py` | **182 项测试**，每项标注书中出处 |
+| `harness/test_harness.py` | **207 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
 | `docs/harness-research-2026.md` | **2026 前沿调研**：ETCLOVG 七层、架构收敛、ECT、压缩悬崖、CapScope、Self-Harness、AHE |
 | `docs/harness-gap-diagnosis.md` | **差距诊断**：逐层读代码，含两个「空壳」实证 |
@@ -175,7 +176,7 @@ curl -X POST http://127.0.0.1:8787/api/run \
 ## 已验证
 
 **后端**（`python -m harness.test_harness`）
-- **182 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- **207 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
 - 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
   重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
 - 模型接入：地址归一化（中转站四种写法）、api_key 绝不回传明文、掩码可核对、
@@ -190,6 +191,12 @@ curl -X POST http://127.0.0.1:8787/api/run \
   未配置时自动走离线脚本 —— 全通过
 - **目标闸门（真实模型 deepseek-v4.1-flash）**：文件落盘 → `check/scope=goal newly_met`
   → `all_met:true` → `completed`；反向用例（要求创建但指示不动手）正确报 `all_met:false`
+- **完成前检查（真实模型）**：
+  · 误拦防线：正常任务 4 轮完成，`preflight blocks: 0`，理由「任务完成。」
+  · 拦住假完成：明示"只回答完成即可" → 拦下 `no_write_attempt` + `named_path_untouched`，
+    最终理由**如实列出缺口与依据**，不谎报完成
+  · 逼出真验证：要求「跑通测试」→ 模型自主建 `calc.py` + `test_calc.py`，
+    跑 unittest 拿到退出码 0，干净完成
 
 **前端**（CDP 探针，真实视口）
 - 12 档宽度（320/375/480/700/768/860/900/1024/1100/1280/1440/1600）横向溢出**全为 0**

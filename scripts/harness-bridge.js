@@ -212,6 +212,17 @@
             }),
           };
         }
+        // 完成前检查的通过事件（只有提醒、无硬缺口）
+        if (d.scope === "preflight" && d.ok) {
+          return {
+            kind: "check", state: "done", tsOffset: tsOffset,
+            title: "完成前检查通过（有提醒）",
+            model: "preflight",
+            items: (d.warnings || []).map(function (f) {
+              return { ok: true, warn: true, text: f.detail + " → " + f.remedy };
+            }).concat([{ ok: true, text: d.reason || "" }]),
+          };
+        }
         return {
           kind: "check", state: "done", tsOffset: tsOffset,
           title: goalScope ? "目标达成判定" : "工具结果验证",
@@ -259,6 +270,23 @@
         };
 
       case "error":
+        // 完成前检查的拦截：事件里的 **findings** 才是真正有用的信息
+        // （哪一条动作没发生、为什么、要补什么）。只显示 reason 会把
+        // 具体的缺口全丢掉，那就等于又变回一句笼统的"出错了"。
+        if (d.cls === "preflight_incomplete" && (d.findings || []).length) {
+          return {
+            kind: "check", state: "done", tsOffset: tsOffset,
+            title: "完成前检查：拦下 " + d.findings.length + " 项未做的动作",
+            model: "preflight",
+            items: d.findings.map(function (f) {
+              return {
+                ok: false,
+                text: f.detail + " → 要做的：" + f.remedy
+                  + ((f.evidence || []).length ? "（依据：" + f.evidence.join("；") + "）" : ""),
+              };
+            }),
+          };
+        }
         return {
           kind: "check", state: "done", tsOffset: tsOffset,
           title: "错误（" + (d.error_layer || "未知层") + "）",

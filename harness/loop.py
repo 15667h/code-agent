@@ -37,6 +37,7 @@ from .context import ContextBuilder, StaticPrefix
 from .correct import Corrector, Fault, FaultClass, LoopDetector, Watchdog, classify
 from .model import BaseModel, ModelReply
 from .policy import ApprovalPolicy, Policy, SandboxMode
+from .preflight import PreCompletionMiddleware, TraceFacts
 from .protocol import (
     ERR_API, ERR_CONTROL, ERR_TOOL, EventBus, EventType, Message, ROLE_TOOL,
     ToolCall, ToolResult,
@@ -77,6 +78,13 @@ class LoopConfig:
 
     # 即时 lint 开关（书 §5「即时语法反馈机制」）
     lint_after_edit: bool = True
+
+    # ── 完成前检查（LangChain PreCompletionChecklistMiddleware，实测 +13.7pp）──
+    # 在收尾前拦截，对照任务规格检查"要求的动作是否真的做过"。
+    # 上限取 2：与 goal / intent 两类纠正一致 —— 两次足够补一次漏掉的动作，
+    # 再多次说明模型确实做不到，继续问只会把任务拖成超时。
+    preflight_enabled: bool = True
+    preflight_max_rounds: int = 2
 
     # 是否在每轮推理前注入环境状态栏（书 §2 的 Agent Status Bar）。
     # 默认关闭以保持最纯粹的前缀稳定性，需要时显式打开 ——
@@ -162,11 +170,19 @@ class AgentLoop:
         # 上下文压缩计数（用于间隔与上限闸）
         self._compactions = 0
         self._last_compact_iter = -999
-        # 目标未达成时的纠正次数。上限 2（书 §5：每条恢复路径都要有上限）——
-        # 意图纠正那套的上限也是 2；两类纠正各自计数，互不挤占。
-        self._goal_retries = 0
+        # 目标未达成 / 完成前检查共用的纠正次数上限由 preflight 持有。
+        # 两道闸门共享同一个额度，因为它们回灌的是**同一份**反馈 ——
+        # 各自计上限会让总轮数翻倍。
         # 已经发过事件的目标条件（避免同一条重复刷屏）
         self._goal_announced: set = set()
+        # 完成前检查（LangChain 实测 +13.7pp 的那一项）。
+        # 它只在**收尾前**被问一次「真的可以结束了吗」。
+        self.preflight = PreCompletionMiddleware(session.meta.workspace,
+                                                max_rounds=self.cfg.preflight_max_rounds)
+        # 结构化事实：只记工具名/参数/ok/退出码/落盘清单。
+        # 不记模型文本 —— 记了就会有人忍不住去解析它。
+        self.facts = TraceFacts()
+        self._user_prompt = ""
 
     # ------------------------------------------------------------------
     # 主入口
@@ -193,6 +209,10 @@ class AgentLoop:
 
         m = self.context.append_user(user_message)
         self.session.persist_message(m)
+        # 记下任务文本：完成前检查要靠它判断"这类任务该做什么"。
+        # 这是**用户输入**，不是模型输出 —— 可信度与系统提示同级。
+        self._user_prompt = user_message
+        self.facts = TraceFacts()
 
         while True:
             # ── 全局终止条件（书 §5）──
@@ -307,44 +327,23 @@ class AgentLoop:
                         escalate=True,
                     )
 
-                if self.goal.conditions and not self.goal.report()["all_met"]:
-                    # 书 §5：「给出了回答」不等于「完成了任务」。
-                    #
-                    # 这里刻意**不是**直接终止 —— 早期版本一到这儿就收尾，
-                    # 结果是闸门只会"报告失败"而从不尝试补救。
-                    # 那比没有闸门更坏：它把未完成固化成了一条看起来
-                    # 很严谨的失败理由，人反而更容易接受它。
-                    #
-                    # 正确做法与 intent_without_action 同源：**把缺口作为反馈回灌**，
-                    # 让模型自己补。但上限同样是 2 —— 不能把闸门变成死循环。
-                    unmet = self.goal.unmet()
-                    unmatched = self.goal.unmatched()
-                    if self._goal_retries < 2:
-                        self._goal_retries += 1
-                        self.bus.emit(EventType.ERROR, error_layer=ERR_CONTROL,
-                                      cls="goal_unmet",
-                                      reason=f"还有 {len(unmet)} 条目标条件没有证据，"
-                                             "已把缺口作为反馈回灌，要求补齐。",
-                                      unmet=unmet, attempt=self._goal_retries)
-                        self._append_correction(
-                            "[这不是工具结果，是一条目标校验反馈] 你给出了最终回答，"
-                            f"但以下在开始时声明的目标条件**没有挂上任何工具证据**：\n"
-                            + "\n".join(f"  · {c}" for c in unmet)
-                            + ("\n（另有 " + str(len(unmatched)) + " 条条件无法自动判定，"
-                               "它们不计入上述缺口。）" if unmatched else "")
-                            + "\n请不要再只给结论：**实际调用工具**去完成这些条件，"
-                            "让它们在事件流里留下可复核的痕迹（落盘路径 / 退出码）。"
-                            "如果某条条件确实无法用工具达成，请明确说明原因。",
-                        )
+                # ── 收尾闸门：目标证据 + 完成前检查，合成一次的反馈 ──
+                #
+                # 书 §5：「给出了回答」不等于「完成了任务」。
+                #
+                # 这里刻意**不是**直接终止。早期版本一到这儿就收尾，结果是
+                # 闸门只会"报告失败"而从不尝试补救 —— 那比没有闸门更坏：
+                # 它把未完成固化成一条看起来严谨的失败理由，人反而更容易接受。
+                #
+                # 两道闸门（GoalVerifier 的目标缺口、PreCompletion 的动作缺口）
+                # **合并成一条**纠正消息发给模型。分开发两条会让模型只回应其中一条，
+                # 另一条被无声丢掉。
+                gate_reason = self._run_completion_gate(answer)
+                if gate_reason is not None:
+                    if gate_reason == "__retry__":
                         continue
-                    # 纠正次数用尽 → 如实报告未达成，绝不假装成功
-                    return self._finish(
-                        "completed",
-                        f"模型给出了最终回答，但以下在开始时声明的目标条件尚未满足：\n"
-                        + "\n".join(f"  · {c}" for c in unmet)
-                        + "\n回答内容如下，请自行判断是否可接受。",
-                        answer=answer,
-                    )
+                    return self._finish("completed", gate_reason, answer=answer)
+
                 return self._finish("completed", "任务完成。", answer=answer)
 
             # ── 执行工具（含审批闸门）──
@@ -353,6 +352,83 @@ class AgentLoop:
                 return suspended
 
         return self._finish("completed", "循环结束。")
+
+    # ------------------------------------------------------------------
+    # 收尾闸门
+    # ------------------------------------------------------------------
+    def _run_completion_gate(self, answer: str) -> Optional[str]:
+        """任务即将结束时跑一次检查。
+
+        返回值语义（用一个哨兵字符串区分"继续循环"与"收尾并说明原因"）：
+          · `None`        → 全部通过，可以正常收尾
+          · `"__retry__"` → 有缺口且还有纠正额度，已回灌，主循环应 continue
+          · 其它字符串     → 额度用尽，以这个理由收尾（如实报告，不假装完成）
+
+        这是 LangChain `PreCompletionChecklistMiddleware` 的落地
+        （实测 +13.7pp，是投入产出比最高的一环）。
+        """
+        if not self.cfg.preflight_enabled:
+            return None
+
+        unmet = self.goal.unmet() if self.goal.conditions else []
+
+        # 额度判断放在最前：用尽后不再回灌，直接如实报告。
+        # 两道闸门共享同一个上限（`preflight.max_rounds`），
+        # 因为它们回灌的是**同一份**反馈 —— 各自计上限会让总轮数翻倍。
+        #
+        # 这里**必须把 blocking 一起报出来**。早期实现只汇总了 warnings，
+        # 于是两次拦下的硬缺口被静默丢弃，最终理由居然报"任务完成。" ——
+        # 那正是本中间件要消灭的"假成功报告"，我自己犯了。
+        if self.preflight.exhausted:
+            rounds_used = self.preflight.rounds
+            cp = self.preflight.check(self._user_prompt, self.facts, None)
+            parts = []
+            if unmet:
+                parts.append("· 目标条件未满足：\n"
+                             + "\n".join(f"    - {c}" for c in unmet))
+            for f in cp.blocking:
+                parts.append(f"· {f.detail}\n"
+                             + ("    依据：" + "；".join(f.evidence) + "\n" if f.evidence else ""))
+            for f in cp.warnings:
+                parts.append(f"· （提醒）{f.detail}")
+            if not parts:
+                return None
+            return ("已尝试纠正 " + str(rounds_used) + " 次仍未补齐，"
+                    "以下在结束时检查出的缺口**未了结**：\n"
+                    + "\n".join(parts)
+                    + "\n回答内容如下，请自行判断是否可接受 —— "
+                      "harness **不声称任务已完成**。")
+
+        cp = self.preflight.check(self._user_prompt, self.facts, unmet)
+
+        if cp.ok and not cp.warnings:
+            # 干净通过 —— 这正是"判定器必须能在正确时放行"的那一面。
+            # 一个永远报警的闸门会退化成噪音（GoalVerifier 曾经就是这样）。
+            return None
+
+        # 只有警告、没有硬缺口：不拦，但**如实记一条事件**让人看见。
+        if cp.ok:
+            self.bus.emit(EventType.CHECK, scope="preflight", ok=True,
+                          warnings=[f.to_json() for f in cp.warnings],
+                          reason="完成前检查通过，但有提醒项。")
+            return None
+
+        # 有硬缺口 → 回灌纠正
+        self.preflight.note_round()
+        codes = [f.code for f in cp.blocking]
+        self.bus.emit(EventType.ERROR, error_layer=ERR_CONTROL,
+                      cls="preflight_incomplete",
+                      reason=f"完成前检查发现 {len(cp.blocking)} 项要求的动作没有发生，"
+                             "已把缺口作为反馈回灌。",
+                      findings=[f.to_json() for f in cp.blocking],
+                      attempt=self.preflight.rounds)
+
+        feedback = cp.feedback()
+        if cp.warnings:
+            feedback += ("\n\n（另有提醒，非阻断）\n"
+                         + "\n".join(f"  · {f.detail}" for f in cp.warnings))
+        self._append_correction(feedback)
+        return "__retry__"
 
     # ------------------------------------------------------------------
     # 模型调用（含重试）
@@ -472,6 +548,19 @@ class AgentLoop:
                 )
             else:
                 self._consecutive_failures = 0
+
+            # ── 记录结构化事实（完成前检查的输入）──
+            # 只记结构：工具名、参数、ok、退出码、落盘清单、错误类型。
+            # **不记任何模型文本** —— 这是 verify/preflight 共用的一条铁律。
+            self.facts.executions.append({
+                "tool": call.name,
+                "args": dict(call.args or {}),
+                "ok": bool(result.ok),
+                "exit_code": result.exit_code,
+                "files_changed": list(result.files_changed or []),
+                "side_effect": bool(result.side_effect),
+                "error_kind": (result.meta or {}).get("kind"),
+            })
 
             # ── 目标证据绑定（确定性，只吃结构化字段）──
             # 位置刻意在验证通过之后：**失败的工具输出不构成证据**。

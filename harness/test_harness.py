@@ -2368,10 +2368,16 @@ class TestGoalGateInLoop(unittest.TestCase):
         res = loop.run("把 a.py 改成 x = 2")
         self.assertEqual(res.status, "completed")
         self.assertTrue(res.goal["all_met"])
-        # 中间那轮纠正必须留下结构化事件（可追查"为什么多跑了一轮"）
+        # 中间那轮纠正必须留下结构化事件（可追查"为什么多跑了一轮"）。
+        # 注意事件类名是 `preflight_incomplete` 而不是 `goal_unmet` ——
+        # 目标缺口与完成前检查**共用同一道收尾闸门**，合并成一条反馈发出。
+        # 分开发两条会让模型只回应其中一条，另一条被无声丢掉。
         errs = [e for e in loop.bus.events()
-                if e.type == EventType.ERROR and e.data.get("cls") == "goal_unmet"]
+                if e.type == EventType.ERROR
+                and e.data.get("cls") in ("preflight_incomplete", "goal_unmet")]
         self.assertEqual(len(errs), 1, "应恰好回灌一次纠正")
+        self.assertIn("goal_unmet", [f["code"] for f in errs[0].data.get("findings", [])],
+                      "目标缺口必须出现在合并后的检查清单里")
 
     def test_correction_when_model_had_no_tool_calls(self):
         """**harness 的纠正不能伪装成工具结果。**
@@ -2431,9 +2437,12 @@ class TestGoalGateInLoop(unittest.TestCase):
         res = loop.run("改 a.py")
         self.assertEqual(res.status, "completed")
         self.assertFalse(res.goal["all_met"])
-        self.assertIn("尚未满足", res.reason)
+        # 措辞已统一到收尾闸门的"未了结"口径（目标缺口与完成前检查合并汇报）
+        self.assertIn("未了结", res.reason)
+        self.assertIn("目标条件未满足", res.reason)
         errs = [e for e in loop.bus.events()
-                if e.type == EventType.ERROR and e.data.get("cls") == "goal_unmet"]
+                if e.type == EventType.ERROR
+                and e.data.get("cls") in ("preflight_incomplete", "goal_unmet")]
         self.assertLessEqual(len(errs), 2, "纠正次数必须有上限")
         self.assertLess(res.iterations, 8, "闸门不得变成无限循环")
 
@@ -2518,6 +2527,370 @@ class TestGoalGateInLoop(unittest.TestCase):
         r = grep(self.ws.path, {"pattern": "needle"})
         self.assertTrue(r.ok)
         self.assertIn("snake/index.html", r.meta.get("matches") or [])
+
+
+# ══════════════════════════════════════════════════════════════════
+# 13. 完成前检查（PreCompletion，LangChain 实测 +13.7pp）
+# ══════════════════════════════════════════════════════════════════
+class TestPreCompletion(unittest.TestCase):
+    """在下游（loop）宣布"做完了"之前拦一次。
+
+    这是投入产出比最高的一环：LangChain 只加三个中间件就让 Terminal-Bench 2.0
+    从 52.8% → 66.5%（+13.7pp），模型一行没动。
+
+    设计上最要紧的两条：
+      1. **全部判据用结构化事实**（工具名/退出码/落盘清单/文件是否存在），
+         绝不解析模型文本。
+      2. **判定器必须先能在正确时放行**。GoalVerifier 曾经恒假、每次都报未达成，
+         闸门退化成噪音 —— 这里引以为戒：宁可漏检，不可误拦。
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        self.mw = None
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def _mw(self, **kw):
+        from harness.preflight import PreCompletionMiddleware
+        return PreCompletionMiddleware(self.ws.path, **kw)
+
+    def _facts(self, executions):
+        from harness.preflight import TraceFacts
+        f = TraceFacts()
+        f.executions = list(executions)
+        return f
+
+    def _exec(self, tool, ok=True, exit_code=None, files=None, args=None,
+              side_effect=True, kind=None):
+        return {"tool": tool, "args": args or {}, "ok": ok,
+                "exit_code": exit_code, "files_changed": files or [],
+                "side_effect": side_effect, "error_kind": kind}
+
+    # ---------- 任务意图识别 ----------
+    def test_intent_detection(self):
+        from harness.preflight import looks_like_edit_task, wants_verification, mentioned_paths
+        self.assertTrue(looks_like_edit_task("实现一个贪吃蛇游戏"))
+        self.assertTrue(looks_like_edit_task("fix the bug in parser"))
+        self.assertFalse(looks_like_edit_task("这个项目是做什么的？"))
+        self.assertTrue(wants_verification("改完要跑通测试"))
+        self.assertFalse(wants_verification("改一下配置"))
+        self.assertIn("snake/index.html", mentioned_paths("创建 snake/index.html"))
+
+    # ---------- 核心：说了要改但没动手 ----------
+    def test_blocks_when_no_write_happened(self):
+        """最典型、危害最大的形态：模型写一段"我已经改好了"，事件流里什么都没有。"""
+        cp = self._mw().check("把 a.py 里的 x 改成 2", self._facts([
+            self._exec("read_file", args={"path": "a.py"}, side_effect=False),
+        ]))
+        self.assertFalse(cp.ok)
+        self.assertIn("no_write_attempt", [f.code for f in cp.blocking])
+        # 反馈必须给出**具体做什么**，不能只说"请检查"
+        fb = cp.feedback()
+        self.assertIn("apply_patch", fb)
+
+    def test_passes_when_write_happened(self):
+        """**判定器必须能在正确时放行** —— 否则退化成噪音。"""
+        self.ws.write("a.py", "x = 2\n")
+        cp = self._mw().check("把 a.py 里的 x 改成 2", self._facts([
+            self._exec("apply_patch", files=["a.py"]),
+        ]))
+        self.assertTrue(cp.ok, f"已落盘却报未通过：{[f.code for f in cp.blocking]}")
+        self.assertEqual(cp.blocking, [])
+
+    def test_read_only_task_is_not_blocked(self):
+        """读类任务不该被写检查误拦（保守取向：宁可漏检）。"""
+        cp = self._mw().check("这个项目的入口文件是哪个？", self._facts([
+            self._exec("glob", side_effect=False),
+            self._exec("read_file", args={"path": "main.py"}, side_effect=False),
+        ]))
+        self.assertTrue(cp.ok, "读类任务不得被写检查拦住")
+
+    # ---------- 写失败 ----------
+    def test_blocks_when_writes_all_failed(self):
+        """**试过但全失败** 要区别对待"没试" —— 前者更易被误当成"做成了"。"""
+        cp = self._mw().check("把 a.py 改掉", self._facts([
+            self._exec("apply_patch", ok=False, kind="no_unique_match"),
+            self._exec("apply_patch", ok=False, kind="parse_error"),
+        ]))
+        self.assertFalse(cp.ok)
+        self.assertIn("writes_all_failed", [f.code for f in cp.blocking])
+        # 补救指示要具体到"读回当前内容"这个动作
+        self.assertIn("read_file", cp.feedback())
+
+    def test_partial_success_is_not_blocked(self):
+        """一次失败一次成功 → 不拦（已经有落盘，任务能推进）。"""
+        self.ws.write("a.py", "x = 2\n")
+        cp = self._mw().check("改 a.py", self._facts([
+            self._exec("apply_patch", ok=False, kind="no_unique_match"),
+            self._exec("apply_patch", files=["a.py"]),
+        ]))
+        self.assertTrue(cp.ok)
+
+    # ---------- 验证缺失 / 失败 ----------
+    def test_warns_when_no_verification(self):
+        """改了代码没跑验证、**用户也没要求** → 警告而非阻断。
+
+        强行 block 会制造大量假失败：改文档、改配置确实没有可跑的验证。
+        假失败会让整道闸门退化成噪音（GoalVerifier 曾经就是这样）。
+        """
+        self.ws.write("a.py", "x = 2\n")
+        cp = self._mw().check("实现新功能", self._facts([
+            self._exec("apply_patch", files=["a.py"]),
+        ]))
+        self.assertTrue(cp.ok, "无验证只应是警告，不该阻断")
+        self.assertIn("no_verification", [f.code for f in cp.warnings])
+
+    def test_blocks_when_user_demanded_verification(self):
+        """用户**明确写了**要跑通验证 → 那就成了用户的完成标准，该拦。
+
+        与上一条的区别只有任务文本。这是「严重度分档」的核心：
+        标准是用户定的，不是我们替用户立规矩。
+        """
+        self.ws.write("a.py", "x = 2\n")
+        cp = self._mw().check("实现新功能，并跑通测试", self._facts([
+            self._exec("apply_patch", files=["a.py"]),
+        ]))
+        self.assertFalse(cp.ok)
+        f = next(f for f in cp.blocking if f.code == "no_verification")
+        self.assertIn("用户明确要求验证", "；".join(f.evidence))
+
+    def test_lint_alone_is_not_verification(self):
+        """**只有 apply_patch 自带的语法 lint 不算验证。**
+
+        早期实现把 lint 当成"有验证"，于是"改了文件但没跑测试"这条
+        警告被整个吞掉 —— 正好放走这道闸门最想抓的场景。
+        lint 证明"文件能被解析"，不证明"改动的行为是对的"。
+        """
+        self.ws.write("a.py", "x = 2\n")
+        cp = self._mw().check("实现新功能", self._facts([
+            self._exec("apply_patch", files=["a.py"]),
+        ]))
+        self.assertIn("no_verification", [f.code for f in cp.warnings],
+                      "仅有语法 lint 不得被当作验证证据")
+
+    def test_blocks_when_verification_never_passed(self):
+        """验证跑了但**一次都没通过**就宣布完成 —— 这条最容易被忽略。
+
+        事件流里有 pytest、有输出，看着"验证过了"，但退出码非 0。
+        书 §5 把"测试通过"而非"代码写完"定义成完成标准。
+        """
+        self.ws.write("a.py", "x = 2\n")
+        cp = self._mw().check("修好这个测试", self._facts([
+            self._exec("apply_patch", files=["a.py"]),
+            self._exec("shell", exit_code=1, args={"command": "python -m pytest -q"}),
+        ]))
+        self.assertFalse(cp.ok)
+        self.assertIn("verification_not_passing", [f.code for f in cp.blocking])
+
+    def test_passing_verification_clears_it(self):
+        self.ws.write("a.py", "x = 2\n")
+        cp = self._mw().check("修好这个测试", self._facts([
+            self._exec("apply_patch", files=["a.py"]),
+            self._exec("shell", exit_code=1, args={"command": "pytest -q"}),
+            self._exec("shell", exit_code=0, args={"command": "pytest -q"}),
+        ]))
+        self.assertTrue(cp.ok, "有通过的验证后不应再拦")
+
+    # ---------- 点名文件 ----------
+    def test_blocks_when_named_path_missing(self):
+        """任务点名要处理的文件既不在磁盘上、也没被写过。"""
+        cp = self._mw().check("创建 snake/index.html", self._facts([
+            self._exec("list_dir", side_effect=False),
+        ]))
+        self.assertFalse(cp.ok)
+        codes = [f.code for f in cp.blocking]
+        self.assertIn("named_path_untouched", codes)
+        # 召回证据要落在那条 finding 上，不是靠"第一条碰巧是它"
+        f = next(f for f in cp.blocking if f.code == "named_path_untouched")
+        self.assertIn("snake/index.html", f.evidence)
+
+    def test_named_path_existing_is_ok(self):
+        """点名文件已存在（改已存在的文件）→ 不该拦。"""
+        self.ws.write("snake/index.html", "<html></html>\n")
+        cp = self._mw().check("修改 snake/index.html", self._facts([
+            self._exec("apply_patch", files=["snake/index.html"]),
+        ]))
+        self.assertTrue(cp.ok)
+
+    def test_named_path_covered_by_basename(self):
+        """任务写 `index.html`、实际落盘 `snake/index.html` → 视为已覆盖。"""
+        cp = self._mw().check("创建 index.html", self._facts([
+            self._exec("apply_patch", files=["snake/index.html"]),
+        ]))
+        self.assertTrue(cp.ok, f"basename 兜底失效：{[f.code for f in cp.blocking]}")
+
+    # ---------- 目标缺口合并 ----------
+    def test_goal_gap_is_merged_into_same_feedback(self):
+        """目标缺口与动作缺口要合成**一条**反馈。
+
+        分开发两条会让模型只回应其中一条，另一条被无声丢掉。
+        """
+        cp = self._mw().check("改 a.py", self._facts([]),
+                              goal_unmet=["修改 a.py"])
+        codes = [f.code for f in cp.blocking]
+        self.assertIn("goal_unmet", codes)
+        self.assertIn("no_write_attempt", codes)
+        fb = cp.feedback()
+        # 一条消息里必须同时出现两者
+        self.assertIn("修改 a.py", fb)
+        self.assertIn("apply_patch", fb)
+
+    # ---------- 额度 ----------
+    def test_rounds_have_a_hard_cap(self):
+        mw = self._mw(max_rounds=2)
+        self.assertFalse(mw.exhausted)
+        mw.note_round(); self.assertFalse(mw.exhausted)
+        mw.note_round(); self.assertTrue(mw.exhausted)
+
+    def test_workspace_escape_path_is_ignored(self):
+        """越界路径交给 policy 层管，中间件不该在这里判 —— 避免职责重叠。"""
+        cp = self._mw().check("创建 ../outside.txt", self._facts([]))
+        # 越界路径不解析 → 不会产生 named_path_untouched；
+        # 但写意图仍在 → 会因没动手而拦
+        self.assertIn("no_write_attempt", [f.code for f in cp.blocking])
+        self.assertNotIn("named_path_untouched", [f.code for f in cp.blocking])
+
+
+class TestPreCompletionInLoop(unittest.TestCase):
+    """中间件接进主循环后的端到端行为。"""
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        self.ws.write("src/a.py", "x = 1\n")
+        self.reg, self.shell = build_default_registry(self.ws.path)
+
+    def tearDown(self):
+        self.shell.reset()
+        self.ws.cleanup()
+
+    def _loop(self, script, **cfg):
+        from harness.loop import AgentLoop, LoopConfig
+        prefix = StaticPrefix("你是测试 agent。", self.reg.specs())
+        sess = Session(self.ws.path, "scripted", "stub", "workspace-write", "on-request")
+        pol = Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST, self.ws.path)
+        return AgentLoop(ScriptedModel(script), self.reg, prefix, pol, sess,
+                         LoopConfig(**cfg) if cfg else None), sess
+
+    def test_blocks_edit_task_with_no_action_then_completes(self):
+        """**这就是 +13.7pp 要修的场景**：
+
+        模型第一轮就宣布"我改好了"（什么都没做），
+        没有中间件时循环会立刻 `completed`，最终回答读起来毫无破绽。
+        """
+        loop, _ = self._loop([
+            final_reply("我已经把 src/a.py 里的 x 改成 2 了。"),
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("现在确实改好了。"),
+        ])
+        res = loop.run("把 src/a.py 里的 x 改成 2")
+        self.assertEqual(res.status, "completed")
+        self.assertIn("x = 2", self.ws.read("src/a.py"),
+                      "中间件必须逼出真正的落盘动作")
+        errs = [e for e in loop.bus.events()
+                if e.type == EventType.ERROR and e.data.get("cls") == "preflight_incomplete"]
+        self.assertEqual(len(errs), 1)
+        self.assertIn("no_write_attempt",
+                      [f["code"] for f in errs[0].data["findings"]])
+
+    def test_does_not_block_a_genuine_done_task(self):
+        """**关键的反向用例**：任务真的做完了 → 中间件必须放行。
+
+        GoalVerifier 曾经恒假、每次都报未达成，闸门退化成噪音。
+        这里要确保不重犯：多跑一轮都算回归。
+        """
+        loop, _ = self._loop([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("改好了。"),
+        ])
+        res = loop.run("把 src/a.py 里的 x 改成 2")
+        self.assertEqual(res.status, "completed")
+        self.assertEqual(res.iterations, 2, "任务已完成，不得凭空多跑一轮")
+        self.assertEqual(res.reason, "任务完成。",
+                         f"不该报未完成，实际：{res.reason}")
+        errs = [e for e in loop.bus.events()
+                if e.type == EventType.ERROR and e.data.get("cls") == "preflight_incomplete"]
+        self.assertEqual(errs, [], "任务真的做完了就不该被拦")
+
+    def test_read_only_task_not_blocked_in_loop(self):
+        """纯问答任务不得被完成前检查拦。"""
+        loop, _ = self._loop([final_reply("入口文件是 src/a.py。")])
+        res = loop.run("这个项目的入口文件是哪个？")
+        self.assertEqual(res.status, "completed")
+        self.assertEqual(res.iterations, 1)
+
+    def test_retry_has_a_cap(self):
+        """反复不干活 → 有上限，最后如实报告，不假装完成。"""
+        loop, _ = self._loop([
+            final_reply("改好了。"), final_reply("真的改好了。"),
+            final_reply("确实改好了。"), final_reply("反正改好了。"),
+        ])
+        res = loop.run("把 src/a.py 里的 x 改成 2")
+        self.assertEqual(res.status, "completed")
+        errs = [e for e in loop.bus.events()
+                if e.type == EventType.ERROR and e.data.get("cls") == "preflight_incomplete"]
+        self.assertLessEqual(len(errs), 2, "纠正次数必须有硬上限")
+        self.assertLess(res.iterations, 8, "闸门不得变成无限循环")
+
+    def test_exhausted_budget_still_reports_the_gap(self):
+        """**额度用尽时必须把缺口报出来，不能说"任务完成"。**
+
+        实测踩到的真 bug：额度用尽那个分支只汇总了 warnings，
+        blocking 被静默丢弃，于是最终理由报的是"任务完成。" ——
+        这恰恰是本中间件要消灭的"假成功报告"，我自己犯了。
+        所以用断言把"理由里必须出现缺口"钉死。
+        """
+        loop, _ = self._loop([
+            final_reply("改好了。"), final_reply("真的改好了。"),
+            final_reply("确实改好了。"),
+        ])
+        res = loop.run("把 src/a.py 里的 x 改成 2")
+        self.assertNotEqual(res.reason, "任务完成。",
+                            "有未了结的硬缺口时不得声称任务完成")
+        self.assertIn("未了结", res.reason)
+        self.assertIn("没有任何写操作", res.reason,
+                      "缺口的**具体内容**必须出现在理由里，不能只给个笼统说法")
+        self.assertFalse(os.path.exists(os.path.join(self.ws.path, "src", "a.py.changed")),
+                         "模型并没有真的动手")
+
+    def test_no_false_block_on_genuine_completion(self):
+        """**误拦防线**：任务真做完了 → 理由必须是干净的"任务完成。"
+
+        GoalVerifier 曾经恒假、每次都报未达成，闸门退化成噪音。
+        这条测试保证不重犯：干净完成必须得到干净的理由。
+        """
+        loop, _ = self._loop([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("改好了。"),
+        ], preflight_max_rounds=2)
+        res = loop.run("把 src/a.py 里的 x 改成 2")
+        self.assertEqual(res.reason, "任务完成。")
+        self.assertEqual(res.iterations, 2)
+
+    def test_disabled_by_config(self):
+        """开关关闭时中间件完全透明（便于排查"是不是它拦的"）。"""
+        loop, _ = self._loop([final_reply("改好了。")], preflight_enabled=False)
+        res = loop.run("把 src/a.py 里的 x 改成 2")
+        self.assertEqual(res.iterations, 1)
+        self.assertEqual(res.reason, "任务完成。")
+
+    def test_facts_only_record_structured_fields(self):
+        """TraceFacts 里**不得**出现模型文本 —— 记了就会有人去解析它。"""
+        loop, _ = self._loop([
+            tool_call_reply("read_file", {"path": "src/a.py"}, "我先读一下这个文件看看。" * 5),
+            final_reply("看完了。"),
+        ])
+        loop.run("看看 src/a.py")
+        import json as _json
+        blob = _json.dumps(loop.facts.executions, ensure_ascii=False)
+        for key in ("content", "reasoning", "text"):
+            self.assertNotIn(f'"{key}"', blob,
+                             f"TraceFacts 记录了 {key} —— 那就等于允许解析模型输出")
+        self.assertIn("read_file", blob)
 
 
 # ══════════════════════════════════════════════════════════════════

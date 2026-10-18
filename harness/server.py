@@ -398,6 +398,10 @@ class Handler(BaseHTTPRequestHandler):
                 max_iterations=int(body.get("max_iterations") or 25),
                 lint_after_edit=bool(body.get("lint_after_edit", True)),
                 inject_status=bool(body.get("inject_status", True)),
+                # 完成前检查默认开启（LangChain 实测 +13.7pp）。
+                # 留出关闭入口，便于排查"是不是这道闸门拦的"。
+                preflight_enabled=bool(body.get("preflight_enabled", True)),
+                preflight_max_rounds=int(body.get("preflight_max_rounds") or 2),
             )
             try:
                 st = create_run(

@@ -51,6 +51,11 @@ temp/
 .workbuddy/video-tools/
 # 演示工作区与验收脚本：一次性产物
 .workbuddy/demo/
+# 一次性端到端验证脚本与其工作区（pf_check*.py 之类）。
+# 它们验证完就没用了，留着只会污染 git status —— 关键是会掩盖真实改动。
+.workbuddy/*.py
+.workbuddy/pf-e2e*/
+.workbuddy/goal-e2e/
 
 # ---- harness 运行时产物 ----
 # 会话落盘（trajectory / events / meta）与工具产出的 artifacts，

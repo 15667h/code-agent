@@ -219,12 +219,28 @@ def run_one(task: Dict[str, Any], *, model, sandbox_mode, max_iter: int = 20,
         except Exception as e:      # noqa: BLE001
             box["e"] = f"{type(e).__name__}: {e}"
     t0 = time.time()
-    th = threading.Thread(target=go)
+    # ## `daemon=True` 不是随手加的，是实测踩出来的
+    #
+    # 第一版用普通线程 + `join(timeout)`。看起来超时机制是有效的，
+    # 实际上**进程根本不会退出** —— `threading.Thread` 默认非守护，
+    # 主线程 join 超时返回后仍会等所有非守护线程结束，
+    # 而那个线程里的 agent 还在继续调模型（可能几百轮）。
+    #
+    # 实测：设了 900s 超时，21 分钟后进程仍然活着，5 → 30 个线程只增不减。
+    # 症状极具迷惑性：脚本"看起来在跑"，只是永远不结束。
+    #
+    # 修法两条：
+    #   · `daemon=True` —— 主线程结束时它不该拖住进程
+    #   · 超时后**明确标记并继续**，而不是假装它在跑
+    th = threading.Thread(target=go, daemon=True)
     th.start()
     th.join(timeout=timeout_s)
     m.duration_s = time.time() - t0
     if th.is_alive():
-        m.note = f"超时（>{timeout_s}s）"
+        # 如实记录：这次运行的指标不完整，因为任务没跑完就被切断了。
+        # 不把它算作"完成"，也不猜它接下来会做什么。
+        m.note = (m.note + " | " if m.note else "") + \
+            f"超时（>{timeout_s}s）未结束，指标不完整"
     if "e" in box:
         m.note = (m.note + " | " if m.note else "") + f"异常：{box['e']}"
 

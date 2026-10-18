@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .chain import HashChain, verify_chain
 from .context import ContextBuilder
 from .protocol import Event, EventBus, Message, Trajectory
 
@@ -38,6 +39,11 @@ class SessionMeta:
     created_at: float = field(default_factory=time.time)
     prefix_hash: str = ""
     tool_order: List[str] = field(default_factory=list)
+    # 对外暴露的运行 id（HTTP 层用它，session_id 是内部落盘目录名）。
+    # **必须落盘**：否则进程重启后 `RUNS`（内存态）一清空，
+    # 外部拿着 run_id 就再也找不到对应的运行目录 ——
+    # 而"外部核验"的前提恰恰是**不依赖产生它的进程还活着**（实测踩到）。
+    run_id: str = ""
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -50,6 +56,7 @@ class SessionMeta:
             "created_at": self.created_at,
             "prefix_hash": self.prefix_hash,
             "tool_order": self.tool_order,
+            "run_id": self.run_id,
         }
 
 
@@ -64,12 +71,15 @@ class Session:
 
     def __init__(self, workspace: str, model: str, provider: str,
                  sandbox: str, approval: str,
-                 run_dir: Optional[str] = None) -> None:
+                 run_dir: Optional[str] = None,
+                 chain_enabled: bool = True,
+                 run_id: str = "") -> None:
         self.meta = SessionMeta(
             session_id=uuid.uuid4().hex[:12],
             workspace=os.path.realpath(workspace),
             model=model, provider=provider,
             sandbox=sandbox, approval=approval,
+            run_id=run_id,
         )
         self.bus = EventBus(turn_id=self.meta.session_id)
         self.context: Optional[ContextBuilder] = None
@@ -78,6 +88,11 @@ class Session:
         self._traj_path = os.path.join(self.run_dir, "trajectory.jsonl")
         self._meta_path = os.path.join(self.run_dir, "meta.json")
         os.makedirs(self.run_dir, exist_ok=True)
+
+        # 事件哈希链（防篡改可核验记录）。
+        # 为什么默认开：它必须先在场才有意义 —— 事后补不上"当时没写"的锚点。
+        # 代价是每条事件多一次 hash（微秒级）与一次链头原子写。
+        self.chain = HashChain(self.run_dir, enabled=chain_enabled)
 
         # 事件一旦产生就落盘（append-only），不攒批 —— 崩溃也不丢
         self.bus.subscribe(self._persist_event)
@@ -91,13 +106,32 @@ class Session:
 
     # ---------- 落盘 ----------
     def _persist_event(self, ev: Event) -> None:
+        """写一条事件，并把它接进哈希链。
+
+        **hash 必须与事件在同一行、同一次写入完成。** 分成两次写会造出一个
+        "事件已落盘、链头还没落盘"的窗口：崩溃时那段事件无法被核验，
+        而核验器无法区分"那时候还没写"与"被人删掉了"。
+        """
         try:
+            record = ev.to_json()
+            if self.chain.enabled:
+                prev = self.chain.head
+                record["prev_hash"] = prev
+                record["hash"] = self.chain.next_hash(record)
+                # 链头每次刷新：崩溃后仍有可比的锚点。
+                # 原子替换（见 chain.write_head）保证不会留下半个文件。
+                self.chain.write_head()
             with open(self._events_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(ev.to_json(), ensure_ascii=False) + "\n")
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError:
             # 落盘失败不能影响主循环（书 §5：错误路径上禁用副作用逻辑）。
             # 但它是一次真实的数据丢失风险，因此记录在内存里供上层检查。
             self._persist_failures = getattr(self, "_persist_failures", 0) + 1
+
+    # ---------- 完整性 ----------
+    def verify_events(self) -> Dict[str, Any]:
+        """核验本次运行的事件链未被篡改。"""
+        return verify_chain(self.run_dir)
 
     def persist_message(self, msg: Message) -> None:
         try:
@@ -131,6 +165,10 @@ class Session:
             "trajectory_len": len(self.read_trajectory()),
             "prefix_hash": self.meta.prefix_hash,
             "persist_failures": getattr(self, "_persist_failures", 0),
+            # 链状态随摘要一起暴露：审计信息不该藏在需要额外调用的地方
+            "chain_enabled": self.chain.enabled,
+            "chain_head": self.chain.head if self.chain.enabled else None,
+            "chain_errors": self.chain.errors,
         }
 
 

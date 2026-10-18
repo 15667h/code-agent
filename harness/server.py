@@ -32,6 +32,7 @@ from urllib.parse import urlparse, parse_qs, quote
 # 后者没有父包，相对导入会失败，所以这里补上包路径再统一用绝对导入。
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from harness.chain import verify_all, verify_chain
     from harness.context import DEFAULT_SYSTEM_PROMPT, StaticPrefix
     from harness.loop import AgentLoop, LoopConfig, build_default_registry
     from harness.model import (ENV_API_KEY, ENV_BASE_URL, ENV_MODEL, EndpointConfig,
@@ -42,6 +43,7 @@ if __package__ in (None, ""):
     from harness.protocol import Event, EventBus, EventType
     from harness.session import Session, list_runs
 else:
+    from .chain import verify_all, verify_chain
     from .context import DEFAULT_SYSTEM_PROMPT, StaticPrefix
     from .loop import AgentLoop, LoopConfig, build_default_registry
     from .model import (ENV_API_KEY, ENV_BASE_URL, ENV_MODEL, EndpointConfig,
@@ -179,7 +181,10 @@ def create_run(workspace: str, prompt: str,
     else:
         model = HttpModel(ep, model_name or ep.model)
 
-    session = Session(workspace, model.name, ep.name, sbx.value, ap.value)
+    # run_id 一并落盘：进程重启后仍能用它找到运行目录并核验事件链。
+    # 不传的话，`RUNS` 一清空，外部拿着 run_id 就再也找不到对应目录了。
+    session = Session(workspace, model.name, ep.name, sbx.value, ap.value,
+                      run_id=run_id)
 
     registry, shell = build_default_registry(workspace)
 
@@ -301,6 +306,43 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # ---------- 工具 ----------
+    def _find_run_dir(self, run_id: str) -> Optional[str]:
+        """按 run_id 找出它的落盘目录。
+
+        为什么需要它：`RUNS` 是内存态，进程重启就没了。但哈希链的价值恰恰是
+        **不依赖产生它的那个进程还活着** —— 只要 run 目录还在，任何人都能核验。
+        所以核验端点必须能在没有 RunState 的情况下工作。
+
+        匹配顺序：meta.json 里的 run_id → 目录名 → session_id。
+        最先查 run_id 是因为那才是**对外**的标识（session_id 是内部落盘目录名，
+        两者独立生成，实测过拿 run_id 去匹配目录名匹配不上）。
+        """
+        if not run_id or "/" in run_id or "\\" in run_id or run_id.startswith("."):
+            return None              # 拒绝路径穿越
+        root = os.path.join(os.path.realpath(default_workspace()),
+                            ".crucible", "runs")
+        if not os.path.isdir(root):
+            return None
+
+        metas: List[tuple] = []
+        for name in os.listdir(root):
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            if name == run_id or name.startswith(run_id):
+                return d
+            mp = os.path.join(d, "meta.json")
+            if os.path.isfile(mp):
+                try:
+                    with open(mp, "r", encoding="utf-8") as f:
+                        m = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if m.get("run_id") == run_id or m.get("session_id") == run_id:
+                    return d
+                metas.append((m.get("created_at") or 0, d))
+        return None
+
     def _json(self, code: int, obj: Any) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -344,6 +386,25 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- 路由 ----------
     def do_GET(self):
+        # 兜住一切未预期的异常。
+        # 为什么必须有：没有它时，路由里任何一处抛错都会**静默产生空响应**，
+        # 客户端只看到 "Expecting value: line 1 column 1" —— 一个不含任何
+        # 诊断信息的症状。实测排查这个花了很久，而真因只是一条 KeyError。
+        # 错误必须可见：把异常类型与消息如实返回。
+        try:
+            return self._route_get()
+        except Exception as e:      # noqa: BLE001 —— 路由兜底就是要捕一切
+            import traceback
+            try:
+                self._json(500, {
+                    "error": f"{type(e).__name__}: {e}",
+                    "path": self.path,
+                    "traceback": traceback.format_exc()[-1200:],
+                })
+            except Exception:
+                pass
+
+    def _route_get(self):
         u = urlparse(self.path)
         path = u.path
         q = parse_qs(u.query)
@@ -379,12 +440,52 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/run/") and path.endswith("/events"):
             return self._sse(path.split("/")[3])
 
+        # ── 事件链核验（防篡改可核验记录）──
+        # 这是"外部可核验"的落点：任何人拿到这份 JSON 就能离线重算，
+        # 不需要信任本进程、也不需要密钥。
+        if path.startswith("/api/run/") and path.endswith("/verify-chain"):
+            rid = path.split("/")[3]
+            st = RUNS.get(rid)
+            if st is not None and st.session is not None:
+                return self._json(200, st.session.verify_events())
+            # 进程可能已重启（RUNS 是内存态）→ 退回按目录核验，
+            # 只要 run 目录还在就仍可核验 —— 这正是哈希链的价值：
+            # **不依赖产生它的那个进程还活着**。
+            # 注意用**顶部**导入的 verify_chain：局部 `from .chain import`
+            # 在脚本直跑模式（`python harness/server.py`）下会
+            # ImportError: attempted relative import with no known parent package。
+            run_dir = self._find_run_dir(rid)
+            if run_dir is None:
+                return self._json(404, {"error": "run not found"})
+            return self._json(200, verify_chain(run_dir))
+
+        if path == "/api/verify-chains":
+            ws = (q.get("workspace") or [default_workspace()])[0]
+            runs_root = os.path.join(os.path.realpath(ws), ".crucible", "runs")
+            return self._json(200, verify_all(runs_root))
+
         # 静态：根路径给前端
         if path in ("/", "/index.html"):
             return self._static("index.html")
         return self._static(path)
 
     def do_POST(self):
+        # 与 do_GET 同样的兜底：任何异常都必须变成可见的错误响应，
+        # 不能是空响应（空响应的症状里不含任何诊断信息）。
+        try:
+            return self._route_post()
+        except Exception as e:      # noqa: BLE001
+            import traceback
+            try:
+                self._json(500, {
+                    "error": f"{type(e).__name__}: {e}",
+                    "path": self.path,
+                    "traceback": traceback.format_exc()[-1200:],
+                })
+            except Exception:
+                pass
+
+    def _route_post(self):
         u = urlparse(self.path)
         path = u.path
         body = self._read_body()

@@ -2894,5 +2894,391 @@ class TestPreCompletionInLoop(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 14. 哈希链记录（防篡改可核验，arXiv 2608.23953 点名的行业空白点）
+# ══════════════════════════════════════════════════════════════════
+class TestHashChain(unittest.TestCase):
+    """`events.jsonl` 已解决"顺序"，但没解决"完整性"：
+
+    `seq` 有单调保证，**但任何一行都可以被编辑而不留痕迹**。
+    一份可以被无声改写的记录，在审计场景里等于没有。
+
+    这里逐项验证：**每一种篡改都必须被检出，而正常情况必须干净通过**。
+    后半句同样重要 —— 假警报会让核验机制退化成噪音
+    （本项目在 GoalVerifier 上已经吃过一次这个教训）。
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        self.sess = None
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def _emit(self, n=6):
+        from harness.session import Session
+        from harness.protocol import EventType
+        self.sess = Session(self.ws.path, "m", "stub", "workspace-write", "on-request")
+        for i in range(n):
+            self.sess.bus.emit(EventType.MESSAGE, text=f"msg {i}", idx=i)
+        return self.sess
+
+    def _tamper(self, lines, name):
+        """用给定的事件行构造一个被篡改的运行目录（链头保持原样）。"""
+        from harness import chain as C
+        d = os.path.join(self.ws.path, "tamper-" + name)
+        os.makedirs(d, exist_ok=True)
+        # 链头故意保留原值 —— 这样"改完内容还能蒙过"才算真的漏洞
+        shutil.copy(os.path.join(self.sess.run_dir, C.CHAIN_FILE),
+                    os.path.join(d, C.CHAIN_FILE))
+        with open(os.path.join(d, C.EVENTS_FILE), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return d
+
+    def _lines(self):
+        with open(os.path.join(self.sess.run_dir, "events.jsonl"),
+                  encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    # ---------- 核心：正常必须干净通过 ----------
+    def test_clean_chain_verifies(self):
+        """**判定器必须能在正确时通过** —— 否则退化成噪音。"""
+        from harness.chain import verify_chain
+        self._emit()
+        r = verify_chain(self.sess.run_dir)
+        self.assertTrue(r["ok"], f"干净链被误报：{r['problems']}")
+        self.assertEqual(r["problems"], [])
+        self.assertEqual(r["checked"], 6)
+        self.assertEqual(r["stored_head"], self.sess.chain.head)
+
+    def test_every_event_carries_hash(self):
+        """每条事件都必须带 prev_hash 与 hash，且首条的 prev 是创世值。"""
+        from harness.chain import GENESIS
+        self._emit(3)
+        recs = self.sess.read_events()
+        self.assertEqual(recs[0]["prev_hash"], GENESIS)
+        for r in recs:
+            self.assertEqual(len(r["hash"]), 64, "hash 应为 SHA-256 十六进制")
+            self.assertEqual(len(r["prev_hash"]), 64)
+
+    def test_chain_is_linked(self):
+        """第 n 条的 prev_hash 必须等于第 n-1 条的 hash。"""
+        self._emit(5)
+        recs = self.sess.read_events()
+        for i in range(1, len(recs)):
+            self.assertEqual(recs[i]["prev_hash"], recs[i - 1]["hash"],
+                             f"第 {i} 条与前一条没有链接上")
+
+    # ---------- 逐种篡改 ----------
+    def test_detects_content_edit(self):
+        """改写某条内容 → 必须检出（且从该条起级联断裂）。"""
+        from harness.chain import verify_chain
+        self._emit()
+        ls = self._lines()
+        rec = json.loads(ls[2]); rec["data"]["text"] = "已被改写"
+        ls[2] = json.dumps(rec, ensure_ascii=False)
+        r = verify_chain(self._tamper(ls, "content"))
+        self.assertFalse(r["ok"])
+        kinds = [p["kind"] for p in r["problems"]]
+        self.assertIn("content_tampered", kinds)
+        self.assertIn("prev_mismatch", kinds, "改写必须级联影响后续链接")
+        self.assertIn("head_mismatch", kinds)
+
+    def test_detects_deletion(self):
+        from harness.chain import verify_chain
+        self._emit()
+        ls = self._lines()
+        r = verify_chain(self._tamper(ls[:3] + ls[4:], "del"))
+        self.assertFalse(r["ok"])
+        kinds = sorted({p["kind"] for p in r["problems"]})
+        self.assertIn("seq_gap", kinds)
+        self.assertIn("count_mismatch", kinds)
+
+    def test_detects_insertion(self):
+        from harness.chain import verify_chain
+        self._emit()
+        ls = self._lines()
+        r = verify_chain(self._tamper(ls[:2] + [ls[1]] + ls[2:], "ins"))
+        self.assertFalse(r["ok"])
+        kinds = sorted({p["kind"] for p in r["problems"]})
+        self.assertIn("seq_gap", kinds)
+
+    def test_detects_reordering(self):
+        from harness.chain import verify_chain
+        self._emit()
+        ls = self._lines()
+        ls[2], ls[3] = ls[3], ls[2]
+        r = verify_chain(self._tamper(ls, "reorder"))
+        self.assertFalse(r["ok"])
+        kinds = sorted({p["kind"] for p in r["problems"]})
+        self.assertIn("prev_mismatch", kinds,
+                      "换序必须被检出 —— 只哈希内容本身会漏掉这一类")
+
+    def test_detects_seq_edit(self):
+        from harness.chain import verify_chain
+        self._emit()
+        ls = self._lines()
+        rec = json.loads(ls[3]); rec["seq"] = 999
+        ls[3] = json.dumps(rec, ensure_ascii=False)
+        r = verify_chain(self._tamper(ls, "seq"))
+        self.assertFalse(r["ok"])
+        kinds = sorted({p["kind"] for p in r["problems"]})
+        self.assertIn("seq_gap", kinds)
+        self.assertIn("content_tampered", kinds)
+
+    def test_attacker_cannot_recompute_own_hash(self):
+        """攻击者把内容与 hash **一起**改，仍然要暴露。
+
+        这是链式结构的意义：即使给他任意改一行的能力，
+        他也无法让后续条目重新自洽 —— 除非重算整条链，
+        而那样链头就与落盘锚点对不上了。
+        """
+        from harness.chain import verify_chain, compute_hash, GENESIS
+        self._emit()
+        ls = self._lines()
+        rec = json.loads(ls[2])
+        rec["data"]["text"] = "伪造内容"
+        # 攻击者自己重算这一条的 hash，并接着把后续每条都重算（最难的情形）
+        prev = json.loads(ls[1])["hash"]
+        rec["prev_hash"] = prev
+        rec["hash"] = compute_hash(prev, rec)
+        ls[2] = json.dumps(rec, ensure_ascii=False)
+        prev = rec["hash"]
+        for i in range(3, len(ls)):
+            nx = json.loads(ls[i])
+            nx["prev_hash"] = prev
+            nx["hash"] = compute_hash(prev, nx)
+            ls[i] = json.dumps(nx, ensure_ascii=False)
+            prev = nx["hash"]
+        # 现在链内完全自洽，但链头锚点对不上
+        r = verify_chain(self._tamper(ls, "forged"))
+        self.assertFalse(r["ok"],
+                         "重算整条链后必须靠**链头锚点**检出 —— "
+                         "否则哈希链形同虚设")
+        kinds = [p["kind"] for p in r["problems"]]
+        self.assertIn("head_mismatch", kinds)
+
+    # ---------- 幂等与边界 ----------
+    def test_verify_is_deterministic(self):
+        from harness.chain import verify_chain
+        self._emit()
+        a = verify_chain(self.sess.run_dir)
+        b = verify_chain(self.sess.run_dir)
+        self.assertEqual(a, b, "核验必须是确定性的（可复现）")
+
+    def test_session_summary_exposes_chain(self):
+        self._emit(2)
+        s = self.sess.summary()
+        self.assertTrue(s["chain_enabled"])
+        self.assertEqual(s["chain_errors"], 0)
+        self.assertTrue(s["chain_head"])
+
+    def test_chain_can_be_disabled(self):
+        from harness.session import Session
+        from harness.protocol import EventType
+        from harness.chain import verify_chain
+        sess = Session(self.ws.path, "m", "stub", "workspace-write",
+                       "on-request", chain_enabled=False)
+        sess.bus.emit(EventType.MESSAGE, text="x")
+        recs = sess.read_events()
+        self.assertNotIn("hash", recs[0], "关闭时不该写链字段")
+        # 无链 = **无法核验**，不等于"被篡改"。
+        # 把它判成失败就会给每个旧运行制造假警报，核验机制随即失去可信度。
+        r = verify_chain(sess.run_dir)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["unchained"])
+
+    def test_canonical_ignores_presentation_fields(self):
+        """**链只覆盖语义字段，不覆盖展示字段。**
+
+        否则一次无害的展示层改动（前端补了个 `ts_ms`）
+        会让整条历史变成"被篡改" —— 假警报比不检查更糟。
+        """
+        from harness.chain import compute_hash, canonical_bytes
+        a = {"type": "message", "seq": 1, "ts": 1.0, "turn_id": "t",
+             "data": {"text": "hi"}}
+        b = dict(a)
+        b["ts_ms"] = 1234567
+        b["ui_hint"] = "something"
+        self.assertEqual(canonical_bytes(a), canonical_bytes(b))
+        self.assertEqual(compute_hash("0" * 64, a), compute_hash("0" * 64, b))
+
+    def test_canonical_is_order_insensitive_for_keys(self):
+        """同一条记录、键顺序不同 → 必须算出同一个 hash。"""
+        from harness.chain import compute_hash
+        g = "0" * 64
+        a = {"type": "x", "seq": 1, "ts": 1.0, "turn_id": "t", "data": {"b": 1, "a": 2}}
+        b = {"data": {"a": 2, "b": 1}, "turn_id": "t", "ts": 1.0, "seq": 1, "type": "x"}
+        self.assertEqual(compute_hash(g, a), compute_hash(g, b))
+
+    def test_verify_all_across_runs(self):
+        """批量核验（供 CI / 审计脚本用）：如实报告每个运行的结论。"""
+        from harness.chain import verify_all
+        self._emit(3)
+        from harness.session import Session
+        from harness.protocol import EventType
+        s2 = Session(self.ws.path, "m", "stub", "workspace-write", "on-request")
+        s2.bus.emit(EventType.MESSAGE, text="ok")
+        runs_root = os.path.join(self.ws.path, ".crucible", "runs")
+        r = verify_all(runs_root)
+        self.assertEqual(r["runs"], 2)
+        self.assertEqual(r["ok"], 2)
+        self.assertEqual(r["failed"], [])
+
+    def test_missing_file_reported_not_crashed(self):
+        from harness.chain import verify_chain
+        r = verify_chain(os.path.join(self.ws.path, "nope"))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["problems"][0]["kind"], "missing_events_file")
+
+    def test_no_anchor_is_reported_not_silent(self):
+        """没有链头时只做链内自洽检查，但**必须显式说明** ——
+        沉默会让人把"没检查"读成"检查通过"。"""
+        from harness.chain import verify_chain, CHAIN_FILE
+        self._emit()
+        os.remove(os.path.join(self.sess.run_dir, CHAIN_FILE))
+        r = verify_chain(self.sess.run_dir)
+        self.assertTrue(r["ok"], "链内自洽时不该误报")
+        self.assertIn("note", r)
+        self.assertIn("没有 chain.head", r["note"])
+
+
+    def test_unchained_legacy_run_is_not_false_alarm(self):
+        """**旧运行（链功能上线前产生的）不得被判为"被篡改"。**
+
+        实测踩到：把没有 hash 字段的旧事件一律当 `prev_mismatch`，
+        于是每个历史运行都报 30 个"问题" —— 全是假警报。
+        假警报会让核验机制彻底失去可信度，所以必须显式区分
+        「无链可核」与「链被破坏」。
+        """
+        from harness.chain import verify_chain
+        from harness.protocol import EventType
+        from harness.session import Session
+        # 造一个"旧格式"运行：手写没有 hash 字段的事件行
+        sess = Session(self.ws.path, "m", "stub", "workspace-write",
+                       "on-request", chain_enabled=False)
+        sess.bus.emit(EventType.MESSAGE, text="old")
+        sess.bus.emit(EventType.MESSAGE, text="old2")
+        r = verify_chain(sess.run_dir)
+        self.assertTrue(r["ok"], f"旧运行被误报为被篡改：{r['problems']}")
+        self.assertTrue(r["unchained"])
+        self.assertIn("无法核验完整性", r["note"])
+        self.assertEqual(r["problems"], [], "旧运行不该产生任何 problem 条目")
+
+    def test_partial_chain_is_a_real_problem(self):
+        """**部分带链是真的异常** —— 说明有人往带链的运行里插了记录。"""
+        from harness.chain import verify_chain
+        self._emit(4)
+        ls = self._lines()
+        # 插一条不带 hash 的记录
+        stray = json.dumps({"type": "message", "seq": 5, "ts": 0.0,
+                            "turn_id": "x", "data": {"text": "偷插"}},
+                           ensure_ascii=False)
+        r = verify_chain(self._tamper(ls + [stray], "partial"))
+        self.assertFalse(r["ok"])
+        kinds = [p["kind"] for p in r["problems"]]
+        self.assertIn("partial_chain", kinds)
+
+    def test_run_id_persisted_in_meta(self):
+        """`run_id` 必须落盘 —— 否则进程重启后外部就找不到运行目录了。
+
+        实测踩到：`RUNS` 是内存态，清空后拿 run_id 去匹配目录名匹配不上
+        （run_id 与 session_id 是**独立生成**的两个 id）。
+        而"外部可核验"的前提恰恰是不依赖产生它的进程还活着。
+        """
+        from harness.session import Session
+        from harness.protocol import EventType
+        sess = Session(self.ws.path, "m", "stub", "workspace-write",
+                       "on-request", run_id="run_abc123")
+        sess.bus.emit(EventType.MESSAGE, text="x")
+        sess.write_meta()        # 正常由 attach_context() 调用；这里手动落盘
+        import json as _json
+        mp = os.path.join(sess.run_dir, "meta.json")
+        with open(mp, encoding="utf-8") as f:
+            meta = _json.load(f)
+        self.assertEqual(meta["run_id"], "run_abc123")
+        # 目录名是 session_id，与 run_id 不同 —— 所以必须靠 meta 映射
+        self.assertNotEqual(sess.meta.session_id, "run_abc123")
+
+
+class TestServerStartupModes(unittest.TestCase):
+    """服务端有两种启动方式，**两种都必须能跑**：
+
+        python -m harness.server        包模式，相对导入可用
+        python harness/server.py        脚本模式，__package__ 为空
+
+    实测踩到：路由里写 `from .chain import ...` 在脚本模式下直接
+    `ImportError: attempted relative import with no known parent package`。
+    症状是端点 500（而且当时异常被静默吞成空响应，排查了很久）。
+
+    这个坑很容易回归 —— 以后任何人在路由处理函数里图省事写局部相对导入
+    都会再犯。所以用**真实启动子进程**的方式把它钉住，而不是只做静态检查。
+    """
+
+    def _port(self):
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    def test_script_mode_starts_and_serves(self):
+        import socket
+        import urllib.request
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        port = self._port()
+        proc = subprocess.Popen(
+            [sys.executable, "harness/server.py", "--port", str(port)],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            # 等服务就绪
+            ok = False
+            for _ in range(50):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/api/health", timeout=1) as r:
+                        if json.load(r).get("ok"):
+                            ok = True
+                            break
+                except Exception:
+                    time.sleep(0.1)
+            self.assertTrue(ok, "脚本模式下服务没有起来")
+
+            # 关键：链核验端点必须可用（它曾因相对导入在脚本模式下 500）
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/verify-chains", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                body = json.load(r)
+            self.assertIn("runs", body, f"端点返回了非预期内容：{body}")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def test_route_handlers_avoid_relative_imports(self):
+        """静态检查：路由处理函数里不得出现局部相对导入。
+
+        静态检查是补充（真实启动测试是主判据），但它能给出**具体行号**，
+        而启动失败只告诉你"500"。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "harness", "server.py"),
+                  encoding="utf-8") as f:
+            lines = f.readlines()
+        # 找出方法体内缩进 ≥ 8 空格的相对导入行（即函数内部的局部导入）
+        bad = []
+        for i, ln in enumerate(lines, start=1):
+            s = ln.strip()
+            if s.startswith("from .") and (len(ln) - len(ln.lstrip())) >= 8:
+                bad.append(f"第 {i} 行：{s}")
+        self.assertEqual(
+            bad, [],
+            "路由处理函数内出现相对导入 —— 脚本直跑模式会 ImportError。\n"
+            + "\n".join(bad))
+
+
+# ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     unittest.main(verbosity=2)

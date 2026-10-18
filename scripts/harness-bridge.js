@@ -733,6 +733,20 @@
   function workspaceInfo(workspace) {
     return get("/api/workspace/info" + wsQuery(workspace, {}));
   }
+  /* 新建空文件 / 空目录。
+     **拒绝也要把 body 带回来**：400 的 body 里有原因码与人话，
+     丢掉它前端就只能说"失败了" —— 而用户需要知道是名字不行还是目录没了。 */
+  function workspaceCreate(workspace, path, kind) {
+    return post("/api/workspace/create",
+                { workspace: workspace, path: path, kind: kind })
+      .then(function (r) {
+        var b = r.body || {};
+        return { ok: r.status === 200 && b.ok === true, status: r.status, body: b };
+      })
+      .catch(function (e) {
+        return { ok: false, status: 0, body: { error: "network", detail: String(e && e.message || e) } };
+      });
+  }
   function workspaceSearch(workspace, q, limit) {
     return get("/api/workspace/search" + wsQuery(workspace, { q: q, limit: limit || 200 }));
   }
@@ -1027,6 +1041,7 @@
     toolManifest: toolManifest,
     workspaceTree: workspaceTree,
     workspaceFile: workspaceFile,
+    workspaceCreate: workspaceCreate,
     workspaceInfo: workspaceInfo,
     workspaceSearch: workspaceSearch,
     workspaceTerminal: workspaceTerminal,

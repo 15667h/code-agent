@@ -1199,6 +1199,28 @@
           if (treeState[openKey]) Backend.loadTree(en.path);
           renderRail();
         });
+        /* 目录也要有右键菜单 —— 原来只有文件行有。
+           「右键目录 → 在此新建」是这类工具里最常用的新建路径，
+           只能在顶栏的「+」里新建是一件很别扭的事。 */
+        row.addEventListener("contextmenu", function (ev) {
+          ev.preventDefault();
+          UI.contextMenu(ev.clientX, ev.clientY, [
+            { label: opened ? "收起此目录" : "展开此目录", icon: ICONS.chevron, onClick: function () {
+                treeState[openKey] = !treeState[openKey];
+                if (treeState[openKey]) Backend.loadTree(en.path);
+                renderRail();
+              } },
+            { sep: true },
+            { label: "在此新建文件", icon: ICONS.plus, onClick: function () {
+                if (uiHooks.startCreate) uiHooks.startCreate("file", en.path);
+              } },
+            { label: "在此新建目录", icon: ICONS.dirClosed, onClick: function () {
+                if (uiHooks.startCreate) uiHooks.startCreate("dir", en.path);
+              } },
+            { sep: true },
+            { label: "复制路径", icon: ICONS.file, onClick: function () { UI.copy(en.path, "路径"); } },
+          ]);
+        });
         wrap.appendChild(row);
         if (opened) wrap.appendChild(renderRealTree(en.path, depth + 1));
       } else {
@@ -1212,8 +1234,19 @@
         });
         row.addEventListener("contextmenu", function (ev) {
           ev.preventDefault();
+          // 「在此新建」用文件所在的目录 —— 右键一个文件时，"此"就是它旁边
+          var dirOf = function (p) {
+            return p.indexOf("/") >= 0 ? p.slice(0, p.lastIndexOf("/")) : "";
+          };
           UI.contextMenu(ev.clientX, ev.clientY, [
             { label: "打开", icon: ICONS.file, onClick: function () { openTab(en.path); } },
+            { label: "在此新建文件", icon: ICONS.plus, onClick: function () {
+                if (uiHooks.startCreate) uiHooks.startCreate("file", dirOf(en.path));
+              } },
+            { label: "在此新建目录", icon: ICONS.dirClosed, onClick: function () {
+                if (uiHooks.startCreate) uiHooks.startCreate("dir", dirOf(en.path));
+              } },
+            { sep: true },
             { label: "复制路径", icon: ICONS.file, onClick: function () { UI.copy(en.path, "路径"); } },
             { label: "复制文件名", icon: ICONS.file, onClick: function () { UI.copy(en.name, "文件名"); } },
             { sep: true },
@@ -4125,30 +4158,110 @@
       hideMention();
     }
 
-    // ---------- 新建文件 ----------
+    // ---------- 新建文件 / 新建目录 ----------
+    /* 这两项以前只弹一句「这是演示环境」的 toast —— 功能根本不存在。
+       而菜单里摆着它，用户点完就是"什么都没发生"，还会怪自己点错。
+       现在真的落盘：POST /api/workspace/create。
+       后端把能力压到最小（只能建空的、不能覆盖），见 server.py 的说明。 */
+    function startCreate(kind, baseDir) {
+      var isDir = kind === "dir";
+      if (state.railView !== "explorer") goView("explorer");
+      if (!Backend.available()) {
+        UI.toast({
+          tone: "warning", title: "后端未连接，创建不了", duration: 6000,
+          desc: "新建要写磁盘，只有 harness 在跑的时候才能落盘。"
+            + "先启动 `python harness/server.py`。",
+        });
+        return;
+      }
+      // 默认落在当前打开文件所在的目录 —— 用户正在看哪个文件，
+      // 新建的东西大概率就该在它旁边。从目录右键进来时用那个目录。
+      // 都没打开就落到根。
+      var cur = state.activeTab || "";
+      var base = baseDir != null ? baseDir
+        : (cur.indexOf("/") >= 0 ? cur.slice(0, cur.lastIndexOf("/")) : "");
+      UI.formDialog({
+        title: isDir ? "新建目录" : "新建文件",
+        desc: base
+          ? "会建在 " + base + " 目录下；也可以改成别的路径。"
+          : "会建在工作区根目录；也可以写成带层级的路径。",
+        submitLabel: "创建",
+        focusName: "path",
+        fields: [{
+          name: "path",
+          label: isDir ? "目录路径" : "文件路径",
+          value: base ? base + "/" : "",
+          placeholder: isDir ? "例如 src/utils" : "例如 src/utils/helper.js",
+          hint: "相对工作区的路径，可以带目录层级。已存在的不会被覆盖。",
+          required: true,
+        }],
+        onSubmit: function (v, dlg) {
+          var p = (v.path || "").trim();
+          dlg.busy(true, "创建中…");
+          return window.Harness.workspaceCreate(state.workspace, p, kind)
+            .then(function (r) {
+              if (!r.ok) {
+                var b = r.body || {};
+                dlg.busy(false);
+                // 失败原因写在字段下面而不是弹 toast：
+                // 用户接下来要改的正是这个字段
+                dlg.setError("path", String(b.detail || b.error || "创建失败"));
+                return false;
+              }
+              var made = r.body.path;
+              /* 让新建的东西**看得见**：把父目录这一路展开。
+                 只建成功却看不见，用户会以为没建成 —— 与"根本没做"同一个症状。 */
+              var segs = made.split("/");
+              var acc = "";
+              for (var i = 0; i < segs.length - 1; i++) {
+                acc = acc ? acc + "/" + segs[i] : segs[i];
+                treeState["open:" + acc] = true;
+              }
+              treeState["open:" + (isDir ? made : (r.body.parent || ""))] = true;
+              // 全丢一遍目录缓存：新条目可能落在任意一层，
+              // 而缓存存的是"当时那一层的子项"。树很浅，重新请求的代价远小于
+              // 显示一份不含新条目的旧列表。
+              state.treeCache = {};
+              Backend.loadWorkspaceInfo();
+              renderRail();
+              if (!isDir) {
+                delete state.fileCache[made];
+                openTab(made);
+                Backend.loadFile(made);
+              }
+              UI.toast({
+                tone: "ok", duration: 3600,
+                title: (isDir ? "已创建目录 " : "已创建文件 ") + made,
+                desc: isDir ? "" : "空文件，内容在编辑器里写。",
+              });
+              return true;
+            })
+            .catch(function (e) {
+              dlg.busy(false);
+              dlg.setError("path", String(e && e.message || e));
+              return false;
+            });
+        },
+      });
+    }
+
+    // 文件树的目录右键要用同一个实现（见 renderRealTree）——
+    // 两处各写一份，迟早只改一处。
+    uiHooks.startCreate = startCreate;
+
     $("#btn-newfile").addEventListener("click", function () {
-      var tree = D.railBody.querySelector(".filetree");
-      if (!tree || state.railView !== "explorer") { goView("explorer"); }
-      UI.contextMenu(
-        D.railBody.getBoundingClientRect().left + 24,
-        D.railBody.getBoundingClientRect().top + 60,
-        [
-          { label: "新建文件", icon: ICONS.plus, onClick: function () {
-              UI.toast({ tone: "info", title: "新建文件", desc: "演示环境：先给一个名字，再打开空标签。", duration: 4000,
-                actions: [{ label: "输入名字", primary: true, onClick: function () {
-                  var n = window.prompt("新文件名");
-                  if (!n) return;
-                  openTab("src/" + n);
-                  UI.toast({ tone: "ok", title: "已创建 " + n, desc: "文件尚未落盘（演示环境）。", duration: 3600 });
-                } }] });
-            } },
-          { label: "新建目录", icon: ICONS.dirClosed, onClick: function () {
-              UI.toast({ tone: "info", title: "新建目录", desc: "演示环境未落盘。", duration: 3000 });
-            } },
-          { sep: true },
-          { label: "刷新", icon: ICONS.play, onClick: refreshIndex },
-        ]
-      );
+      var r = D.railBody.getBoundingClientRect();
+      UI.contextMenu(r.left + 24, r.top + 60, [
+        { label: "新建文件", icon: ICONS.plus, onClick: function () { startCreate("file"); } },
+        { label: "新建目录", icon: ICONS.dirClosed, onClick: function () { startCreate("dir"); } },
+        { sep: true },
+        // 原来这里的「刷新」调的是 refreshIndex（重建代码索引）——
+        // 在文件树的上下文里点"刷新"，用户要的是刷新树，不是重建索引。
+        { label: "刷新文件树", icon: ICONS.play, onClick: function () {
+            Backend.invalidateWorkspace();
+            UI.toast({ tone: "info", title: "已刷新文件树", duration: 1800 });
+          } },
+      ]);
     });
 
     // ---------- 标签栏「更多」 ----------

@@ -1077,6 +1077,16 @@ class Handler(BaseHTTPRequestHandler):
                                     "provider": st.session.meta.provider,
                                     "live": bool(st.endpoint and st.endpoint.configured)})
 
+        # ── 工作区写操作（只有"新建"，且只建空的）──
+        # POST 而不是 GET：它会改变磁盘状态。用 GET 的话，一个预取、
+        # 一次误刷新、一个 <img src> 都能触发建文件。
+        if path == "/api/workspace/create":
+            ws = body.get("workspace") or default_workspace()
+            r = _create_workspace_entry(ws, body.get("path") or "",
+                                        body.get("kind") or "file")
+            # 拒绝用 400 + 原因码：前端能把"为什么不行"直接摆到字段下面
+            return self._json(200 if r.get("ok") else 400, r)
+
         # ── 模型接入配置 ──
         # 只有三个字段。GET 返回掩码后的形态（**绝不回传明文 key**），
         # POST 保存，/test 用当前配置做一次真实连通性自检。
@@ -1358,6 +1368,111 @@ def _read_workspace_file(workspace: str, rel: str, max_bytes: int) -> Dict[str, 
         "truncated": truncated,
         "line_count": len(lines),
         "lines": lines,
+    }
+
+
+# ── 新建文件 / 新建目录 ──
+#
+# 这是本仓库**唯一**能给工作区写东西的浏览器接口，所以能力刻意压到最小：
+#   · 只能建"空的" —— 写内容归 agent 的工具链（走沙箱 + 审批）
+#   · 不能覆盖 —— 已存在一律拒绝，不提供 force
+#   · 不能删除、不能重命名
+# 最坏情况是在工作区里多一个空文件 / 空目录，而不是代码被改写。
+#
+# 这不是洁癖。这条路径绕过了 policy（理由同上面的只读接口：它是用户在
+# 操作自己的工作区，不是 agent 的动作），所以"能做的"必须比"想做的"更少 ——
+# 一旦允许写内容，它就变成了绕过审批闸门的后门。
+
+_BAD_NAME_CHARS = '<>:"|?*'
+# Windows 的保留设备名。连 CON.txt 这种带扩展名的写法也不合法，
+# 所以按"点号前的部分"比对。
+_RESERVED_NAMES = ({"con", "prn", "aux", "nul"}
+                   | {"com%d" % i for i in range(1, 10)}
+                   | {"lpt%d" % i for i in range(1, 10)})
+
+_NEW_KIND_CN = {"file": "文件", "dir": "目录"}
+
+
+def _create_workspace_entry(workspace: str, rel: str, kind: str) -> Dict[str, Any]:
+    """在工作区内新建一个空文件或空目录。
+
+    返回 `{"ok": True, ...}`，或 `{"ok": False, "error": <码>, "detail": <人话>}`。
+
+    **错误必须说清是哪一步不行**。「创建失败」这种话对用户没有任何用处 ——
+    是名字非法？还是上级目录不存在？还是已经有了？三种情况的下一步动作完全不同。
+    """
+    def bad(code: str, detail: str) -> Dict[str, Any]:
+        return {"ok": False, "error": code, "detail": detail, "path": rel}
+
+    if kind not in _NEW_KIND_CN:
+        return bad("bad_kind", "kind 只能是 file 或 dir。")
+
+    rel = (rel or "").strip()
+    if not rel:
+        return bad("empty_name", "名字不能为空。")
+    if os.path.isabs(rel) or rel.startswith(("/", "\\")):
+        return bad("absolute_path", "只接受工作区内的相对路径，不能从根目录开始。")
+
+    parts = [p for p in re.split(r"[\\/]+", rel) if p not in ("", ".")]
+    if not parts:
+        return bad("empty_name", "名字不能为空。")
+    if any(p == ".." for p in parts):
+        return bad("traversal", "路径里不能有 ..（不能建到工作区外面去）。")
+
+    name = parts[-1]
+    if any(ch in _BAD_NAME_CHARS for ch in name):
+        return bad("bad_name",
+                   '名字里不能有这些字符：< > : " | ? *')
+    if any(ord(ch) < 32 for ch in name):
+        return bad("bad_name", "名字里不能有控制字符（换行、制表符等）。")
+    if name != name.rstrip(" ."):
+        # 这一条不是为了好看：系统会**悄悄**去掉结尾的空格与点，
+        # 建出来的名字和用户输入的不一致，而用户以为自己建对了。
+        return bad("bad_name",
+                   "名字结尾不能是空格或点。系统会把它悄悄去掉，"
+                   "建出来的名字就和你输入的不一样了。")
+    if name.split(".")[0].lower() in _RESERVED_NAMES:
+        return bad("reserved_name",
+                   "「%s」是系统保留的设备名（CON / PRN / AUX / NUL / COM1…），"
+                   "这类名字建不出来。换一个。" % name)
+
+    target = _safe_join(workspace, "/".join(parts))
+    if target is None:
+        return bad("outside_workspace",
+                   "这个路径会落到工作区外面（或经过一个指向外面的符号链接）。已拒绝。")
+
+    parent = os.path.dirname(target)
+    if not os.path.isdir(parent):
+        # 不自动 makedirs 上级：那会让"路径写错"变成"悄悄建了一串目录"，
+        # 用户以为建在 A 处，实际建在 B 处。
+        return bad("no_parent",
+                   "上一级目录不存在。先在文件树里选中一个已存在的目录再新建。")
+
+    if os.path.exists(target):
+        # 已存在就**不动它**。省掉这条，"新建"就会静默变成"覆盖"。
+        what = "目录" if os.path.isdir(target) else "文件"
+        return bad("already_exists", "这里已经有一个同名%s了。" % what)
+
+    try:
+        if kind == "dir":
+            os.mkdir(target)
+        else:
+            # 'x' 模式：存在即失败。用它而不是先 exists 再写，
+            # 是为了不留"检查与写入之间"的竞态窗口。
+            with open(target, "x", encoding="utf-8"):
+                pass
+    except FileExistsError:
+        return bad("already_exists", "已经有同名项了（刚刚被别的进程建了）。")
+    except OSError as e:
+        return bad("io_error", "系统拒绝了这个操作：%s" % e)
+
+    return {
+        "ok": True,
+        "path": "/".join(parts),
+        "kind": kind,
+        "name": name,
+        "parent": "/".join(parts[:-1]),
+        "detail": "已创建%s：%s" % (_NEW_KIND_CN[kind], "/".join(parts)),
     }
 
 

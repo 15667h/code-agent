@@ -124,7 +124,9 @@
     <div class="rail__head">
       <h1 class="rail__title" id="rail-title">资源管理器</h1>
       <div class="rail__acts">
-        <button type="button" class="iconbtn iconbtn--sm" id="btn-newfile" aria-label="新建文件" data-tip="新建文件（双击树可重命名）">
+        <!-- 提示里原本写着「双击树可重命名」—— 真实文件树上没有双击重命名
+             （那只在演示树里），提示在说一件做不到的事。改成实际有的功能。 -->
+        <button type="button" class="iconbtn iconbtn--sm" id="btn-newfile" aria-label="新建文件或目录" data-tip="新建文件 / 目录">
           <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         </button>
         <button type="button" class="iconbtn iconbtn--sm" id="btn-rail-more" aria-label="更多侧栏操作" aria-haspopup="menu" aria-expanded="false" data-tip="更多操作">

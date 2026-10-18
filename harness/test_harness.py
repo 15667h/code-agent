@@ -3672,6 +3672,128 @@ class TestServerStartupModes(unittest.TestCase):
                     proc.kill()
             ws.cleanup()
 
+    def test_workspace_create_only_creates_empty_and_never_overwrites(self):
+        """新建文件 / 目录：真落盘、只建空的、不覆盖、不逃逸、原因说得清。
+
+        这是本项目**唯一**能给工作区写东西的浏览器接口，所以正向与反向
+        都要钉住：
+          · 正向：文件与目录真的出现在磁盘上（文件是 0 字节）
+          · 反向：已存在 / 路径穿越 / 绝对路径 / 非法名字 / 上级不存在
+            全部拒绝，且给出可操作的原因
+        特别要紧的是「已存在」这一条 —— 少了它，"新建"会静默变成"覆盖"，
+        而覆盖已有的源码是不可撤销的。
+        """
+        import urllib.request
+        import urllib.error
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        port = self._port()
+        ws = TempWorkspace()
+        proc = None
+        try:
+            with open(os.path.join(ws.path, "keep.txt"), "w", encoding="utf-8") as f:
+                f.write("原有内容\n")
+
+            proc = subprocess.Popen(
+                [sys.executable, "harness/server.py", "--port", str(port)],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(60):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/api/health", timeout=1) as r:
+                        if json.load(r).get("ok"):
+                            break
+                except Exception:
+                    time.sleep(0.1)
+
+            def create(path, kind="file"):
+                """返回 (status, body)。4xx 也要读 body —— 原因就在里面。"""
+                payload = json.dumps({"workspace": ws.path, "path": path,
+                                      "kind": kind}).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/workspace/create", data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        return r.status, json.load(r)
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read().decode("utf-8"))
+
+            # ── 正向：文件与目录都真的落到磁盘 ──
+            st, b = create("a.txt")
+            self.assertEqual(st, 200, f"新建文件失败：{b}")
+            self.assertTrue(b.get("ok"))
+            full = os.path.join(ws.path, "a.txt")
+            self.assertTrue(os.path.isfile(full), "报成功但磁盘上没有这个文件")
+            self.assertEqual(os.path.getsize(full), 0,
+                             "新建的文件必须是空的 —— 编一点内容就是假数据")
+
+            st, b = create("d1", "dir")
+            self.assertEqual(st, 200, f"新建目录失败：{b}")
+            self.assertTrue(os.path.isdir(os.path.join(ws.path, "d1")))
+
+            # 带层级（上级已存在）也应当可以
+            st, b = create("d1/d2", "dir")
+            self.assertEqual(st, 200, f"带层级的目录建不出来：{b}")
+            self.assertTrue(os.path.isdir(os.path.join(ws.path, "d1", "d2")))
+
+            # 反斜杠写法按 Windows 习惯当分隔符（用户很可能这么输）
+            st, b = create("d1\\d3", "dir")
+            self.assertEqual(st, 200, f"反斜杠路径没被当成层级：{b}")
+            self.assertTrue(os.path.isdir(os.path.join(ws.path, "d1", "d3")))
+
+            # 中文名：UTF-8 路径必须能落盘
+            st, b = create("中文目录", "dir")
+            self.assertEqual(st, 200, f"中文名建不出来：{b}")
+            self.assertTrue(os.path.isdir(os.path.join(ws.path, "中文目录")))
+
+            # ── 反向：每一条都得拒绝，且原因能指导下一步 ──
+            st, b = create("keep.txt")
+            self.assertEqual(st, 400)
+            self.assertEqual(b.get("error"), "already_exists")
+            with open(os.path.join(ws.path, "keep.txt"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "原有内容\n",
+                                 "已存在的文件被清空了 —— 这不可撤销")
+
+            st, b = create("../escape.txt")
+            self.assertEqual(b.get("error"), "traversal")
+            self.assertFalse(os.path.exists(os.path.join(os.path.dirname(ws.path),
+                                                         "escape.txt")),
+                             "路径穿越真的把文件建到工作区外面了")
+
+            st, b = create(os.path.join(ws.path, "abs.txt"))
+            self.assertEqual(b.get("error"), "absolute_path")
+
+            for bad in ("bad:name.txt", "tail. ", "a\tb.txt"):
+                st, b = create(bad)
+                self.assertEqual(b.get("error"), "bad_name",
+                                 f"{bad!r} 应被判为非法名字：{b}")
+                self.assertTrue(b.get("detail"), "拒绝时必须给出人话原因")
+
+            st, b = create("con")
+            self.assertEqual(b.get("error"), "reserved_name")
+
+            st, b = create("nope/sub/x.txt")
+            self.assertEqual(b.get("error"), "no_parent",
+                             "上级目录不存在时要拒绝，不能偷偷建一串目录")
+
+            st, b = create("")
+            self.assertEqual(b.get("error"), "empty_name")
+
+            st, b = create("weird.txt", "symlink")
+            self.assertEqual(b.get("error"), "bad_kind")
+
+            # 拒绝之后磁盘上不该留下任何东西
+            self.assertFalse(os.path.exists(os.path.join(ws.path, "bad:name.txt")))
+            self.assertFalse(os.path.exists(os.path.join(ws.path, "nope")))
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            ws.cleanup()
+
     def test_result_endpoint_falls_back_to_replay(self):
         """`/result` 也必须能读历史 run —— 否则历史运行取不到用量。
 
@@ -4159,6 +4281,57 @@ class TestFrontendWiring(unittest.TestCase):
         self.assertEqual(offenders, [],
                          "用户可见文案里出现了 markdown 强调号（会原样显示成 *）：\n"
                          + "\n".join(offenders))
+
+    def test_new_file_menu_really_creates_and_refresh_refreshes_tree(self):
+        """「新建文件 / 新建目录」必须真落盘；「刷新」必须刷新树。
+
+        这两条以前都是假的：
+          · 新建只弹一句「演示环境未落盘」——菜单里摆着，点完什么都不会发生；
+          · 「刷新」调的是 refreshIndex（重建代码索引），
+            而在文件树的上下文里点"刷新"，用户要的是刷新树。
+        功能不存在的按钮比没有按钮更坏：它让人以为是自己点错了。
+        """
+        app = self._read("scripts", "app.js")
+        # 旧的假实现（只弹 toast）不许回来
+        self.assertNotIn("演示环境未落盘", app,
+                         "新建目录又变回只弹一句 toast 了 —— 它必须真的落盘")
+        # 入口必须接到真正的创建函数
+        self.assertIn("function startCreate(kind", app,
+                      "找不到新建的共用实现")
+        self.assertIn('startCreate("file")', app)
+        self.assertIn('startCreate("dir")', app)
+        seg = app.split("function startCreate(kind", 1)[1]
+        self.assertIn("window.Harness.workspaceCreate", seg,
+                      "新建没有调后端 —— 那就只是界面上的假动作")
+        # 失败原因必须写在字段下面：用户接下来要改的就是那个字段
+        self.assertIn("dlg.setError(", seg,
+                      "创建失败没有就地提示原因，用户不知道下一步该改什么")
+        # 建完必须让新目录**看得见**
+        self.assertIn('treeState["open:"', seg,
+                      "新建的目录没被展开 —— 建成功却看不见，用户会以为没建成")
+        # 文件树的右键「在此新建」必须复用同一份实现，不许另写一套
+        self.assertIn("uiHooks.startCreate = startCreate", app,
+                      "目录右键没有接到同一份创建实现")
+        self.assertIn('label: "在此新建目录"', app,
+                      "文件树右键里没有「在此新建」—— 那是最自然的新建路径")
+
+        br = self._read("scripts", "harness-bridge.js")
+        self.assertIn('post("/api/workspace/create"', br,
+                      "创建必须走 POST：GET 会被预取/误刷新触发建文件")
+        self.assertIn("workspaceCreate: workspaceCreate", br,
+                      "桥接层没导出 workspaceCreate")
+
+        server = self._read("harness", "server.py")
+        i_post = server.find("def _route_post")
+        i_create = server.find('path == "/api/workspace/create"')
+        self.assertGreater(i_create, 0, "后端没有创建端点")
+        self.assertGreater(i_create, i_post,
+                           "创建端点必须在 POST 路由里，不能放在 GET 里")
+        # 只能建空的：'x' 模式是"存在即失败"，也是这里防覆盖的最后一层
+        fn = server.split("def _create_workspace_entry", 1)[1].split("\n# 终端白名单", 1)[0]
+        self.assertIn('open(target, "x"', fn,
+                      "写文件没用 'x' 模式 —— 先 exists 再写会留下竞态窗口，"
+                      "竞态里「新建」会变成「覆盖」")
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -43,6 +43,8 @@
     clock: '<circle cx="8" cy="8" r="5.8" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 4.6V8l2.4 1.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
     plus: '<path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
     play: '<path d="M5.5 3.5l7 4.5-7 4.5z" fill="currentColor"/>',
+    plug: '<path d="M6 2.5v3M10 2.5v3M4.5 5.5h7v2a3.5 3.5 0 0 1-7 0z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 11v2.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
+    trash: '<path d="M3 4.5h10M6.5 4.5V2.8h3v1.7M4.5 4.5l.7 8.7h5.6l.7-8.7" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>',
   };
 
   var TOOL_ICON = {
@@ -86,6 +88,7 @@
     filter: persisted.filter || "all",
     focusIdx: 0,             // 文件树的键盘游标
     renaming: null,          // 正在内联重命名的路径
+    endpoint: null,          // 当前模型接入配置（公开形态，不含明文 key）
   };
 
   var dirtyFile = { "src/transport/reconnect.ts": true };
@@ -1983,7 +1986,7 @@
       e.stopPropagation();
       var r = this.getBoundingClientRect();
       UI.contextMenu(r.left - 140, r.top - 130, [
-        { label: "账户设置", icon: ICONS.book, onClick: function () { UI.toast({ tone: "info", title: "账户设置", desc: "演示环境未接入。", duration: 3000 }); } },
+        { label: "模型接入", icon: ICONS.plug, onClick: openModelSettings },
         { label: "键盘快捷键", icon: ICONS.terminal, hint: "?", onClick: openShortcuts },
         { label: "切换主题", icon: ICONS.edit, onClick: toggleTheme },
         { sep: true },
@@ -1995,6 +1998,37 @@
           } },
       ]);
     });
+
+    // ---------- 设置（活动栏底部）----------
+    var btnSettings = $("#btn-settings");
+    if (btnSettings) {
+      btnSettings.addEventListener("click", function () { openModelSettings(); });
+      // 右键给一个"清除配置"的口子 —— 不放在主表单里，避免误触，
+      // 但必须存在：否则用户想换 key / 换端点时只能手动删文件。
+      btnSettings.addEventListener("contextmenu", function (e) {
+        e.preventDefault();
+        var r = this.getBoundingClientRect();
+        UI.contextMenu(r.right + 6, r.bottom - 120, [
+          { label: "模型接入…", icon: ICONS.plug, onClick: openModelSettings },
+          { sep: true },
+          { label: "清除模型配置", icon: ICONS.trash, danger: true, onClick: function () {
+              UI.confirm({
+                title: "清除模型配置？",
+                desc: "会删除服务端保存的接口地址、API Key 与模型名称。清除后运行将回到离线脚本模式。",
+                confirmLabel: "清除", tone: "danger",
+              }).then(function (ok) {
+                if (!ok) return;
+                window.Harness.clearConfig(persisted.workspace).then(function (r2) {
+                  applyEndpoint(r2 && r2.endpoint);
+                  UI.toast({ tone: "info", title: "已清除模型配置",
+                             desc: r2 && r2.removed ? "配置已删除。" : "本来就没有配置文件。",
+                             duration: 4000 });
+                });
+              });
+            } },
+        ]);
+      });
+    }
 
     // ---------- 主题 ----------
     function toggleTheme() {
@@ -2577,6 +2611,228 @@
   function openRailIfMobile() { /* 窄屏点文件后保留侧栏，方便连续操作 */ }
 
   /* ============================================================
+     模型接入设置 —— 只有三个字段
+     ============================================================
+     设计取舍：
+     1. **只有三个字段**。接口地址 / API Key / 模型名称。
+        不设「厂家下拉」—— 任何厂家下拉都会过时，而这三个字段
+        能接任意 OpenAI 兼容端点（含中转），换厂家不用改代码。
+     2. **地址归一化实时可见**。用户填 `https://x.com/v1` 时，
+        下方直接显示最终请求的完整 URL。地址写错是这类配置里
+        最常见的失败，而原始报错（404/401）通常不指向原因。
+     3. **测试连接是一等公民**。填完先验一次再保存，
+        避免「保存成功但根本用不了」。
+     4. **key 留空 = 沿用旧值**。这是关键语义 —— 否则用户每次
+        改模型名都得重新粘一遍 key。
+     ============================================================ */
+  function normalizeBase(u) {
+    var s = String(u || "").trim().replace(/\/+$/, "");
+    if (!s) return "";
+    if (/\/chat\/completions$/.test(s)) return s;
+    return s + "/chat/completions";
+  }
+
+  function openModelSettings() {
+    if (!window.Harness || !window.Harness.isLive()) {
+      UI.toast({
+        tone: "warning",
+        title: "后端未连接",
+        desc: "模型接入配置由 harness 后端持久化。启动 `python harness/server.py` 后刷新页面即可。",
+        duration: 6000,
+      });
+      return;
+    }
+
+    var ws = persisted.workspace;
+    var dlg = null, api = null;
+    var current = { base_url: "", model: "", has_key: false, api_key_masked: "" };
+
+    // 先读现有配置，再用它作为表单初值 —— 让「改一个字段」成为默认操作
+    window.Harness.getConfig(ws).then(function (r) {
+      var ep = (r && r.endpoint) || {};
+      current = ep;
+      dlg = UI.formDialog({
+        title: "模型接入",
+        desc: "填这三项即可接任意 OpenAI 兼容端点（含中转）。",
+        submitLabel: "保存",
+        focusName: "base_url",
+        extraActions: [{ act: "test", label: "测试连接" }],
+        fields: [
+          {
+            name: "base_url", label: "接口地址", type: "text", required: true,
+            placeholder: "https://api.deepseek.com/v1",
+            autocomplete: "off", spellcheck: false,
+            value: ep.base_url || "",
+            hint: "填到 /v1 即可；末尾带不带 /chat/completions 都行，会自动补。",
+          },
+          {
+            name: "api_key", label: "API Key", type: "password", required: !ep.has_key,
+            placeholder: ep.has_key ? ("已保存：" + (ep.api_key_masked || "••••") + "（留空则沿用）") : "sk-…",
+            autocomplete: "new-password", spellcheck: false,
+            value: "",
+            hint: ep.has_key
+              ? "已有一份保存的服务端。这里留空即沿用，填入则替换。"
+              : "只存在服务端的 .crucible/config.json（已在 .gitignore），不会回传明文。",
+          },
+          {
+            name: "model", label: "模型名称", type: "text", required: true,
+            placeholder: "deepseek-chat",
+            autocomplete: "off", spellcheck: false,
+            value: ep.model || "",
+            hint: "该端点上可用的模型 id，原样填即可。",
+          },
+        ],
+        onSubmit: submit,
+      });
+      api = dlg;
+      wireLiveHints();
+    }).catch(function (err) {
+      UI.toast({ tone: "danger", title: "读取配置失败", desc: String(err.message || err), duration: 6000 });
+    });
+
+    /* ---------- 表单内：地址预览 + 测试连接 ---------- */
+    function wireLiveHints() {
+      var root = document.querySelector(".modal--form");
+      if (!root) return;
+      var baseInput = root.querySelector('input[name="base_url"]');
+      var keyInput = root.querySelector('input[name="api_key"]');
+      var modelInput = root.querySelector('input[name="model"]');
+      var extra = root.querySelector(".fd__extra");
+      var testBtn = root.querySelector('[data-act="test"]');
+
+      // —— 实时地址预览：把「最终会请求什么」摆在用户眼前 ——
+      var preview = document.createElement("p");
+      preview.className = "field__hint";
+      preview.style.marginTop = "6px";
+      baseInput.parentElement.parentElement.appendChild(preview);
+      function refreshPreview() {
+        var full = normalizeBase(baseInput.value);
+        preview.textContent = full ? ("将请求：" + full) : "";
+        preview.hidden = !full;
+      }
+      baseInput.addEventListener("input", refreshPreview);
+      refreshPreview();
+
+      // —— 填入新 key 时解除"必填"约束（留空=沿用） ——
+      keyInput.addEventListener("input", function () {
+        if (dlg) dlg.clearErrors();
+      });
+
+      if (testBtn) {
+        testBtn.addEventListener("click", function () {
+          var payload = collect(testBtn);
+          extra.innerHTML = "";
+          extra.appendChild(checkBar("busy", "正在连接该端点…", ""));
+          testBtn.disabled = true;
+          window.Harness.testConfig(ws, payload, 20).then(function (rep) {
+            testBtn.disabled = false;
+            extra.innerHTML = "";
+            extra.appendChild(checkBar(
+              rep.ok ? "ok" : "bad",
+              rep.message || (rep.ok ? "连通" : "失败"),
+              (rep.url ? rep.url : "") + (rep.elapsed_s != null ? ("　" + rep.elapsed_s + "s") : "")
+            ));
+            if (rep.ok) UI.announce("连接测试通过");
+            else UI.announce("连接测试未通过");
+          }).catch(function (err) {
+            testBtn.disabled = false;
+            extra.innerHTML = "";
+            extra.appendChild(checkBar("bad", String(err.message || err), ""));
+          });
+        });
+      }
+
+      function collect(testBtn) {
+        // 测试用当前表单值；key 留空则沿用已保存的（服务端会合并）
+        var v = {
+          base_url: (baseInput.value || "").trim(),
+          model: (modelInput.value || "").trim(),
+        };
+        var k = (keyInput.value || "").trim();
+        if (k) v.api_key = k;
+        return v;
+      }
+      void collect;
+    }
+
+    function checkBar(kind, text, meta) {
+      var box = el("div", "fdcheck fdcheck--" + kind);
+      var icon = kind === "ok"
+        ? '<path d="M3.5 8.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+        : '<path d="M8 2.5l6 11H2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 6.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>';
+      box.appendChild(svg(icon));
+      var body = el("div");
+      body.appendChild(document.createTextNode(text));
+      if (meta) {
+        var m = el("span", "fdcheck__meta", meta);
+        body.appendChild(m);
+      }
+      box.appendChild(body);
+      return box;
+    }
+
+    /* ---------- 提交 ---------- */
+    function submit(v, formApi) {
+      formApi.busy(true, "保存中…");
+      var payload = {
+        base_url: (v.base_url || "").trim(),
+        model: (v.model || "").trim(),
+      };
+      var k = (v.api_key || "").trim();
+      if (k) payload.api_key = k;                 // 填了 → 替换
+      else if (!current.has_key) payload.api_key = "";  // 本来没有也没填 → 明确空
+      // 有 key 且留空 → **不带该字段**，服务端沿用旧值
+
+      return window.Harness.saveConfig(ws, payload).then(function (r) {
+        formApi.busy(false);
+        applyEndpoint(r.endpoint);
+        UI.toast({
+          tone: "success",
+          title: "模型接入已保存",
+          desc: r.endpoint.configured
+            ? (r.endpoint.model + " @ " + r.endpoint.chat_url)
+            : "配置不完整，运行时仍走离线脚本。",
+          duration: 5000,
+        });
+        return true;
+      }).catch(function (err) {
+        formApi.busy(false);
+        formApi.setError("base_url", "保存失败：" + (err.message || err));
+        UI.toast({ tone: "danger", title: "保存失败", desc: String(err.message || err), duration: 6000 });
+        return false;   // 保持打开，别把用户填的内容丢掉
+      });
+    }
+  }
+
+  /* 把某个 endpoint 的公开展示形态应用到界面上 */
+  function applyEndpoint(ep) {
+    if (!ep) return;
+    state.endpoint = ep;
+    var name = ep.configured ? ep.model : "未配置";
+    // 状态栏与 Agent 面板两处模型名保持一致 —— 同一个人看的同一个值
+    ["#btn-model", ".agentpanel__model"].forEach(function (sel) {
+      var n = $(sel);
+      if (n) {
+        n.textContent = name;
+        n.title = ep.configured
+          ? (name + " @ " + ep.chat_url)
+          : "模型未配置 · 点此接入";
+      }
+    });
+    var dot = $(".statusitem__dot--model");
+    if (dot) dot.style.background = ep.configured ? "var(--jade)" : "var(--text-faint)";
+  }
+
+  /* 启动时把已保存的配置反映到界面 */
+  function loadEndpoint() {
+    if (!window.Harness || !window.Harness.isLive()) return Promise.resolve(null);
+    return window.Harness.getConfig(persisted.workspace).then(function (r) {
+      applyEndpoint(r && r.endpoint);
+      return r && r.endpoint;
+    }).catch(function () { return null; });
+  }
+
+  /* ============================================================
      启动
      ============================================================ */
   function restorePersisted() {
@@ -2695,6 +2951,18 @@
           hint.appendChild(el("span", null, "已连接 harness · 发送即真实运行"));
         }
         UI.announce("已连接 harness 后端");
+        // 把已保存的模型接入配置反映到界面。
+        // 若未配置，状态栏模型会显示"未配置"并在 title 里提示点此接入 ——
+        // 不静默显示一个假模型名，否则用户会以为真的在用那个模型。
+        return loadEndpoint().then(function (ep) {
+          if (ep && !ep.configured) {
+            var h = $(".dock__hint");
+            if (h) {
+              h.textContent = "";
+              h.appendChild(el("span", null, "已连接 harness · 点左下角设置接入模型"));
+            }
+          }
+        });
       });
     }
 

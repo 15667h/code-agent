@@ -1553,6 +1553,241 @@ class TestToolResultEventUniqueness(unittest.TestCase):
             shell.reset()
 
 
+class TestModelEndpoint(unittest.TestCase):
+    """模型接入：**只有三个字段**，走 OpenAI 兼容端点。
+
+    这组测试锁住三件容易退化的事：
+      1. 地址归一化（中转站的四种写法）—— 写错地址是这类配置最常见的失败
+      2. api_key 绝不回传明文（对外只有掩码）
+      3. 配置落盘的合并语义（key 留空 = 沿用，而不是被清空）
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    # ---------- 地址归一化 ----------
+    def test_normalize_common_middleman_shapes(self):
+        from harness.model import normalize_base_url
+        cases = [
+            # 用户填法                                 期望
+            ("https://api.deepseek.com/v1", "https://api.deepseek.com/v1/chat/completions"),
+            ("https://api.deepseek.com/v1/", "https://api.deepseek.com/v1/chat/completions"),
+            ("https://x.com/v1/chat/completions", "https://x.com/v1/chat/completions"),
+            ("https://x.com/v1/chat/completions/", "https://x.com/v1/chat/completions"),
+            ("  https://x.com/v1  ", "https://x.com/v1/chat/completions"),
+            ("", ""),
+        ]
+        for raw, want in cases:
+            self.assertEqual(normalize_base_url(raw), want,
+                             "地址归一化错了：%r" % raw)
+
+    def test_normalize_does_not_guess_v1(self):
+        """**刻意不自动补 /v1** —— 猜错会制造"模型不存在"的误导性报错。
+
+        这个测试是在**锁住一个设计决定**，而不是锁住一个实现细节：
+        将来若有人"热心地"加上自动补 /v1 的逻辑，这里会红。
+        """
+        from harness.model import normalize_base_url
+        got = normalize_base_url("https://x.com")
+        self.assertEqual(got, "https://x.com/chat/completions")
+        self.assertNotIn("/v1/", got)
+
+    # ---------- key 掩码 ----------
+    def test_key_is_masked_never_returned_raw(self):
+        from harness.model import EndpointConfig, mask_key
+        key = "sk-abcdefghijklmnop1234"
+        cfg = EndpointConfig(base_url="https://x.com/v1", api_key=key, model="m")
+        pub = cfg.to_public()
+        self.assertNotIn(key, json.dumps(pub), "公开形态绝不能含明文 key")
+        self.assertTrue(pub["has_key"])
+        self.assertIn("••", pub["api_key_masked"])
+        # 掩码要足够用于"核对是哪一个"，但不能反推出原文
+        self.assertTrue(mask_key(key).startswith("sk-a"))
+        self.assertTrue(mask_key(key).endswith("1234"))
+
+    def test_mask_short_key_still_checkable(self):
+        """短 key 也要能核对 —— 全部遮死会让用户认不出自己存的是哪个 key，
+        于是每次换 key 都得重新粘一遍。掩码的价值就在"能认出"。"""
+        from harness.model import mask_key
+        self.assertEqual(mask_key("abc"), "a••")        # ≤4 位：留第一位
+        self.assertEqual(mask_key("abcd"), "a•••")
+        self.assertEqual(mask_key("abcde"), "a•••e")    # 5–8 位：留首尾
+        self.assertEqual(mask_key(""), "")
+        # 无论长短，都不能回传出完整的原始 key
+        for k in ("abc", "abcd", "abcde", "good-key", "sk-abcdefghijklmnop1234"):
+            m = mask_key(k)
+            self.assertNotEqual(m, k, "掩码不能等于原文：%r" % k)
+            self.assertIn("•", m)
+
+    # ---------- 三字段齐备判定 ----------
+    def test_configured_requires_all_three(self):
+        from harness.model import EndpointConfig
+        good = EndpointConfig(base_url="https://x.com/v1", api_key="k", model="m")
+        self.assertTrue(good.configured)
+        for bad in (
+            EndpointConfig(base_url="", api_key="k", model="m"),
+            EndpointConfig(base_url="https://x.com/v1", api_key="", model="m"),
+            EndpointConfig(base_url="https://x.com/v1", api_key="k", model=" "),
+        ):
+            self.assertFalse(bad.configured, "缺任一字段都不算配置完整")
+
+    def test_provider_name_derived_from_host(self):
+        """provider 标识从地址取主机名 —— 这样三个字段就真的只有三个
+        （不需要用户额外填一个"厂家名"）。"""
+        from harness.model import EndpointConfig
+        cfg = EndpointConfig(base_url="https://api.deepseek.com/v1",
+                             api_key="k", model="m")
+        self.assertEqual(cfg.name, "api.deepseek.com")
+
+    # ---------- 落盘与合并 ----------
+    def test_save_and_load_roundtrip(self):
+        from harness.model import EndpointConfig, load_config, save_config
+        cfg = EndpointConfig(base_url="https://x.com/v1", api_key="sk-secret-123",
+                             model="my-model")
+        p = save_config(self.ws.path, cfg)
+        self.assertTrue(os.path.isfile(p))
+        back = load_config(self.ws.path)
+        self.assertEqual(back.base_url, cfg.base_url)
+        self.assertEqual(back.api_key, cfg.api_key)
+        self.assertEqual(back.model, cfg.model)
+
+    def test_config_file_is_not_world_readable(self):
+        """配置含明文 key，权限必须收紧（POSIX 上生效）。"""
+        from harness.model import EndpointConfig, save_config
+        p = save_config(self.ws.path,
+                        EndpointConfig(base_url="https://x.com/v1",
+                                       api_key="sk-x", model="m"))
+        if os.name != "nt":
+            mode = os.stat(p).st_mode & 0o777
+            self.assertEqual(mode, 0o600, "配置文件应是 0600，实际 %o" % mode)
+
+    def test_clear_removes_file(self):
+        from harness.model import (EndpointConfig, clear_config, load_config,
+                                   save_config)
+        save_config(self.ws.path,
+                    EndpointConfig(base_url="https://x.com/v1", api_key="k", model="m"))
+        self.assertTrue(clear_config(self.ws.path))
+        self.assertFalse(load_config(self.ws.path).configured)
+        self.assertFalse(clear_config(self.ws.path), "重复清除应返回 False")
+
+    def test_corrupt_config_falls_back_without_crashing(self):
+        """配置损坏不该炸掉 harness —— 退回"未配置"即可（于是走离线脚本）。"""
+        from harness.model import config_path, load_config
+        p = config_path(self.ws.path)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{ 这不是合法 JSON")
+        cfg = load_config(self.ws.path)      # 不应抛异常
+        self.assertFalse(cfg.configured)
+
+    def test_resolve_endpoint_merges_partial_override(self):
+        """请求只带部分字段时，未带的沿用落盘值。
+
+        这条语义很重要：否则前端每次保存模型名都要重填 key。
+        """
+        from harness.model import (EndpointConfig, resolve_endpoint, save_config)
+        save_config(self.ws.path, EndpointConfig(
+            base_url="https://x.com/v1", api_key="sk-old", model="old-model"))
+        # 只改模型名
+        ep = resolve_endpoint(self.ws.path, {"model": "new-model"})
+        self.assertEqual(ep.model, "new-model")
+        self.assertEqual(ep.api_key, "sk-old", "未提供的字段必须沿用")
+        self.assertEqual(ep.base_url, "https://x.com/v1")
+
+    # ---------- 未配置时的行为 ----------
+    def test_unconfigured_model_returns_actionable_error(self):
+        """三个字段没填全时，错误必须**指名缺什么**，而不是笼统的 401。"""
+        from harness.model import EndpointConfig, HttpModel
+        m = HttpModel(EndpointConfig(base_url="", api_key="", model=""))
+        reply = m.complete({"messages": [{"role": "user", "content": "hi"}]})
+        self.assertIsNotNone(reply.error_layer)
+        self.assertFalse(reply.retryable, "缺配置是不可重试的 —— 重试没有意义")
+        for field in ("接口地址", "API Key", "模型名称"):
+            self.assertIn(field, reply.raw_error)
+
+    # ---------- HTTP 错误翻译 ----------
+    def test_404_distinguishes_url_from_model(self):
+        """**404 有两种完全不同的含义**，必须靠正文区分。
+
+        指错方向比不给提示更糟 —— 用户会去改一个本来正确的字段。
+        这条测试就是为这个场景写的（实测时真的踩到了：
+        模型名不存在时，最初的实现报"地址可能不对"）。
+        """
+        from harness.model import HttpModel
+        model_missing = HttpModel._explain_http(
+            404, '{"error":{"message":"model not found"}}')
+        self.assertIn("模型名称", model_missing,
+                      "模型名不存在时应指向模型名：%s" % model_missing)
+        self.assertNotIn("接口地址", model_missing)
+
+        path_wrong = HttpModel._explain_http(
+            404, '{"error":{"message":"unknown path /v1/chat/completions"}}')
+        self.assertIn("接口地址", path_wrong,
+                      "地址错时应指向地址：%s" % path_wrong)
+
+        unclear = HttpModel._explain_http(404, "Not Found")
+        self.assertIn("或", unclear, "判不出来时要说清两种可能，而不是乱指一个")
+
+    def test_http_errors_get_actionable_hints(self):
+        from harness.model import HttpModel
+        cases = [
+            (401, "API Key"),
+            (403, "权限"),
+            (429, "限流"),
+        ]
+        for code, needle in cases:
+            msg = HttpModel._explain_http(code, "")
+            self.assertIn(needle, msg,
+                          "%d 的提示应指向真正的原因，实际：%s" % (code, msg))
+
+    def test_only_gateway_errors_are_retryable(self):
+        """401/403/404 是配置问题，**不能标成可重试** ——
+        否则用户会白等若干轮退避，最后还是同一个错。"""
+        from harness.model import error_reply
+        self.assertFalse(error_reply(401, "x", retryable=False).retryable)
+        self.assertFalse(error_reply(404, "x", retryable=False).retryable)
+        self.assertTrue(error_reply(429, "x").retryable)
+        self.assertTrue(error_reply(503, "x").retryable)
+
+    def test_parse_detects_error_payload_in_200(self):
+        """有的中转在出错时返回 200 + {"error": {...}}。
+
+        必须识别出来，否则会被当成"模型没说话"，变成一次**静默的失败** ——
+        正是书 §1 警告的那种"看上去毫无破绽"。
+        """
+        from harness.model import EndpointConfig, HttpModel
+        m = HttpModel(EndpointConfig(base_url="https://x.com/v1", api_key="k", model="m"))
+        reply = m._parse({"error": {"message": "quota exceeded"}})
+        self.assertIsNotNone(reply.error_layer)
+        self.assertIn("quota exceeded", reply.raw_error)
+
+    def test_parse_tool_calls_from_openai_shape(self):
+        from harness.model import EndpointConfig, HttpModel
+        m = HttpModel(EndpointConfig(base_url="https://x.com/v1", api_key="k", model="m"))
+        reply = m._parse({"choices": [{"message": {
+            "content": "",
+            "tool_calls": [{"function": {"name": "read_file",
+                                         "arguments": '{"path": "a.py"}'}}],
+        }, "finish_reason": "tool_calls"}]})
+        self.assertEqual(len(reply.tool_calls), 1)
+        self.assertEqual(reply.tool_calls[0].name, "read_file")
+        self.assertEqual(reply.tool_calls[0].args, {"path": "a.py"})
+
+    def test_malformed_tool_args_kept_for_model_to_fix(self):
+        """参数不是合法 JSON 时保留原文，由 router 报结构化错误让模型自纠
+        （书 §5：工具层错误不终止会话，而是变成模型的输入）。"""
+        from harness.model import EndpointConfig, HttpModel
+        m = HttpModel(EndpointConfig(base_url="https://x.com/v1", api_key="k", model="m"))
+        reply = m._parse({"choices": [{"message": {
+            "tool_calls": [{"function": {"name": "read_file",
+                                         "arguments": "{not json"}}],
+        }, "finish_reason": "tool_calls"}]})
+        self.assertEqual(reply.tool_calls[0].args.get("__malformed__"), "{not json")
+
+
 class TempWorkdirOnce:
     _p = None
 

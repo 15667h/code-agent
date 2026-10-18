@@ -34,16 +34,20 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from harness.context import DEFAULT_SYSTEM_PROMPT, StaticPrefix
     from harness.loop import AgentLoop, LoopConfig, build_default_registry
-    from harness.model import (HttpModel, ScriptedModel, error_reply,
-                               resolve_provider, tool_call_reply, final_reply)
+    from harness.model import (ENV_API_KEY, ENV_BASE_URL, ENV_MODEL, EndpointConfig,
+                               HttpModel, ScriptedModel, clear_config, config_path,
+                               error_reply, load_config, mask_key, normalize_base_url,
+                               resolve_endpoint, save_config, tool_call_reply, final_reply)
     from harness.policy import ApprovalPolicy, Policy, SandboxMode
     from harness.protocol import Event, EventBus, EventType
     from harness.session import Session, list_runs
 else:
     from .context import DEFAULT_SYSTEM_PROMPT, StaticPrefix
     from .loop import AgentLoop, LoopConfig, build_default_registry
-    from .model import (HttpModel, ScriptedModel, error_reply,
-                        resolve_provider, tool_call_reply, final_reply)
+    from .model import (ENV_API_KEY, ENV_BASE_URL, ENV_MODEL, EndpointConfig,
+                        HttpModel, ScriptedModel, clear_config, config_path,
+                        error_reply, load_config, mask_key, normalize_base_url,
+                        resolve_endpoint, save_config, tool_call_reply, final_reply)
     from .policy import ApprovalPolicy, Policy, SandboxMode
     from .protocol import Event, EventBus, EventType
     from .session import Session, list_runs
@@ -67,6 +71,8 @@ class RunState:
         self.thread: Optional[threading.Thread] = None
         self.started = time.time()
         self.error: Optional[str] = None
+        # 这次运行实际用的是哪个端点（供前端回显"真的在调谁"）
+        self.endpoint: Optional[EndpointConfig] = None
 
         # ── 审批闸门的阻塞/唤醒机制 ──
         # 设计：工具调用线程在 await_approval() 上**阻塞**，直到
@@ -138,15 +144,18 @@ def create_run(workspace: str, prompt: str,
                sandbox: str = "workspace-write",
                approval: str = "on-request",
                model_name: Optional[str] = None,
-               provider_name: Optional[str] = None,
+               endpoint: Optional[Dict[str, Any]] = None,
                offline_script: Optional[List[str]] = None,
                goal_conditions: Optional[List[str]] = None,
                approval_timeout_s: float = 300.0,
                config: Optional[LoopConfig] = None) -> RunState:
     """装配一次运行。
 
+    **模型接入只有一条路径**：`EndpointConfig`（接口地址 / API Key / 模型名）。
+    配置来源优先级：请求里显式带 > 落盘的 `.crucible/config.json` > 空（走离线脚本）。
+
     `offline_script` 是离线脚本（形如 ["shell:git status", "final:完成"]），
-    让前端在没有 API key 时也能看到**真实驱动**的事件流，
+    让前端在没有 key 时也能看到**真实驱动**的事件流，
     而不是前端自己伪造的假事件 —— 这点很重要：
     书 §1 的消融实验专门警告过「上下文残缺时典型的失败不是报错退出，
     而是一个看上去毫无破绽的答案」。
@@ -156,23 +165,27 @@ def create_run(workspace: str, prompt: str,
     st = RunState(run_id, workspace)
     st.approval_timeout_s = max(1.0, float(approval_timeout_s))
 
-    provider = resolve_provider(provider_name)
+    ep = resolve_endpoint(workspace, endpoint)
     sbx = SandboxMode(sandbox)
     ap = ApprovalPolicy(approval)
 
-    session = Session(workspace, model_name or provider.default_model,
-                      provider.name, sbx.value, ap.value)
+    # 模型选择规则（单一判据，不猜）：
+    #   显式给了 offline_script → 用脚本（测试与演示要确定性）
+    #   端点三个字段齐备      → 用真实模型
+    #   否则                  → 离线脚本（并让 UI 明确显示"未配置"）
+    use_scripted = offline_script is not None or not ep.configured
+    if use_scripted:
+        model = _build_scripted(offline_script)
+    else:
+        model = HttpModel(ep, model_name or ep.model)
+
+    session = Session(workspace, model.name, ep.name, sbx.value, ap.value)
+
     registry, shell = build_default_registry(workspace)
 
     prefix = StaticPrefix(DEFAULT_SYSTEM_PROMPT, registry.specs())
 
     policy = Policy(sbx, ap, workspace)
-
-    # 模型选择：有 key 用真模型，否则用离线脚本
-    if offline_script is not None or provider.name == "stub":
-        model = _build_scripted(offline_script)
-    else:
-        model = HttpModel(provider, model_name)
 
     loop = AgentLoop(
         model=model, registry=registry, prefix=prefix, policy=policy,
@@ -184,6 +197,7 @@ def create_run(workspace: str, prompt: str,
 
     st.loop = loop
     st.session = session
+    st.endpoint = ep
     session.bus.subscribe(st.on_event)
 
     with RUNS_LOCK:
@@ -342,6 +356,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"runs": list_runs(ws)})
         if path == "/api/tools":
             return self._json(200, _tool_manifest())
+        if path == "/api/config":
+            ws = (q.get("workspace") or [os.getcwd()])[0]
+            ep = load_config(ws)
+            return self._json(200, {
+                "endpoint": ep.to_public(),
+                "config_path": config_path(ws),
+                # 这三个环境变量可以作为替代来源（容器/CI 场景不想落盘明文 key）
+                "env_vars": [ENV_BASE_URL, ENV_API_KEY, ENV_MODEL],
+            })
         if path.startswith("/api/run/") and path.endswith("/result"):
             rid = path.split("/")[3]
             st = RUNS.get(rid)
@@ -382,7 +405,7 @@ class Handler(BaseHTTPRequestHandler):
                     sandbox=body.get("sandbox") or "workspace-write",
                     approval=body.get("approval") or "on-request",
                     model_name=body.get("model"),
-                    provider_name=body.get("provider"),
+                    endpoint=body.get("endpoint"),
                     offline_script=body.get("offline_script"),
                     goal_conditions=body.get("goal_conditions"),
                     approval_timeout_s=float(body.get("approval_timeout_s") or 300.0),
@@ -394,7 +417,44 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"run_id": st.run_id,
                                     "run_dir": st.session.run_dir,
                                     "prefix_hash": st.session.meta.prefix_hash,
-                                    "tool_order": st.session.meta.tool_order})
+                                    "tool_order": st.session.meta.tool_order,
+                                    "model": st.session.meta.model,
+                                    "provider": st.session.meta.provider,
+                                    "live": bool(st.endpoint and st.endpoint.configured)})
+
+        # ── 模型接入配置 ──
+        # 只有三个字段。GET 返回掩码后的形态（**绝不回传明文 key**），
+        # POST 保存，/test 用当前配置做一次真实连通性自检。
+        if path == "/api/config":
+            ws = body.get("workspace") or os.getcwd()
+            incoming = body.get("endpoint") or {}
+            current = load_config(ws)
+            # api_key 语义：传了新值就替换；传空字符串显式清除；
+            # **不传**则沿用已有 —— 否则前端每次保存都要重填 key。
+            merged = EndpointConfig(
+                base_url=incoming.get("base_url", current.base_url) or "",
+                api_key=(incoming["api_key"] if "api_key" in incoming else current.api_key) or "",
+                model=incoming.get("model", current.model) or "",
+                requires_reasoning_replay=bool(
+                    incoming.get("requires_reasoning_replay", current.requires_reasoning_replay)),
+            )
+            p = save_config(ws, merged)
+            return self._json(200, {"ok": True, "path": p, "endpoint": merged.to_public()})
+
+        if path == "/api/config/test":
+            ws = body.get("workspace") or os.getcwd()
+            # 优先用请求里带的（用户可能还没保存就想先试），否则用落盘的
+            ep = resolve_endpoint(ws, body.get("endpoint"))
+            model = HttpModel(ep)
+            report = model.selfcheck(timeout_s=float(body.get("timeout_s") or 20.0))
+            report["endpoint"] = ep.to_public()
+            return self._json(200 if report.get("ok") else 200, report)
+
+        if path == "/api/config/clear":
+            ws = body.get("workspace") or os.getcwd()
+            removed = clear_config(ws)
+            return self._json(200, {"ok": True, "removed": removed,
+                                    "endpoint": EndpointConfig().to_public()})
 
         if path.startswith("/api/run/") and path.endswith("/approve"):
             rid = path.split("/")[3]

@@ -359,6 +359,45 @@
     }).catch(function () { return false; });
   }
 
+  /* ---------- 模型接入配置（只有三个字段） ----------
+     走服务端 /api/config，让配置**落在服务端**而不是浏览器 localStorage：
+     · base_url / model 是运行必需，服务端也要用；
+     · api_key 是机密，存服务端一份、浏览器不持久化明文，
+       避免把 key 留在 localStorage 被任何同源脚本读到。
+  */
+  function getConfig(workspace) {
+    var qs = workspace ? ("?workspace=" + encodeURIComponent(workspace)) : "";
+    return get("/api/config" + qs).then(function (r) { return r; });
+  }
+
+  function saveConfig(workspace, endpoint) {
+    return post("/api/config", { workspace: workspace, endpoint: endpoint })
+      .then(function (r) {
+        if (r.status !== 200 || !r.body || !r.body.ok) {
+          throw new Error((r.body && r.body.error) || ("HTTP " + r.status));
+        }
+        return r.body;
+      });
+  }
+
+  function testConfig(workspace, endpoint, timeoutS) {
+    return post("/api/config/test", {
+      workspace: workspace,
+      endpoint: endpoint,
+      timeout_s: timeoutS || 20,
+    }).then(function (r) {
+      if (r.status !== 200 || !r.body) {
+        throw new Error((r.body && r.body.error) || ("HTTP " + r.status));
+      }
+      return r.body;   // { ok, stage, message, url, elapsed_s }
+    });
+  }
+
+  function clearConfig(workspace) {
+    return post("/api/config/clear", { workspace: workspace })
+      .then(function (r) { return r.body; });
+  }
+
   /* ---------- 对外接口 ---------- */
   global.Harness = {
     probe: probe,
@@ -366,6 +405,10 @@
     approve: approve,
     feed: feed,                     // 给自测用：可直接灌一条 harness 事件
     translate: translate,           // 纯函数，便于单测
+    getConfig: getConfig,
+    saveConfig: saveConfig,
+    testConfig: testConfig,
+    clearConfig: clearConfig,
     _state: state,
     attach: function (h) { host = h; },
     isLive: function () { return state.live; },

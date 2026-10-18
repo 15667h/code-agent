@@ -194,8 +194,120 @@
 .modal__acts {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: var(--sp-2);
   margin-top: var(--sp-5);
+}
+/* 表单模态比确认框宽，且需要滚动才能容纳字段 */
+.modal--form { width: min(560px, 100%); }
+.modal--form .modal__acts { flex-wrap: wrap; }
+.fd__spacer { flex: 1 1 auto; }
+.fd__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-2);
+}
+.fd__head .modal__title { margin-bottom: 0; }
+.fd__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  margin-top: var(--sp-5);
+}
+.fd__extra:empty { display: none; }
+.fd__extra { margin-top: var(--sp-4); }
+
+.field__label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: .01em;
+}
+.field__box {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: var(--bg-inset);
+  transition-property: border-color, box-shadow;
+  transition-duration: var(--dur-fast);
+  transition-timing-function: var(--ease-out-quart);
+}
+.field__box:focus-within {
+  border-color: var(--brass-a40);
+  box-shadow: 0 0 0 3px var(--brass-a12);
+}
+.field__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-3);
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  outline: none;
+}
+.field__input::placeholder { color: var(--text-faint); }
+.field__input:-webkit-autofill {
+  -webkit-box-shadow: 0 0 0 40px var(--bg-inset) inset;
+  -webkit-text-fill-color: var(--text);
+}
+select.field__input { font-family: var(--font-sans); cursor: pointer; }
+.field__reveal {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out-quart);
+}
+.field__reveal:hover { color: var(--text); }
+.field__reveal svg { width: 15px; height: 15px; }
+.field__hint {
+  margin-top: 5px;
+  font-size: var(--fs-2xs);
+  color: var(--text-muted);
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+.field--bad .field__box { border-color: var(--vermilion); }
+.field--bad .field__box:focus-within { box-shadow: 0 0 0 3px rgba(200, 80, 60, .14); }
+.field--bad .field__hint { color: var(--vermilion); }
+
+/* 连通性自检的结果条 —— 三种状态各有明确语气 */
+.fdcheck {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-size: var(--fs-xs);
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+.fdcheck svg { flex: none; width: 15px; height: 15px; margin-top: 1px; }
+.fdcheck--ok { border-color: var(--jade-a40, rgba(60, 160, 120, .4)); color: var(--jade); }
+.fdcheck--bad { border-color: var(--vermilion); color: var(--vermilion); }
+.fdcheck--busy { color: var(--text-muted); }
+.fdcheck__meta {
+  display: block;
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--text-muted);
+  word-break: break-all;
 }
 
 /* ============================================================

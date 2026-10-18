@@ -18,8 +18,8 @@
 | `styles/app.css` | 布局与组件样式 |
 | `styles/ui-kit.css` | 交互原语样式（Toast / 弹窗 / 右键菜单 / 命令面板 / Tooltip） |
 | `scripts/mock-data.js` | 演示数据（后端不在时的离线原型用） |
-| `scripts/ui-kit.js` | 交互原语层（焦点陷阱、Toast、确认框、右键菜单、命令面板、无障碍播报） |
-| `scripts/harness-bridge.js` | **桥接层**：把 harness 事件翻译成前端视图模型 |
+| `scripts/ui-kit.js` | 交互原语层（焦点陷阱、Toast、确认框、**表单对话框**、右键菜单、命令面板、无障碍播报） |
+| `scripts/harness-bridge.js` | **桥接层**：harness 事件翻译 + 模型接入配置读写 |
 | `scripts/app.js` | 业务与交互逻辑 |
 | `harness/protocol.py` | 中立轨迹格式 + 事件类型（`seq` 单调不变式） |
 | `harness/context.py` | 静态前缀冻结 + append-only + `prefix_hash()` 断言 |
@@ -27,9 +27,10 @@
 | `harness/tools/` | `registry` / `router` / `fs` / `search` / `patch`(V4A) / `shell` |
 | `harness/verify.py` | 只读结构化字段的验证 + 编辑后即时 lint |
 | `harness/correct.py` | 四级故障分类 + 熔断 + 重复指纹 + 看门狗 + 死亡螺旋防护 |
+| `harness/model.py` | **模型接入**：OpenAI 兼容端点（三字段）+ 连通性自检 + 离线 stub |
 | `harness/loop.py` | ReAct 主循环 + 五功能闭环 + 事件发射 |
 | `harness/server.py` | 零依赖 HTTP + SSE，同源托管前端 |
-| `harness/test_harness.py` | **118 项测试**，每项标注书中出处 |
+| `harness/test_harness.py` | **136 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
 | `docs/codex-architecture.md` | Codex 架构原理调研 |
 | `docs/harness-architecture.md` | 后端架构设计（含逐条对照与待验证清单） |
@@ -47,20 +48,62 @@
 ```bash
 python harness/server.py --port 8787
 # 打开 http://127.0.0.1:8787/index.html
-# 顶栏 chip 变绿、输入坞提示「已连接 harness · 发送即真实运行」即表示已接上
+# 顶栏 chip 变绿即表示已接上 harness
 ```
 
 服务同源托管前端 —— 不需要 CORS，消除一整类问题（书 §1 的边界治理）。
 
-无 API key 时用**离线脚本**也能看到真实驱动的事件流（不是前端伪造的假事件）：
+## 接入任意模型（三个字段）
+
+模型接入**只有一条路径：OpenAI 兼容端点**。点左下角 **设置 → 模型接入**，
+填三项即可：
+
+| 字段 | 示例 | 说明 |
+| --- | --- | --- |
+| 接口地址 | `https://api.deepseek.com/v1` | 末尾带不带 `/chat/completions` 都行，会自动补 |
+| API Key | `sk-…` | 只存在服务端 |
+| 模型名称 | `deepseek-chat` | 该端点上可用的模型 id |
+
+**为什么只做 OpenAI 兼容一种**：为每家写适配器是**永不收敛**的工作。而
+`/chat/completions` 已经是事实标准 —— 国内主流厂家（DeepSeek / 通义 / Kimi /
+智谱 / 硅基流动…）与几乎所有中转站都提供兼容端点。所以接入面收敛成三个字段，
+**换任何厂家或中转，代码一行不动**。
+
+表单里有**测试连接**：填完先验一次再保存，避免「保存成功但根本用不了」。
+失败诊断会指向真正的原因，而不是丢一个 HTTP 码：
+
+| 情况 | 提示 |
+| --- | --- |
+| Key 错 | API Key 无效或已过期 |
+| 模型名不存在 | **模型名称**不存在 —— 该端点没有这个模型 id |
+| 地址错 | **接口地址**不对 —— 注意末尾要不要带 `/v1` |
+| 网络不通 | 连不上 `<url>`，请检查地址与网络 |
+
+> 404 有两种完全不同的含义，判据来自响应正文而不是状态码 ——
+> **指错方向比不给提示更糟**，用户会去改一个本来正确的字段。
+
+配置落在 `<workspace>/.crucible/config.json`（含明文 key，**已在 `.gitignore`**，
+文件权限收紧到 `0600`）。也可用环境变量 `CRUCIBLE_BASE_URL` /
+`CRUCIBLE_API_KEY` / `CRUCIBLE_MODEL` 注入（容器/CI 不想落盘时）。
+
+接口层面：
+
+```bash
+GET  /api/config          # 读配置（api_key 只回掩码）
+POST /api/config          # 存配置；api_key 不传=沿用，传空串=清除
+POST /api/config/test     # 连通性自检，返回可读诊断
+POST /api/config/clear    # 清除
+```
+
+未配置时运行**自动走离线脚本**，不会直接失败 —— 前端也看得到真实驱动的事件流
+（不是前端伪造的假事件）：
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/run \
   -H 'Content-Type: application/json' \
-  -d '{"provider":"stub","prompt":"看看工作区","offline_script":["list:.","read:src/a.py","final:完成"]}'
+  -d '{"prompt":"看看工作区","offline_script":["list:.","read:src/a.py","final:完成"]}'
 ```
 
-配置 API key 后自动切换到真实模型（`provider=openai` / `anthropic`，见 `harness/model.py`）。
 
 ## 后端对标要点
 
@@ -126,15 +169,22 @@ curl -X POST http://127.0.0.1:8787/api/run \
 ## 已验证
 
 **后端**（`python -m harness.test_harness`）
-- **118 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- **136 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
 - 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
   重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
+- 模型接入：地址归一化（中转站四种写法）、api_key 绝不回传明文、掩码可核对、
+  配置落盘权限 0600、损坏配置不炸、key 留空=沿用、404 区分「地址错」与「模型名错」
 
 **端到端**
 - 离线运行：`status=completed`、事件 `seq` 连续、`tool.requested` 与 `tool.output` 一一对应、
   读取结果带行号、中立格式只含 `name/args`、危险命令被识别并拒绝 —— 全通过
 - 闸门：挂起 → 幽灵 `call_id` 被拒（404）→ 回灌批准**恰好执行一次** → 拒绝路径不执行 —— 全通过
-- 浏览器：前端接上 harness 后真实渲染 live 事件卡片，**JS 错误 0**
+- 模型接入（打本地 OpenAI 兼容桩）：三字段保存与落盘、自检路径与鉴权头、
+  四种失败诊断各自指向真因、`200 + error` 形态被识别、key 沿用/清除、清除配置、
+  未配置时自动走离线脚本 —— 全通过
+- 浏览器：前端接上 harness 后真实渲染 live 事件卡片；模型接入对话框三字段、
+  实时地址预览、测试连接、必填校验、保存后状态栏同步、重开回填与掩码、焦点陷阱
+  —— 全通过，**JS 错误 0**
 
 **前端**
 - 语法：`node --check` 四个脚本全通过；CSS 花括号配平；HTML 标签配平

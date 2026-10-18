@@ -18,7 +18,7 @@
     verify.py     结构化验证 + 即时 lint + 目标自证（书 §1 §5）
     correct.py    故障分类 + 指纹检测 + 熔断 + 看门狗（书 §5）
     session.py    会话与 rollout 落盘（可重放、可审计）
-    model.py      Provider 抽象 + 离线 stub
+    model.py      OpenAI 兼容端点接入（三字段：地址 / Key / 模型）+ 离线 stub
     loop.py       ReAct 主循环 + 五功能闭环
     tools/        注册表、路由、文件、搜索、补丁、shell
     server.py     零依赖 HTTP + SSE

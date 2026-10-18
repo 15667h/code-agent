@@ -246,6 +246,236 @@ var UI = (function () {
   }
 
   /* ============================================================
+     FormDialog —— 带字段的表单模态
+     与 confirm 的区别：confirm 只问是非，formDialog 收集**输入**。
+     因此它多负责三件事：字段渲染、校验反馈、提交态（进行中禁用提交）。
+     ============================================================ */
+  function formDialog(opts) {
+    opts = opts || {};
+    var fields = opts.fields || [];
+    var back = h("div", "modalback");
+    var dlg = h("div", "modal modal--form");
+    dlg.setAttribute("role", "dialog");
+    dlg.setAttribute("aria-modal", "true");
+    var titleId = "fd-title-" + Date.now();
+    dlg.setAttribute("aria-labelledby", titleId);
+
+    var head = h("div", "fd__head");
+    var title = h("h2", "modal__title", opts.title || "设置");
+    title.id = titleId;
+    head.appendChild(title);
+    var closeBtn = h("button", "iconbtn iconbtn--sm fd__close");
+    closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "关闭");
+    closeBtn.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>';
+    head.appendChild(closeBtn);
+    dlg.appendChild(head);
+
+    if (opts.desc) dlg.appendChild(h("p", "modal__desc", opts.desc));
+
+    var form = h("form", "fd__form");
+    form.noValidate = true;
+    var inputs = {};
+
+    fields.forEach(function (f) {
+      var wrap = h("div", "field" + (f.full ? " field--full" : ""));
+      var lid = "fld-" + (f.name || Math.random().toString(36).slice(2));
+      var label = h("label", "field__label", f.label || f.name);
+      label.setAttribute("for", lid);
+      wrap.appendChild(label);
+
+      var box = h("div", "field__box");
+      var input;
+      if (f.type === "select") {
+        input = h("select", "field__input");
+        (f.options || []).forEach(function (o) {
+          var op = h("option", null, o.label);
+          op.value = o.value;
+          if (o.value === f.value) op.selected = true;
+          input.appendChild(op);
+        });
+      } else {
+        input = h("input", "field__input");
+        input.type = f.type || "text";
+        input.value = f.value == null ? "" : String(f.value);
+      }
+      input.id = lid;
+      input.name = f.name || "";
+      if (f.placeholder) input.placeholder = f.placeholder;
+      if (f.autocomplete) input.autocomplete = f.autocomplete;
+      if (f.spellcheck === false) input.spellCheck = false;
+
+      // 密码类字段：给一个可切换明文的小开关 —— 填 key 时看不到内容极难排错
+      if (f.type === "password") {
+        var eye = h("button", "field__reveal");
+        eye.type = "button";
+        eye.setAttribute("aria-label", "显示内容");
+        eye.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M2 10s3-5 8-5 8 5 8 5-3 5-8 5-8-5-8-5z" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="10" cy="10" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
+        eye.addEventListener("click", function () {
+          var shown = input.type === "text";
+          input.type = shown ? "password" : "text";
+          eye.setAttribute("aria-label", shown ? "显示内容" : "隐藏内容");
+          input.focus();
+        });
+        box.appendChild(input);
+        box.appendChild(eye);
+      } else {
+        box.appendChild(input);
+      }
+      wrap.appendChild(box);
+
+      var hint = h("div", "field__hint", f.hint || "");
+      if (!f.hint) hint.hidden = true;
+      wrap.appendChild(hint);
+
+      form.appendChild(wrap);
+      inputs[f.name] = { input: input, wrap: wrap, hint: hint, def: f };
+    });
+
+    dlg.appendChild(form);
+
+    // 字段之外的自由区域（例如"测试连接"的结果区）
+    var extra = h("div", "fd__extra");
+    form.appendChild(extra);
+
+    var acts = h("div", "modal__acts");
+    if (opts.extraActions) {
+      opts.extraActions.forEach(function (a) {
+        var b = h("button", "btn " + (a.cls || ""), a.label);
+        b.type = "button";      // 非提交按钮，否则会触发校验
+        if (a.id) b.id = a.id;
+        if (a.role) b.dataset.role = a.role;
+        b.dataset.act = a.act || "";
+        acts.appendChild(b);
+      });
+    }
+    var spacer = h("span", "fd__spacer");
+    acts.appendChild(spacer);
+    var cancel = h("button", "btn", opts.cancelLabel || "取消");
+    cancel.type = "button";
+    var ok = h("button", "btn btn--primary", opts.submitLabel || "保存");
+    ok.type = "submit";                 // 必须在 form 内，见下方注释
+    acts.appendChild(cancel);
+    acts.appendChild(ok);
+
+    // **提交按钮必须位于 <form> 内部**。
+    // 放在 form 外面时：回车提交仍然能用（form 的 submit 事件会触发），
+    // 但**点击按钮什么都不会发生** —— 因为按钮不再是 form 的提交控件。
+    // 这个不对称极难发现：两条路径一条通一条不通，实测就踩到了。
+    form.appendChild(acts);
+
+    back.appendChild(dlg);
+    document.body.appendChild(back);
+
+    lockScroll(true);
+    var release = manageFocus(dlg, opts.focusName && inputs[opts.focusName]
+      ? inputs[opts.focusName].input : null);
+
+    function cleanup() {
+      if (release) { release(); release = null; }
+      lockScroll(false);
+      back.classList.add("modalback--out");
+      setTimeout(function () { if (back.parentNode) back.parentNode.removeChild(back); }, 200);
+    }
+
+    function values() {
+      var out = {};
+      Object.keys(inputs).forEach(function (k) { out[k] = inputs[k].input.value; });
+      return out;
+    }
+
+    // ---- 校验：在字段下方就地给反馈，而不是弹一个笼统的 toast ----
+    function setError(name, msg) {
+      var f = inputs[name];
+      if (!f) return;
+      f.wrap.classList.toggle("field--bad", !!msg);
+      f.hint.textContent = msg || f.def.hint || "";
+      f.hint.hidden = !msg && !f.def.hint;
+      if (msg) f.input.setAttribute("aria-invalid", "true");
+      else f.input.removeAttribute("aria-invalid");
+    }
+    function clearErrors() {
+      Object.keys(inputs).forEach(function (k) { setError(k, ""); });
+    }
+    function validate() {
+      clearErrors();
+      var bad = [];
+      Object.keys(inputs).forEach(function (k) {
+        var f = inputs[k];
+        var v = (f.input.value || "").trim();
+        if (f.def.required && !v) { setError(k, "这一项必填。"); bad.push(k); }
+      });
+      return bad;
+    }
+
+    var api = {
+      el: dlg,
+      body: extra,
+      values: values,
+      setError: setError,
+      clearErrors: clearErrors,
+      validate: validate,
+      // 提交中的状态：禁用提交与取消，避免重复提交
+      busy: function (on, label) {
+        ok.disabled = !!on;
+        cancel.disabled = !!on;
+        ok.textContent = on ? (label || "处理中…") : (opts.submitLabel || "保存");
+      },
+      focusField: function (name) {
+        if (inputs[name]) inputs[name].input.focus();
+      },
+      close: function () { cleanup(); if (opts.onClose) opts.onClose(); },
+    };
+
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(v) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(v);
+      }
+      api._finish = finish;
+
+      closeBtn.addEventListener("click", function () { if (!ok.disabled) finish(null); });
+      cancel.addEventListener("click", function () { if (!ok.disabled) finish(null); });
+      back.addEventListener("mousedown", function (e) {
+        if (e.target === back && !ok.disabled) finish(null);
+      });
+      dlg.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && !ok.disabled) { e.preventDefault(); finish(null); }
+      });
+      // extraActions 交给调用方绑（用 data-act 区分），但这里统一做"点击即回调"
+      (opts.extraActions || []).forEach(function (a) {
+        var btn = acts.querySelector('[data-act="' + a.act + '"]');
+        if (btn && a.onClick) btn.addEventListener("click", function () { a.onClick(api); });
+      });
+      form.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (ok.disabled) return;
+        var bad = validate();
+        if (bad.length) { api.focusField(bad[0]); return; }
+        resolveAsync();
+      });
+
+      // onSubmit 可以返回 Promise（异步保存）；用返回值决定是否关闭
+      function resolveAsync() {
+        var v = values();
+        if (!opts.onSubmit) { finish(v); return; }
+        var r = opts.onSubmit(v, api);
+        if (r && typeof r.then === "function") {
+          r.then(function (keep) {
+            if (keep === false) return;   // 调用方要求保持打开（例如校验失败）
+            finish(v);
+          });
+        } else if (r !== false) {
+          finish(v);
+        }
+      }
+    });
+  }
+
+  /* ============================================================
      ContextMenu —— 右键菜单，键盘可达
      ============================================================ */
   var menuCleanup = null;
@@ -622,6 +852,7 @@ var UI = (function () {
     announce: announce,
     toast: toast,
     confirm: confirm,
+    formDialog: formDialog,
     contextMenu: contextMenu,
     closeMenu: closeMenu,
     commandPalette: commandPalette,

@@ -481,6 +481,24 @@ class Handler(BaseHTTPRequestHandler):
             flawed_only = (q.get("flawed_only") or ["0"])[0] in ("1", "true", "yes")
             return self._json(200, analyze_workspace(ws, only_flawed=flawed_only))
 
+        # ── 变更集（改坏了能还原）──
+        if path.startswith("/api/run/") and path.endswith("/changesets"):
+            rid = path.split("/")[3]
+            st = RUNS.get(rid)
+            if st is not None and st.session is not None:
+                cs = st.session.changesets
+            else:
+                run_dir = self._find_run_dir(rid)
+                if run_dir is None:
+                    return self._json(404, {"error": "run not found"})
+                from harness.changeset import ChangeSetStore
+                cs = ChangeSetStore(run_dir,
+                                    default_workspace(), enabled=False)
+            return self._json(200, {
+                "summary": cs.summary(),
+                "history": [c.to_json() for c in cs.history()],
+            })
+
         # 静态：根路径给前端
         if path in ("/", "/index.html"):
             return self._static("index.html")
@@ -577,6 +595,34 @@ class Handler(BaseHTTPRequestHandler):
             removed = clear_config(ws)
             return self._json(200, {"ok": True, "removed": removed,
                                     "endpoint": EndpointConfig().to_public()})
+
+        if path.startswith("/api/run/") and path.endswith("/rollback"):
+            rid = path.split("/")[3]
+            st = RUNS.get(rid)
+            cs = None
+            if st is not None and st.session is not None:
+                cs = st.session.changesets
+            else:
+                # 进程重启后 RUNS 清空 —— 但变更集在盘上，
+                # 回滚**不依赖产生它的进程还活着**（这正是它要解决的问题）。
+                run_dir = self._find_run_dir(rid)
+                if run_dir is None:
+                    return self._json(404, {"error": "run not found"})
+                ws = body.get("workspace") or default_workspace()
+                from harness.changeset import ChangeSetStore
+                cs = ChangeSetStore(run_dir, ws, enabled=False)
+            if cs is None:
+                return self._json(404, {"error": "no changeset store for that run"})
+
+            to_seq = body.get("to_seq")
+            try:
+                to_seq = int(to_seq) if to_seq is not None else None
+            except (TypeError, ValueError):
+                return self._json(400, {"error": "to_seq 必须是整数"})
+            dry = bool(body.get("dry_run", False))
+            result = cs.rollback(to_seq=to_seq, dry_run=dry)
+            code = 200 if result.get("ok") else 207   # 207 = 部分成功，如实表达
+            return self._json(code, result)
 
         if path.startswith("/api/run/") and path.endswith("/approve"):
             rid = path.split("/")[3]

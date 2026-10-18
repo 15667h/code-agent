@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .changeset import ChangeSetStore
 from .chain import HashChain, verify_chain
 from .context import ContextBuilder
 from .protocol import Event, EventBus, Message, Trajectory
@@ -73,7 +74,8 @@ class Session:
                  sandbox: str, approval: str,
                  run_dir: Optional[str] = None,
                  chain_enabled: bool = True,
-                 run_id: str = "") -> None:
+                 run_id: str = "",
+                 changeset_enabled: bool = True) -> None:
         self.meta = SessionMeta(
             session_id=uuid.uuid4().hex[:12],
             workspace=os.path.realpath(workspace),
@@ -93,6 +95,12 @@ class Session:
         # 为什么默认开：它必须先在场才有意义 —— 事后补不上"当时没写"的锚点。
         # 代价是每条事件多一次 hash（微秒级）与一次链头原子写。
         self.chain = HashChain(self.run_dir, enabled=chain_enabled)
+
+        # 变更集记录（改坏了能还原，不靠 git）。
+        # 与事件链并列：一个记录"发生了什么"，一个记录"文件变成了什么样"。
+        # 两者都必须在 run 目录里（回滚可能发生在进程重启之后）。
+        self.changesets = ChangeSetStore(self.run_dir, self.meta.workspace,
+                                        enabled=changeset_enabled)
 
         # 事件一旦产生就落盘（append-only），不攒批 —— 崩溃也不丢
         self.bus.subscribe(self._persist_event)
@@ -169,6 +177,8 @@ class Session:
             "chain_enabled": self.chain.enabled,
             "chain_head": self.chain.head if self.chain.enabled else None,
             "chain_errors": self.chain.errors,
+            # 变更集状态随摘要暴露：审计信息不该藏在需要额外调用的地方
+            "changeset": self.changesets.summary(),
         }
 
 

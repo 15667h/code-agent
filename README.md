@@ -39,8 +39,9 @@
 | `harness/loop.py` | ReAct 主循环 + 五功能闭环 + 事件发射 |
 | `harness/server.py` | 零依赖 HTTP + SSE，同源托管前端 |
 | `harness/errors.py` | **统一错误模板**：出了什么错 + 期望是什么 + 下一步调什么 |
+| `harness/changeset.py` | **变更集与回滚**：改坏了能逐字节还原，不依赖 git |
 | `harness/retention.py` | **类型化保留**：约束 verbatim 永不进摘要器（防压缩悬崖） |
-| `harness/test_harness.py` | **294 项测试**，每项标注书中出处 |
+| `harness/test_harness.py` | **314 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
 | `docs/harness-research-2026.md` | **2026 前沿调研**：ETCLOVG 七层、架构收敛、ECT、压缩悬崖、CapScope、Self-Harness、AHE |
 | `docs/harness-gap-diagnosis.md` | **差距诊断**：逐层读代码，含两个「空壳」实证 |
@@ -181,7 +182,7 @@ curl -X POST http://127.0.0.1:8787/api/run \
 ## 已验证
 
 **后端**（`python -m harness.test_harness`）
-- **294 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- **314 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
 - 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
   重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
 - 模型接入：地址归一化（中转站四种写法）、api_key 绝不回传明文、掩码可核对、
@@ -196,6 +197,12 @@ curl -X POST http://127.0.0.1:8787/api/run \
   未配置时自动走离线脚本 —— 全通过
 - **目标闸门（真实模型 deepseek-v4.1-flash）**：文件落盘 → `check/scope=goal newly_met`
   → `all_met:true` → `completed`；反向用例（要求创建但指示不动手）正确报 `all_met:false`
+- **变更集与回滚（G-6）**：agent 改坏文件后可从 run 目录**逐字节还原**，
+  不依赖 git（`git checkout --` 在 workspace-write 下被允许，既是恢复手段
+  也是破坏手段；且不是每个工作区都有 git）。真实模型/脚本端到端：
+  改坏 + 新建 → 变更集记 2 条 → HTTP 预演（不改动）→ HTTP 真回滚 →
+  原文逐字节还原、新建文件被删除、无关文件未受影响。
+  只读工具**零代价**（对应"75% 的轮次不产生与恢复相关的状态"）。
 - **工具错误统一 + 描述补负例（G-7）**：33 处错误全部收敛到三段式模板
   （同一错误码跨工具措辞一致）；**6 个工具全部具备负例并互相点名替代工具**。
   真实模型复验：任务「找哪个文件定义了 compute_magic_number」→ 工具序列

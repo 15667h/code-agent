@@ -4378,5 +4378,346 @@ class TestToolDescriptionNegatives(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 18. 变更集记录与回滚（G-6）
+# ══════════════════════════════════════════════════════════════════
+class TestChangeSets(unittest.TestCase):
+    """改坏了能还原，且**不靠 git**。
+
+    文档点出的陷阱：`git checkout` 在 workspace-write 下**被允许** ——
+    这既是恢复手段，也是**破坏手段**。而且不是每个工作区都有 git，
+    git 也不跟踪未提交的新文件、不知道"哪一次工具的哪一步干的"。
+
+    前沿依据：
+      · arXiv 2604.28138：**>75% 的轮次不产生与恢复相关的状态**
+        → 不做每轮全量快照，只在文件确实变了时记录
+      · arXiv 2605.22781：只复制变化（检查点 14ms / 回滚 5ms）
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        self.run_dir = tempfile.mkdtemp(prefix="crucible-cs-run-")
+
+    def tearDown(self):
+        self.ws.cleanup()
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+
+    def _store(self, **kw):
+        from harness.changeset import ChangeSetStore
+        return ChangeSetStore(self.run_dir, self.ws.path, **kw)
+
+    def _write(self, rel, text):
+        """二进制写入 —— 文本模式在 Windows 上会翻 \n 成 \r\n，
+        那会让"原内容"与"我们以为的原内容"不一致，掩盖真实缺陷。"""
+        p = os.path.join(self.ws.path, rel)
+        os.makedirs(os.path.dirname(p) or self.ws.path, exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(text.encode("utf-8"))
+
+    def _read(self, rel):
+        p = os.path.join(self.ws.path, rel)
+        if not os.path.exists(p):
+            return None
+        with open(p, "rb") as f:
+            return f.read().decode("utf-8")
+
+    def _change(self, store, rel, new_text, tool="apply_patch", seq=1):
+        before = store.capture_before([rel])
+        self._write(rel, new_text)
+        return store.capture([rel], tool, seq=seq, before=before)
+
+    # ---------- 核心：逐字节还原 ----------
+    def test_rollback_restores_byte_exact(self):
+        """**回滚的唯一价值是逐字节还原。**
+
+        做不到逐字节，那就不叫还原，叫"换了个内容的文件"。
+        实测踩到过：文本模式写入会把 `\\n` 翻成 `\\r\\n`，
+        回滚后内容与原文不一致 —— 所以读写都必须二进制。
+        """
+        self._write("a.py", "x = 1\n")
+        st = self._store()
+        self._change(st, "a.py", "x = 999999\n")
+        self.assertEqual(self._read("a.py"), "x = 999999\n")
+        r = st.rollback()
+        self.assertTrue(r["ok"])
+        self.assertEqual(self._read("a.py"), "x = 1\n",
+                         "回滚后必须与原文逐字节一致")
+
+    def test_rollback_removes_newly_created_file(self):
+        """回滚"新建"意味着**删掉**它 —— 不是清空。"""
+        st = self._store()
+        self._change(st, "new.txt", "内容\n")
+        self.assertEqual(self._read("new.txt"), "内容\n")
+        st.rollback()
+        self.assertIsNone(self._read("new.txt"))
+
+    def test_rollback_restores_deleted_file(self):
+        """回滚"删除"意味着**还原**它。"""
+        self._write("gone.txt", "重要\n")
+        st = self._store()
+        before = st.capture_before(["gone.txt"])
+        os.remove(os.path.join(self.ws.path, "gone.txt"))
+        st.capture(["gone.txt"], "apply_patch", seq=1, before=before)
+        self.assertIsNone(self._read("gone.txt"))
+        r = st.rollback()
+        self.assertTrue(r["ok"])
+        self.assertEqual(self._read("gone.txt"), "重要\n")
+
+    def test_unrelated_files_untouched(self):
+        """回滚只动记录过的文件 —— 不能顺手把别的文件也改了。"""
+        self._write("keep.txt", "原样\n")
+        self._write("a.py", "x = 1\n")
+        st = self._store()
+        self._change(st, "a.py", "x = 2\n")
+        st.rollback()
+        self.assertEqual(self._read("keep.txt"), "原样\n")
+
+    # ---------- "只在变了时记录" ----------
+    def test_no_record_when_content_unchanged(self):
+        """**内容没变就不记录** —— 这是"75% 的轮次不付代价"的落地。
+
+        每次都记 = 那 75% 白付代价。
+        """
+        self._write("a.py", "same\n")
+        st = self._store()
+        before = st.capture_before(["a.py"])
+        # 写入完全相同的内容
+        self._write("a.py", "same\n")
+        cs = st.capture(["a.py"], "apply_patch", seq=1, before=before)
+        self.assertEqual(cs, [], "内容未变时不该产生变更记录")
+        self.assertEqual(st.summary()["changes"], 0)
+
+    def test_blob_dedup_by_content(self):
+        """同一份旧内容反复出现 → blob 只存一份（内容哈希做文件名）。"""
+        st = self._store()
+        for i in range(3):
+            self._write("a.py", "original\n")
+            self._change(st, "a.py", f"v{i}\n", seq=i + 1)
+        blobs = os.listdir(os.path.join(self.run_dir, "changesets", "blobs"))
+        self.assertEqual(len(blobs), 1, f"同内容应去重，实际 {blobs}")
+
+    # ---------- 按 seq 回滚 ----------
+    def test_rollback_to_seq_keeps_earlier_changes(self):
+        """回滚到 seq=N → **只撤销 seq>=N 的**，更早的保留。"""
+        self._write("a.py", "v0\n")
+        st = self._store()
+        self._change(st, "a.py", "v1\n", seq=1)
+        self._change(st, "a.py", "v2\n", seq=5)
+        r = st.rollback(to_seq=5)
+        self.assertTrue(r["ok"])
+        self.assertEqual(self._read("a.py"), "v1\n",
+                         "应回到 seq=5 之前的那一刻（v1）")
+
+    def test_rollback_is_reverse_order(self):
+        """同一文件被改两次 → 必须**倒序**还原。
+
+        正序还原会用"较早的旧内容"盖掉"较晚的正确状态"。
+        """
+        self._write("a.py", "v0\n")
+        st = self._store()
+        self._change(st, "a.py", "v1\n", seq=1)
+        self._change(st, "a.py", "v2\n", seq=2)
+        st.rollback()
+        self.assertEqual(self._read("a.py"), "v0\n",
+                         "倒序还原后应回到最初的 v0")
+
+    def test_dry_run_does_not_touch_workspace(self):
+        """预演必须**真的不改**任何东西 —— 否则它就不是预演。"""
+        self._write("a.py", "v0\n")
+        st = self._store()
+        self._change(st, "a.py", "v1\n")
+        r = st.rollback(dry_run=True)
+        self.assertTrue(r["dry_run"])
+        self.assertEqual(self._read("a.py"), "v1\n", "预演改了工作区")
+
+    # ---------- 边界与诚实报告 ----------
+    def test_missing_blob_is_reported_not_silent(self):
+        """内容块丢了 → **如实跳过并报告**，不能假装还原成功。"""
+        self._write("a.py", "v0\n")
+        st = self._store()
+        self._change(st, "a.py", "v1\n")
+        # 手动删掉 blob
+        blob_dir = os.path.join(self.run_dir, "changesets", "blobs")
+        for f in os.listdir(blob_dir):
+            os.remove(os.path.join(blob_dir, f))
+        r = st.rollback()
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["skipped"])
+        self.assertEqual(r["skipped"][0]["path"], "a.py")
+
+    def test_binary_file_not_pretended(self):
+        """二进制文件**如实拒绝记录**，不假装能还原。
+
+        静默存乱码会让回滚把文件写成损坏内容，比不回滚更糟。
+        """
+        p = os.path.join(self.ws.path, "blob.bin")
+        with open(p, "wb") as f:
+            f.write(bytes([0xFF, 0xFE, 0x00, 0x01]))
+        st = self._store()
+        before = st.capture_before(["blob.bin"])
+        self.assertIsNone(before["blob.bin"],
+                          "二进制文件不该被当成可还原的文本")
+
+    def test_path_escape_ignored(self):
+        """越界路径不记录（与 fs.resolve_within 同一判据）。"""
+        st = self._store()
+        before = st.capture_before(["../outside.txt", "/abs/path"])
+        self.assertEqual(before, {})
+
+    def test_can_be_disabled(self):
+        st = self._store(enabled=False)
+        self._write("a.py", "v0\n")
+        before = st.capture_before(["a.py"])
+        self._write("a.py", "v1\n")
+        cs = st.capture(["a.py"], "apply_patch", seq=1, before=before)
+        self.assertEqual(cs, [])
+        self.assertFalse(st.summary()["enabled"])
+
+    def test_snapshot_skips_runtime_dirs(self):
+        """全目录快照必须跳过 .crucible/.git 等 —— 否则每次都有"假变更"。"""
+        from harness.changeset import _SNAP_IGNORE
+        self.assertIn(".crucible", _SNAP_IGNORE)
+        self.assertIn(".git", _SNAP_IGNORE)
+        self._write("a.py", "v0\n")
+        os.makedirs(os.path.join(self.ws.path, ".crucible", "runs"), exist_ok=True)
+        self._write(".crucible/runs/x.jsonl", "{}\n")
+        st = self._store()
+        snap = st.snapshot_workspace_content()
+        self.assertIn("a.py", snap)
+        self.assertFalse([k for k in snap if k.startswith(".crucible")])
+
+    def test_index_is_append_only(self):
+        """索引是 append-only：新增变更不会重写已有行。"""
+        self._write("a.py", "v0\n")
+        st = self._store()
+        self._change(st, "a.py", "v1\n", seq=1)
+        first = open(os.path.join(self.run_dir, "changesets", "index.jsonl"),
+                     encoding="utf-8").read()
+        self._change(st, "a.py", "v2\n", seq=2)
+        second = open(os.path.join(self.run_dir, "changesets", "index.jsonl"),
+                      encoding="utf-8").read()
+        self.assertTrue(second.startswith(first), "已有行被改写")
+
+    def test_corrupt_index_line_does_not_break_history(self):
+        self._write("a.py", "v0\n")
+        st = self._store()
+        self._change(st, "a.py", "v1\n", seq=1)
+        with open(os.path.join(self.run_dir, "changesets", "index.jsonl"),
+                  "a", encoding="utf-8") as f:
+            f.write("{ 这不是合法 JSON\n")
+        self.assertEqual(len(st.history()), 1)
+
+
+class TestChangeSetsInLoop(unittest.TestCase):
+    """变更集接进主循环后：真实工具改动能否被完整记录并可回滚。"""
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        # 注意：TempWorkspace.write 走**文本模式**，在 Windows 上会写 \r\n。
+        # 所以下面断言"还原正确"时必须与**磁盘上的真实基线**比，
+        # 不能凭印象写 '\n' —— 那会误判成产品缺陷。
+        self.ws.write("important.txt", "珍贵内容\n")
+        self.ws.write("a.py", "x = 1\n")
+        self._baseline_important = self._read("important.txt")
+        self._baseline_a = self._read("a.py")
+        self.reg, self.shell = build_default_registry(self.ws.path)
+
+    def tearDown(self):
+        self.shell.reset()
+        self.ws.cleanup()
+
+    def _loop(self, script):
+        from harness.loop import AgentLoop, LoopConfig
+        prefix = StaticPrefix("测试", self.reg.specs())
+        sess = Session(self.ws.path, "m", "stub", "workspace-write", "on-request")
+        pol = Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST,
+                     self.ws.path)
+        return AgentLoop(ScriptedModel(script), self.reg, prefix, pol, sess,
+                         LoopConfig(max_iterations=6),
+                         approval_handler=lambda r: "approved"), sess
+
+    def _read(self, rel):
+        p = os.path.join(self.ws.path, rel)
+        if not os.path.exists(p):
+            return None
+        with open(p, "rb") as f:
+            return f.read().decode("utf-8")
+
+    def test_apply_patch_changes_are_recorded_and_rollback_works(self):
+        """**端到端**：agent 改坏文件 + 新建文件 → 回滚逐字节还原。"""
+        loop, sess = self._loop([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: important.txt\n@@\n"
+                "-珍贵内容\n+被我改坏了\n*** End Patch"}),
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Add File: junk.txt\n+垃圾\n*** End Patch"}),
+            final_reply("改完了"),
+        ])
+        res = loop.run("改一下文件")
+        self.assertEqual(res.status, "completed")
+
+        # 改动确实发生了
+        self.assertIn("被我改坏了", self._read("important.txt"))
+        self.assertEqual(self._read("junk.txt"), "垃圾")
+
+        # 变更集完整记录了两次改动
+        hist = sess.changesets.history()
+        paths = {c.path for c in hist}
+        self.assertIn("important.txt", paths)
+        self.assertIn("junk.txt", paths)
+
+        # 回滚
+        r = sess.changesets.rollback()
+        self.assertTrue(r["ok"], f"回滚报告失败：{r}")
+        # 与**磁盘上的真实基线**逐字节比：回滚必须还原到一模一样
+        self.assertEqual(self._read("important.txt"), self._baseline_important,
+                         "必须逐字节还原到基线内容")
+        self.assertIsNone(self._read("junk.txt"), "新建的文件应被删除")
+        self.assertEqual(self._read("a.py"), self._baseline_a,
+                         "无关文件不该被动")
+
+    def test_read_only_tools_produce_no_changeset(self):
+        """**只读工具零代价** —— 这是"75% 的轮次不付代价"的落地。"""
+        loop, sess = self._loop([
+            tool_call_reply("read_file", {"path": "a.py"}),
+            tool_call_reply("list_dir", {"path": "."}),
+            tool_call_reply("grep", {"pattern": "x"}),
+            final_reply("看完了"),
+        ])
+        loop.run("看看文件")
+        self.assertEqual(sess.changesets.summary()["changes"], 0,
+                         "只读操作不该产生任何变更记录")
+
+    def test_changeset_summary_exposed_in_session(self):
+        loop, sess = self._loop([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Update File: a.py\n@@\n-x = 1\n+x = 2\n*** End Patch"}),
+            final_reply("好了"),
+        ])
+        loop.run("改 a.py")
+        s = sess.summary()
+        self.assertIn("changeset", s)
+        self.assertGreaterEqual(s["changeset"]["changes"], 1)
+
+    def test_shell_write_is_captured_via_snapshot(self):
+        """shell 写文件**无法预知路径** → 靠执行前内容快照兜底。
+
+        这是最容易漏的一条：apply_patch 能从补丁头解析路径，
+        shell（`echo x > f.txt`）不能。
+        """
+        loop, sess = self._loop([
+            tool_call_reply("shell", {"command": "echo hello > made_by_shell.txt"}),
+            final_reply("好了"),
+        ])
+        loop.run("用命令建个文件")
+        if self._read("made_by_shell.txt") is None:
+            self.skipTest("本平台 shell 未生成文件，跳过")
+        paths = {c.path for c in sess.changesets.history()}
+        self.assertIn("made_by_shell.txt", paths,
+                      "shell 写文件也必须被记进变更集")
+        sess.changesets.rollback()
+        self.assertIsNone(self._read("made_by_shell.txt"))
+
+
+# ══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     unittest.main(verbosity=2)

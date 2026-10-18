@@ -85,6 +85,13 @@ class ToolRouter:
         # 本会话累计
         self._executed: List[Dict[str, Any]] = []
 
+        # 变更集记录（改坏了能还原，不靠 git）。
+        # 由 session 注入 —— router 不自己创建它，因为它的落盘位置
+        # 属于 run 目录（session 的地盘）。
+        self.changesets = None      # 类型为 changeset.ChangeSetStore 或 None
+        # 事件序号提供者：用于把变更挂到具体 seq 上（支持"回滚到第 N 步"）
+        self.seq_provider: Optional[Callable[[], int]] = None
+
     # ------------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------------
@@ -146,12 +153,47 @@ class ToolRouter:
 
         # ── 4. 执行 ──
         t0 = time.time()
+
+        # 变更集：**执行前**必须把旧内容拍下来。
+        # 这是唯一时机 —— 文件一旦被写，旧内容就没了，事后无法补救。
+        #
+        # 两种预判方式，按代价从低到高：
+        #   · 工具已给出结构化路径（action.paths，如 apply_patch）→ 只读那几个文件
+        #   · 无法预知（shell）→ 但有副作用时，拍一份工作区内容快照
+        #
+        # 只读工具（side_effect=False）**完全不付代价** ——
+        # 这正对应 arXiv 2604.28138 的实测："**>75% 的轮次不产生与恢复相关的状态**"。
+        pre_content: Dict[str, Optional[str]] = {}
+        pre_is_full = False
+        if self.changesets is not None:
+            if action.paths:
+                pre_content = self.changesets.capture_before(action.paths)
+            elif action.side_effect:
+                # 全工作区内容快照 —— 标记为"完整快照"，
+                # 这样工具事后报出的新文件才能被正确判为"当时不存在"。
+                # 否则 shell 建文件会整条漏记（实测踩到，且不报错，很隐蔽）。
+                pre_content = self.changesets.snapshot_workspace_content()
+                pre_is_full = True
+
         try:
             res = tool.handler(call.args)
         except Exception as e:
             res = tool_error(call.name, "exception",
                              f"工具执行抛异常：{type(e).__name__}: {e}")
         dur = round(time.time() - t0, 3)
+
+        # 执行后记录变更。
+        # 优先用工具**自己报告**的 files_changed（结构化、最准）；
+        # 若它没报，则用"执行前快照 vs 当前内容"做差分兜底（覆盖 shell 写文件）。
+        if self.changesets is not None and res.ok:
+            if res.files_changed:
+                self.changesets.capture(res.files_changed, call.name,
+                                        seq=self._next_seq(), before=pre_content,
+                                        before_was_full_snapshot=pre_is_full)
+            elif pre_content:
+                self.changesets.capture(list(pre_content.keys()), call.name,
+                                        seq=self._next_seq(), before=pre_content,
+                                        before_was_full_snapshot=pre_is_full)
 
         # ── 5. 输出截断 + 落盘 ──
         res = self._cap_output(res, call.name, call_id)
@@ -176,6 +218,23 @@ class ToolRouter:
                           diff=res.meta.get("diff", "") if res.meta else "")
 
         return res
+
+    # ------------------------------------------------------------------
+    # 变更集
+    # ------------------------------------------------------------------
+    def _next_seq(self) -> int:
+        """取当前事件序号，用于把变更挂到具体 seq 上。
+
+        为什么需要 seq 而不是只用记录顺序：seq 是**跨记录可对齐**的标识 ——
+        回滚时能说"回到第 12 步之前"，而"第 3 条变更记录"这种说法
+        在混着事件流看时没有意义。
+        """
+        if self.seq_provider is not None:
+            try:
+                return int(self.seq_provider())
+            except Exception:
+                pass
+        return 0
 
     # ------------------------------------------------------------------
     # 审批

@@ -146,6 +146,12 @@ class AgentLoop:
         self.router = ToolRouter(registry, policy, self.bus,
                                  workspace=session.meta.workspace,
                                  approval_handler=approval_handler)
+        # 注入变更集记录器：让 router 在每次写操作前后留痕（可回滚）。
+        # 由 loop 注入而不是 router 自己创建 —— 落盘位置属于 run 目录
+        # （session 的地盘），router 不该知道 run 目录在哪。
+        self.router.changesets = getattr(session, "changesets", None)
+        # seq 提供者：把变更挂到事件序号上，支持"回滚到第 N 步"
+        self.router.seq_provider = lambda: self.bus.seq
         self.verifier = Verifier(session.meta.workspace)
         self.corrector = Corrector(bus=self.bus)
         self.loop_detector = LoopDetector()

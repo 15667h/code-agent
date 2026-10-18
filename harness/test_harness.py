@@ -1063,7 +1063,48 @@ class TestCorrectLayer(unittest.TestCase):
         from harness.correct import _parse_retry_after
         self.assertEqual(_parse_retry_after("retry-after: 12"), 12.0)
         self.assertEqual(_parse_retry_after("Please try again in 3s"), 3.0)
-        self.assertIsNone(_parse_retry_after("no hint here"))
+
+    def test_api_error_is_not_labelled_as_tool_declaration(self):
+        """**实测修正**：API 层的不可重试错误，不能被说成"工具声明为不可重试"。
+
+        真机踩到：模型接口返回 400（`tool calls and tool results do not match`），
+        `classify()` 因为先看了 `retryable=False` 就返回
+        「工具声明为不可重试，需改变输入或策略」，最终上报又说
+        「请检查 API key、模型名与配额」—— 两句话互相矛盾，
+        而真正该做的是看请求体结构。**指错方向比不给提示更糟。**
+
+        所以 `retryable` 只在**工具层**有权威性；API 层由本模块的标记表判定。
+        """
+        f = classify(ToolResult(
+            ok=False, error_layer="api", retryable=False,
+            text="HTTP 400 Bad Request: tool calls and tool results do not match"))
+        self.assertIs(f.cls, FaultClass.NEEDS_INPUT_CHANGE)
+        self.assertNotIn("工具声明", f.reason,
+                         f"API 层错误被贴上了工具层的标签：{f.reason}")
+        self.assertIn("模型接口", f.reason)
+
+    def test_api_hint_points_at_the_real_cause(self):
+        """不可重试 API 错误的下一步必须按**具体原因**分档。
+
+        一律说"请检查 API key、模型名与配额"会把用户引到错的方向。
+        """
+        from harness.loop import _api_error_hint
+        from harness.correct import Fault
+
+        def hint(text):
+            return _api_error_hint(Fault("api", FaultClass.NEEDS_INPUT_CHANGE,
+                                         "", detail=text))
+
+        self.assertIn("API key", hint("401 Unauthorized"))
+        self.assertIn("模型名称", hint("404 model not found"))
+        self.assertIn("接口地址", hint("404 unknown path /v1/chat/completions"))
+        self.assertIn("请求体", hint("400 tool calls and tool results do not match"))
+        self.assertIn("配额", hint("429 insufficient quota"))
+        # 认不出时如实说，不编一个最可能的原因
+        unknown = hint("something weird happened")
+        self.assertIn("没有可识别的特征", unknown)
+        # 该唯一一条不许出现：它会把所有原因混成一个
+        self.assertNotIn("请检查 API key、模型名与配额", unknown)
 
     def test_backoff_respects_server_hint(self):
         c = Corrector()
@@ -5052,6 +5093,355 @@ class TestCapabilityInLoop(unittest.TestCase):
         s = loop.session.summary()
         self.assertIn("capability", s)
         self.assertIsNotNone(s["capability"])
+
+
+# ══════════════════════════════════════════════════════════════════
+# 子代理与上下文隔离（G-9）
+# ══════════════════════════════════════════════════════════════════
+# 依据《Role Separation Is Not Verification》：
+#   单代理（代码与测试同对话）测试准确率 61.0%
+#   多代理但*测试设计者看不到代码*             87.8%
+# → **收入来自上下文隔离，不是"分成两个 agent"。**
+#
+# 所以这个测试类的核心不是"能不能跑子代理"，而是
+# **隔离在结构上不可能被绕过**。
+# 用"约定"实现的隔离必然会失效，而且失效时**不报错** ——
+# 那正是本项目反复踩的那类"看上去正常的失败"。
+class TestSubAgentIsolation(unittest.TestCase):
+    """隔离的结构性质：用类型与签名把约束钉死。"""
+
+    def test_spec_has_no_channel_for_upstream_reasoning(self):
+        """`SubAgentSpec` 里**没有**任何能承载上游推理的字段。
+
+        测试写成一个"黑名单"形式，是为了表达这条约束的意图：
+        将来有人想加 `context` / `summary` / `history` 字段时会撞到它。
+        有任何一条命中，隔离就有了漏的通道，而漏了**不会报错**。
+        """
+        from harness.subagent import SubAgentSpec
+        fields = set(SubAgentSpec.__dataclass_fields__.keys())
+        forbidden = {"context", "history", "messages", "transcript", "summary",
+                     "parent_messages", "parent_context", "previous_reasoning",
+                     "reasoning", "notes", "upstream", "conversation"}
+        hit = fields & forbidden
+        self.assertEqual(hit, set(),
+                         f"SubAgentSpec 出现了可能承载上游推理的字段：{hit}")
+
+    def test_verification_prompt_cannot_receive_claim(self):
+        """验证提示词的**签名里没有 claim 参数** —— 不是"别传"，是"没地方传"。"""
+        import inspect
+        from harness.subagent import build_verification_prompt
+        params = set(inspect.signature(build_verification_prompt).parameters)
+        self.assertEqual(params, {"spec", "artifacts"},
+                         f"签名出现了额外参数：{params}。"
+                         "每个新参数都是一条把上游内容漏进验证者的通道。")
+        for bad in ("claim", "answer", "summary", "reasoning", "history", "context"):
+            self.assertNotIn(bad, params)
+
+    def test_isolated_context_contains_only_the_spec(self):
+        """隔离上下文里**只有规格**一条消息。"""
+        from harness.subagent import SubAgentSpec, build_isolated_context
+        from harness.context import StaticPrefix
+        from harness.loop import build_default_registry
+        ws = TempWorkspace()
+        try:
+            reg, shell = build_default_registry(ws.path)
+            prefix = StaticPrefix("测试", reg.specs())
+            spec = SubAgentSpec(name="v1", role="verifier", task="验证某件事")
+            ctx, rec = build_isolated_context(prefix, spec, ws.path)
+            self.assertEqual(len(ctx), 1)
+            self.assertEqual(ctx.trajectory()[0].content, "验证某件事")
+            self.assertFalse(rec.parent_context_leaked)
+            self.assertEqual(rec.context_messages, 1)
+            shell.reset()
+        finally:
+            ws.cleanup()
+
+    def test_isolation_record_states_what_was_withheld(self):
+        """隔离记录必须**双向**：不只记给了什么，还要记刻意没给什么。
+
+        只记"给了什么"无法回答"隔离到底做了没有" ——
+        不可观察的机制等于没有（本项目在哈希链与能力账本上都验证过这条）。
+        """
+        from harness.subagent import (SubAgentSpec, build_isolated_context,
+                                      WITHHELD_TEMPLATE)
+        from harness.context import StaticPrefix
+        from harness.loop import build_default_registry
+        ws = TempWorkspace()
+        try:
+            reg, shell = build_default_registry(ws.path)
+            prefix = StaticPrefix("测试", reg.specs())
+            ctx, rec = build_isolated_context(
+                prefix, SubAgentSpec(name="v1", task="t"), ws.path)
+            self.assertEqual(len(rec.withheld), len(WITHHELD_TEMPLATE),
+                             "隔离记录漏掉了某些 withheld 项")
+            joined = " ".join(rec.withheld)
+            # 五条硬约束各自都必须在记录里出现
+            for key in ("reasoning", "工具输出", "对话历史",
+                        "最终回答", "压缩摘要"):
+                self.assertIn(key, joined,
+                              f"隔离记录里没有提到「{key}」")
+            shell.reset()
+        finally:
+            ws.cleanup()
+
+    def test_verification_prompt_carries_no_generator_statement(self):
+        """验证提示词里不能出现生成者的自述。
+
+        实测踩过：文档 7.3 说摘要会朝上游结论方向压缩
+        （2500+ 对话、25 万次推理），所以验证者读了"我改好了"之后
+        判断就会被引过去，**而且它自己不会知道**。
+
+        判据刻意用**生成者独有的具体说法**而不是"已完成"这类通用词 ——
+        提示词本身就写着"不要因为任务简单就推断已完成"，
+        用通用词判会把那句正确的话也判成泄漏（第一版就是这么误报的）。
+        """
+        from harness.subagent import SubAgentSpec, build_verification_prompt
+        claim = "我已经把 add 函数改好了，测试全部通过，请放心。"
+        spec = SubAgentSpec(name="v1", task="把 a.py 改成 x = 2")
+        p = build_verification_prompt(
+            spec,
+            {"status": "completed", "files_changed": ["a.py"],
+             "commands": [{"command": "pytest -q", "exit_code": 0}],
+             "tool_sequence": ["apply_patch", "shell"]})
+        # 生成者独有的说法一个都不能出现
+        for leak in ("我改好了", "全部通过", "请放心", claim):
+            self.assertNotIn(leak, p, f"提示词里漏进了生成者的说法：{leak}")
+        # 只包含客观产物
+        self.assertIn("a.py", p)
+        self.assertIn("[0] pytest -q", p)
+
+    def test_verification_prompt_tells_verifier_to_read_files(self):
+        """**实测补上的设计缺口**：验证者必须被告知"去读文件"。
+
+        真机踩到：第一版只给产物清单，deepseek-v4.1-flash 一次工具都没调用，
+        直接回「calc.py 的内容不可见，无法确认 add 是否已修好」。
+        它的推理没错（清单确实不含内容），但**正确做法是去读**——
+        它只读沙箱、有 read_file，读文件是被期待的。
+
+        「隔离」不等于「只能看摘要」。不写清楚这句，验证者就会停在
+        "看不出来"上 —— 那是**假阴性**：明明能核实，却报"无法判断"。
+        假阴性比假阳性更危险：它会让人以为隔离把判断力也隔离掉了。
+        """
+        from harness.subagent import SubAgentSpec, build_verification_prompt
+        p = build_verification_prompt(
+            SubAgentSpec(name="v1", task="修好 calc.py"),
+            {"status": "completed", "files_changed": ["calc.py"],
+             "commands": [], "tool_sequence": ["apply_patch"]})
+        self.assertIn("read_file", p,
+                      "提示词没有告诉验证者可以用 read_file 去核实")
+        self.assertIn("不要", p)
+        self.assertIn("清单里没有的，不要直接判", p,
+                      "必须明确：清单里没有的先去读，读了才判")
+        self.assertIn("也不要直接判「做了」", p,
+                      "反向也要说清：清单里有的不等于做对了")
+
+    def test_verification_prompt_warns_about_weak_assertions(self):
+        """退出码 0 不等于做对了 —— 必须点名"断言太弱"这种情形。
+
+        这是「给了回答≠完成任务」在验证场景的具体形态：
+        一个没有断言的测试文件照样 exit 0。
+        """
+        from harness.subagent import SubAgentSpec, build_verification_prompt
+        p = build_verification_prompt(
+            SubAgentSpec(name="v1", task="修好 calc.py 并写测试"),
+            {"status": "completed", "files_changed": ["calc.py", "test_calc.py"],
+             "commands": [{"command": "pytest", "exit_code": 0}],
+             "tool_sequence": ["shell"]})
+        self.assertIn("断言", p)
+        self.assertIn("退出码 0", p)
+
+    def test_verification_prompt_flags_absent_artifacts(self):
+        """产物为空时必须**明确写出来**，而不是留白让人自己领会。
+
+        留白会被读成"没提到就是没问题" —— 那是书 §1 的"看上去正常的失败"。
+        """
+        from harness.subagent import SubAgentSpec, build_verification_prompt
+        p = build_verification_prompt(
+            SubAgentSpec(name="v1", task="创建 x.txt"),
+            {"status": "completed", "files_changed": [], "commands": [],
+             "tool_sequence": []})
+        self.assertIn("**无**", p)
+        self.assertIn("工具调用序列：（无）", p)
+
+    def test_subagent_result_marks_claim_as_non_evidence(self):
+        """`claim` 必须自带"这不是证据"的标记。"""
+        from harness.subagent import SubAgentResult
+        r = SubAgentResult(agent_id="v1", status="completed", claim="全部通过")
+        self.assertFalse(r.claim_is_evidence)
+        j = r.to_json()
+        self.assertIn("claim_is_evidence", j)
+        self.assertFalse(j["claim_is_evidence"])
+        # 渲染时也要明确标出
+        self.assertIn("非证据", r.to_text())
+
+    def test_run_subagent_signature_has_no_content_params(self):
+        """`run_subagent` 只收**环境**参数，不收**内容**参数。
+
+        父级前缀与父级上下文都不该出现在签名里 ——
+        有了它们，就有一条"顺手复用"的路，而那条路会连带上游结论。
+        """
+        import inspect
+        from harness.subagent import run_subagent
+        params = set(inspect.signature(run_subagent).parameters)
+        forbidden = {"parent_prefix", "parent_ctx", "parent_context",
+                     "context", "prefix", "parent_messages", "history"}
+        hit = params & forbidden
+        self.assertEqual(hit, set(),
+                         f"run_subagent 收了内容类参数：{hit}（应只收环境参数）")
+
+    def test_verifier_gets_a_tighter_sandbox(self):
+        """验证者默认拿不到写权限 —— 否则它能改产物让自己通过。
+
+        这正是 BenchJack 的 conftest.py 手法：不改实现，改检查文件。
+        所以验证者必须只读。
+        """
+        from harness.subagent import SubAgentSpec
+        from harness.policy import SandboxMode
+        rank = {SandboxMode.READ_ONLY: 0, SandboxMode.WORKSPACE_WRITE: 1,
+                SandboxMode.FULL_ACCESS: 2}
+        for spec_sbx in (None, "workspace-write", "danger-full-access"):
+            spec = SubAgentSpec(name="v1", task="t", allow_write=False,
+                                sandbox=spec_sbx)
+            want = SandboxMode(spec_sbx) if spec_sbx else SandboxMode.WORKSPACE_WRITE
+            sbx = want if rank[want] <= rank[SandboxMode.WORKSPACE_WRITE] \
+                else SandboxMode.WORKSPACE_WRITE
+            if rank[sbx] >= rank[SandboxMode.WORKSPACE_WRITE]:
+                sbx = SandboxMode.READ_ONLY
+            self.assertIs(sbx, SandboxMode.READ_ONLY,
+                          f"allow_write=False 时沙箱应被收紧到只读，实际 {sbx}")
+
+
+class TestModelIndependence(unittest.TestCase):
+    """模型独立性判定：**宁可说不知道，不给猜出来的低风险**。"""
+
+    def test_same_model_is_high_risk(self):
+        from harness.subagent import model_independence
+        d = model_independence("deepseek-v4.1-flash", "deepseek-v4.1-flash")
+        self.assertEqual(d["verdict"], "same_model")
+        self.assertEqual(d["risk"], "高")
+
+    def test_same_family_is_flagged(self):
+        """名字不同但同族 → 仍要标出来（共享训练数据的相关失败模式）。"""
+        from harness.subagent import model_independence
+        d = model_independence("deepseek-v4.1-flash", "deepseek-v3")
+        self.assertEqual(d["verdict"], "same_family")
+        self.assertIn(d["risk"], ("中高", "高"))
+
+    def test_unknown_models_report_uncertain_not_low_risk(self):
+        """**这是一条实测修正过的判据。**
+
+        早期版本把"端点不同"当作独立性的**充分条件**，于是两个
+        从未听说过的模型名 + 两个不同端点 → 判"低风险"。
+        但同一个模型完全可能通过两个中转站暴露 —— 端点不同只是佐证。
+
+        给一个猜出来的"低风险"比给"不确定"更坏：
+        它会让一次弱验证被当成强验证接受。
+        """
+        from harness.subagent import model_independence
+        d = model_independence("mystery-model-x", "another-mystery",
+                               "http://a/v1", "http://b/v1")
+        self.assertEqual(d["verdict"], "uncertain")
+        self.assertNotEqual(d["risk"], "低")
+        self.assertIn("无法判定", d["note"])
+
+    def test_distinct_family_with_same_endpoint_is_medium(self):
+        """不同族但同端点 → 风险**中**而非低（中转站可能指向同一后端）。"""
+        from harness.subagent import model_independence
+        d = model_independence("gpt-5.2-codex", "qwen3-max",
+                               "http://relay/v1", "http://relay/v1")
+        self.assertEqual(d["verdict"], "distinct_family")
+        self.assertEqual(d["risk"], "中")
+        self.assertTrue(d["same_endpoint"])
+
+    def test_caveat_is_always_present(self):
+        """必须自带能力边界说明 —— 不要把启发式包装成事实。"""
+        from harness.subagent import model_independence
+        d = model_independence("a", "b")
+        self.assertIn("caveat", d)
+        self.assertIn("不能真正判定同族", d["caveat"])
+
+
+class TestSubAgentInLoop(unittest.TestCase):
+    """集成：隔离在真实循环里成立。"""
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+        self.ws.write("a.py", "x = 1\n")
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    def _fake_model(self, script):
+        from harness.model import ScriptedModel
+        return ScriptedModel(script)
+
+    def test_run_subagent_keeps_context_isolated(self):
+        """子代理跑完后，它的上下文里仍不得出现父级消息。"""
+        from harness.subagent import SubAgentSpec, run_subagent
+        from harness.model import final_reply
+        from harness.policy import SandboxMode
+        spec = SubAgentSpec(name="sub-1", role="worker",
+                            task="看一眼 a.py", allow_write=True)
+        model = self._fake_model([final_reply("看过了")])
+        res = run_subagent(spec, workspace=self.ws.path, model=model,
+                           sandbox=SandboxMode.WORKSPACE_WRITE)
+        self.assertIsNotNone(res.isolation)
+        self.assertFalse(res.isolation.parent_context_leaked)
+        # 规格 + 可能的状态栏 + 一条 assistant；**绝不可能**是父级消息
+        self.assertLessEqual(res.isolation.context_messages, 8,
+                             f"上下文里有 {res.isolation.context_messages} 条消息")
+
+    def test_subagent_capability_ledger_is_separate(self):
+        """子代理的能力账本按自己的 name 分账。
+
+        CapScope 第 4 点：子代理的权限**不自动传导**。
+        落点就是 grantee 用 spec.name。
+        """
+        from harness.subagent import SubAgentSpec, run_subagent
+        from harness.model import final_reply
+        from harness.policy import SandboxMode
+        spec = SubAgentSpec(name="verifier-9", role="verifier", task="验证")
+        model = self._fake_model([final_reply("看过了")])
+        res = run_subagent(spec, workspace=self.ws.path, model=model,
+                           sandbox=SandboxMode.WORKSPACE_WRITE)
+        self.assertEqual(res.capability["grantee"], "verifier-9",
+                         "子代理的账本必须按自己的 id 分账")
+
+    def test_subagent_can_actually_do_work(self):
+        """子代理要能真的干活 —— 否则隔离就成了"隔离到什么都做不了"。"""
+        from harness.subagent import SubAgentSpec, run_subagent
+        from harness.model import tool_call_reply, final_reply
+        from harness.policy import SandboxMode
+        spec = SubAgentSpec(name="sub-2", role="worker",
+                            task="创建 b.txt", allow_write=True)
+        model = self._fake_model([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Add File: b.txt\n+hello\n*** End Patch"}),
+            final_reply("建好了"),
+        ])
+        res = run_subagent(spec, workspace=self.ws.path, model=model,
+                           sandbox=SandboxMode.WORKSPACE_WRITE)
+        self.assertEqual(res.status, "completed")
+        self.assertIn("b.txt", res.artifacts["files_changed"],
+                      f"子代理没真的落盘：{res.artifacts}")
+        self.assertTrue(os.path.exists(os.path.join(self.ws.path, "b.txt")))
+
+    def test_readonly_subagent_cannot_write(self):
+        """`allow_write=False` 的子代理写不进去 —— 这是对验证者的硬保护。"""
+        from harness.subagent import SubAgentSpec, run_subagent
+        from harness.model import tool_call_reply, final_reply
+        from harness.policy import SandboxMode
+        spec = SubAgentSpec(name="v-1", role="verifier",
+                            task="验证", allow_write=False)
+        model = self._fake_model([
+            tool_call_reply("apply_patch", {"patch":
+                "*** Begin Patch\n*** Add File: sneaky.txt\n+x\n*** End Patch"}),
+            final_reply("看过了"),
+        ])
+        run_subagent(spec, workspace=self.ws.path, model=model,
+                     sandbox=SandboxMode.WORKSPACE_WRITE)
+        self.assertFalse(os.path.exists(os.path.join(self.ws.path, "sneaky.txt")),
+                         "只读验证者竟然写成功了 —— 它能改产物让自己通过")
 
 
 # ══════════════════════════════════════════════════════════════════

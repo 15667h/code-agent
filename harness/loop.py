@@ -522,10 +522,15 @@ class AgentLoop:
             )
 
         # 不可重试的 API 错误（401/403/404/400）—— 重试无意义，直接终止
+        #
+        # 措辞按**具体原因**分档，不要一句"请检查 API key、模型名与配额"打包所有情况：
+        # 实测踩到，一条 400（请求体不合法）被这么上报，
+        # 而真正该做的是改请求或换端点 —— 用户会去反复检查 key，白费时间。
+        # **指错方向比不给提示更糟。**
+        hint = _api_error_hint(fault)
         return self._finish(
             "escalated",
-            f"模型接口返回不可重试的错误：{fault.reason}。"
-            "请检查 API key、模型名与配额，而不是重试。",
+            f"模型接口返回不可重试的错误：{fault.reason}。{hint}",
             escalate=True,
         )
 
@@ -935,6 +940,46 @@ class AgentLoop:
             attempted_recoveries=self.corrector.attempted_actions(),
             goal=goal_report, usage=self._usage,
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# API 错误的下一步提示：按**具体原因**分档
+# ══════════════════════════════════════════════════════════════════
+# 为什么需要它：不可重试的 API 错误至少有四种成因，处置方式完全不同 ——
+#   401/403 鉴权、404 模型名或路径、400 请求体不合法、429/配额。
+# 一律说"请检查 API key、模型名与配额"会把用户引到错的方向，
+# 而**指错方向比不给提示更糟**（详见 model.py 里同一条纪律）。
+# 注意顺序：路径判定要排在模型名判定之前 —— 两者都可能是 404，
+# 而 `unknown path` 往往同时含 `not found`，先判模型名会误分类。
+_API_HINTS = (
+    (("401", "403", "unauthorized", "forbidden", "invalid api key", "authentication"),
+     "请检查 API key 是否有效、是否有该模型的权限"),
+    (("400", "tool calls and tool results do not match",
+      "invalid request", "bad request"),
+     "请求体结构有问题（例如工具调用与结果不配对）。"
+     "这是 harness 侧的问题，请把这条错误连同轨迹一起报告"),
+    (("429", "quota", "rate limit", "insufficient"),
+     "配额或限流问题：请检查余额与速率限制"),
+    (("unknown path", "no such route", "unknown url", "404 page"),
+     "接口地址可能不对：OpenAI 兼容端点有的是 `…/v1` 有的不是，请核对"),
+    (("404", "model not found", "unknown model", "no such model", "does not exist"),
+     "模型名称可能写错了：请核对端点实际支持的模型清单"),
+)
+
+
+def _api_error_hint(fault: Fault) -> str:
+    """按错误正文给出**具体**的下一步。
+
+    认不出时如实说"认不出"并给出排查顺序 —— 不要编一个最可能的原因，
+    那会让用户在一个错误方向上反复尝试。
+    """
+    text = (fault.detail or "").lower()
+    for keys, hint in _API_HINTS:
+        if any(k in text for k in keys):
+            return hint + "，而不是重复重试。"
+    return ("错误正文里没有可识别的特征，无法给出确定原因。"
+            "请依次核对：API key 是否有效 → 模型名是否在该端点存在 → "
+            "接口地址是否带对了 `/v1`。")
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -331,14 +331,73 @@
         };
 
       case "turn.completed":
+        // 能力账本若有越界，必须在**结束卡片上**就看得见。
+        // 只在事件流中段浮一条会被滚走，而"这次会话出现过任务外的能力"
+        // 是回合结束时最该被看见的东西。
+        var capOOS = (d.capability && d.capability.out_of_scope) || 0;
+        var capItems = [{
+          ok: d.status === "completed",
+          text: (d.reason || d.answer || "").slice(0, 300),
+        }];
+        if (capOOS > 0) {
+          capItems.push({
+            ok: false, warn: true,
+            text: "本次会话有 " + capOOS + " 次超出任务范围的能力使用"
+                + "（" + JSON.stringify(d.capability.by_code || {}) + "），"
+                + "详见上方「能力越界信号」。",
+          });
+        } else if (d.capability) {
+          capItems.push({
+            ok: true,
+            text: "能力账本：本次会话没有超出任务范围的使用。",
+          });
+        }
         return {
           kind: "check", state: "done", tsOffset: tsOffset,
           title: "回合结束 · " + (d.status || "completed"),
           model: "harness",
-          items: [{
-            ok: d.status === "completed",
-            text: (d.reason || d.answer || "").slice(0, 300),
-          }],
+          items: capItems,
+        };
+
+      case "subagent.completed":
+        // 子代理结果：**产物在前，自述在后并标注非证据**。
+        // 顺序不能反 —— 反过来读的人第一眼看到的就是模型说了什么，
+        // 那正是隔离要避免的认知路径。
+        var art = d.artifacts || {};
+        var items = [];
+        if ((art.files_changed || []).length) {
+          items.push({ ok: true, text: "落盘：" + art.files_changed.join("、") });
+        } else {
+          items.push({ ok: false, warn: true, text: "落盘：无" });
+        }
+        (art.commands || []).slice(0, 5).forEach(function (c) {
+          items.push({
+            ok: c.exit_code === 0,
+            warn: c.exit_code !== 0,
+            text: "[" + c.exit_code + "] " + String(c.command || "").slice(0, 80),
+          });
+        });
+        if (art.tool_sequence && art.tool_sequence.length) {
+          items.push({ ok: true, text: "工具序列：" + art.tool_sequence.join(" → ") });
+        }
+        if (d.isolation) {
+          items.push({
+            ok: true,
+            text: "上下文隔离：" + d.isolation.context_messages + " 条消息"
+                + "（刻意不给：" + (d.isolation.withheld || []).length + " 类内容）",
+          });
+        }
+        if (d.claim) {
+          items.push({
+            ok: true, warn: true,
+            text: "生成者自述（**非证据**）：" + String(d.claim).slice(0, 160),
+          });
+        }
+        return {
+          kind: "check", state: "done", tsOffset: tsOffset,
+          title: "子代理 " + (d.agent_id || "?") + " 结束 · " + (d.status || ""),
+          model: "subagent",
+          items: items,
         };
 
       default:

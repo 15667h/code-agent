@@ -526,6 +526,44 @@ class Handler(BaseHTTPRequestHandler):
             with open(cap_path, "r", encoding="utf-8") as f:
                 return self._json(200, json.load(f))
 
+        # ── 子代理列表（G-9）──
+        # 只读**落盘**，不读内存态：子代理的 run 目录是持久事实，
+        # 而它存在的意义恰恰是"父级进程可能早就没了，结果仍要能查"。
+        # 顺带列出每个子代理的隔离记录 —— 隔离不可见就等于没做。
+        if path.startswith("/api/run/") and path.endswith("/subagents"):
+            rid = path.split("/")[3]
+            run_dir = None
+            st = RUNS.get(rid)
+            if st is not None and st.session is not None:
+                run_dir = st.session.run_dir
+            if run_dir is None:
+                run_dir = self._find_run_dir(rid)
+            if run_dir is None:
+                return self._json(404, {"error": "run not found"})
+            root = os.path.join(run_dir, "subagents")
+            if not os.path.isdir(root):
+                return self._json(404, {
+                    "error": "no subagent records",
+                    "detail": "这次运行没有派出任何子代理。"
+                              "这**不等于**「子代理都失败了」，而是「没有记录」。",
+                })
+            out = []
+            for name in sorted(os.listdir(root)):
+                d = os.path.join(root, name)
+                if not os.path.isdir(d):
+                    continue
+                item: Dict[str, Any] = {"agent_id": name, "run_dir": d}
+                for fn in ("capability.json", "meta.json"):
+                    fp = os.path.join(d, fn)
+                    if os.path.isfile(fp):
+                        try:
+                            with open(fp, "r", encoding="utf-8") as f:
+                                item[fn.replace(".json", "")] = json.load(f)
+                        except (OSError, json.JSONDecodeError):
+                            item[fn.replace(".json", "")] = None
+                out.append(item)
+            return self._json(200, {"subagents": out, "count": len(out)})
+
         # 静态：根路径给前端
         if path in ("/", "/index.html"):
             return self._static("index.html")

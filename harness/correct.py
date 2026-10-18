@@ -100,6 +100,18 @@ def classify(result: ToolResult) -> Optional[Fault]:
     """把一次工具结果归类。
 
     第一判断是「值不值得重试」，而不是「要不要重试」。
+
+    ## 分层必须在"显式声明"之前
+
+    实测踩到的坑：早期实现先看 `result.retryable is False` 就直接返回
+    「工具声明为不可重试」，**不管它其实是 API 层的错误**。
+    于是模型接口返回的 400 被渲染成"工具声明…"，最终上报时又说
+    "请检查 API key、模型名与配额" —— 两句话互相矛盾，
+    而真正该做的是换模型或改请求。**指错方向比不给提示更糟。**
+
+    所以顺序改成：先判层（API / 上下文 / 控制流 / 工具），
+    层内再看显式声明。`retryable` 是工具的自我声明，
+    它只在**工具层**有权威性；API 层该由 `model.py` 的判据说了算。
     """
     if result.ok:
         return None
@@ -107,24 +119,27 @@ def classify(result: ToolResult) -> Optional[Fault]:
     layer = result.error_layer or ERR_TOOL
     text = (result.text or "").lower()
 
-    # 显式声明优先（工具实现方最清楚自己的错误性质）
-    if result.retryable is True:
-        return Fault(layer, FaultClass.RETRYABLE, "工具声明为可重试", detail=result.text[:400])
-    if result.retryable is False:
-        return Fault(layer, FaultClass.NEEDS_INPUT_CHANGE,
-                     "工具声明为不可重试，需改变输入或策略", detail=result.text[:400])
-
+    # ── API 层：由本模块的标记表判定，不采信"工具声明" ──
+    # 为什么：`retryable` 这个字段的语义是"这个工具调用值不值得重试"，
+    # 但 API 层失败的原因（限流 / 鉴权 / 请求不合法）与工具无关，
+    # 套用工具的自我声明会给出错误的方向。
     if layer == ERR_API:
         for pat in NON_RETRYABLE_MARKERS:
             if re.search(pat, text):
                 return Fault(layer, FaultClass.NEEDS_INPUT_CHANGE,
-                             f"API 错误命中不可重试特征 {pat}", detail=result.text[:400])
+                             f"模型接口错误命中不可重试特征（{pat}）："
+                             "需要改配置或改请求，重试无意义",
+                             detail=result.text[:400])
         for pat in RETRYABLE_API_MARKERS:
             if re.search(pat, text):
                 ra = _parse_retry_after(result.text or "")
                 return Fault(layer, FaultClass.RETRYABLE,
-                             f"API 错误命中可重试特征 {pat}", retry_after_s=ra,
-                             detail=result.text[:400])
+                             f"模型接口错误命中可重试特征（{pat}）",
+                             retry_after_s=ra, detail=result.text[:400])
+        if result.retryable is False:
+            return Fault(layer, FaultClass.NEEDS_INPUT_CHANGE,
+                         "模型接口返回不可重试的错误：需要改配置或改请求，重试无意义",
+                         detail=result.text[:400])
         # 未识别 → 保守视为可重试一次（由熔断兜底）
         return Fault(layer, FaultClass.RETRYABLE, "API 层错误未识别，按可重试处理（熔断兜底）",
                      detail=result.text[:400])
@@ -135,6 +150,13 @@ def classify(result: ToolResult) -> Optional[Fault]:
 
     if layer == ERR_CONTROL:
         return Fault(layer, FaultClass.CONTROL_FLOW, "控制流层故障", detail=result.text[:400])
+
+    # ── 工具层：这时"显式声明"才有权威性 ──
+    if result.retryable is True:
+        return Fault(layer, FaultClass.RETRYABLE, "工具声明为可重试", detail=result.text[:400])
+    if result.retryable is False:
+        return Fault(layer, FaultClass.NEEDS_INPUT_CHANGE,
+                     "工具声明为不可重试，需改变输入或换工具", detail=result.text[:400])
 
     # 工具层：默认不可重试 —— 书 §5 明确「原样重试多少次都是同样的结果」
     return Fault(layer, FaultClass.NEEDS_INPUT_CHANGE,

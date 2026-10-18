@@ -3451,10 +3451,17 @@ class TestServerStartupModes(unittest.TestCase):
             ws.cleanup()
 
     def test_find_run_dir_rejects_path_traversal(self):
-        """拒绝路径穿越 —— 这是安全边界，不能被 workspace 参数放宽。"""
+        """拒绝路径穿越 —— 这是安全边界，不能被 workspace 参数放宽。
+
+        字符串用原始字面量（`r"..\\windows"` 这种带 r 前缀的写法）：
+        写成普通字面量时，反斜杠加 w 会被当成**无效转义序列**，
+        于是测的其实不是反斜杠形态的穿越尝试 ——
+        测试仍然"通过"，但那是因为它没在测它声称要测的东西。
+        这类"测得不对"比"测失败"危险得多（本项目已多次踩到）。
+        """
         from harness.server import Handler
         h = Handler.__new__(Handler)
-        for bad in ("../etc/passwd", "..\windows", "/abs", "\abs", ".hidden"):
+        for bad in ("../etc/passwd", r"..\windows", "/abs", r"\abs", ".hidden"):
             self.assertIsNone(h._find_run_dir(bad, "/"), f"{bad} 应被拒绝")
 
     def test_route_handlers_avoid_relative_imports(self):

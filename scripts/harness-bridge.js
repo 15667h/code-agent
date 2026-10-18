@@ -713,6 +713,33 @@
   }
   function toolManifest() { return get("/api/tools"); }
 
+  /* ---------- 工作区只读访问 ---------- */
+  function wsQuery(workspace, extra) {
+    var parts = [];
+    if (workspace) parts.push("workspace=" + encodeURIComponent(workspace));
+    Object.keys(extra || {}).forEach(function (k) {
+      if (extra[k] != null) parts.push(k + "=" + encodeURIComponent(extra[k]));
+    });
+    return parts.length ? "?" + parts.join("&") : "";
+  }
+  function workspaceTree(workspace, path) {
+    return get("/api/workspace/tree" + wsQuery(workspace, { path: path || "" }));
+  }
+  function workspaceFile(workspace, path, maxBytes) {
+    return get("/api/workspace/file" + wsQuery(workspace, {
+      path: path, max_bytes: maxBytes || 524288,
+    }));
+  }
+  function workspaceInfo(workspace) {
+    return get("/api/workspace/info" + wsQuery(workspace, {}));
+  }
+  function workspaceSearch(workspace, q, limit) {
+    return get("/api/workspace/search" + wsQuery(workspace, { q: q, limit: limit || 200 }));
+  }
+  function workspaceTerminal(workspace, cmd) {
+    return get("/api/workspace/terminal" + wsQuery(workspace, { cmd: cmd }));
+  }
+
   /* ---------- 回滚 ---------- */
   function rollback(runId, changeId, workspace) {
     return post("/api/run/" + encodeURIComponent(runId) + "/rollback",
@@ -895,6 +922,43 @@
     };
   }
 
+  /* 用量 → 可显示的统计。
+     ## 三态必须守住
+     `usage === null` 表示**没记录用量**（老 run 或端点没返回），
+     与"用量确实是 0"不是一回事。前者应显示"未记录"，
+     后者才显示 0。报成 0 会让人以为这次调用不花钱。
+
+     `ctxTokens` 是当前上下文的估算量（= 最后一次 prompt_tokens），
+     不是"窗口上限"。前端有个 /200k 的进度条，**分母必须有来源** ——
+     编一个上限比不显示更坏，所以这里把 `contextLimit` 也如实说出来：
+     它是**配置里的预算**，不是模型真实窗口。 */
+  function toUsage(result) {
+    if (!result) return { available: false };
+    var u = result.usage;
+    if (!u) {
+      return { available: false, note: "这次运行没有用量记录（端点未返回 usage）" };
+    }
+    var p = Number(u.prompt_tokens) || 0;
+    var c = Number(u.completion_tokens) || 0;
+    var t = Number(u.total_tokens) || (p + c);
+    return {
+      available: true,
+      prompt: p,
+      completion: c,
+      total: t,
+      // 单次运行的成本明细：这是 harness 唯一能给出的真实成本量
+      fmt: fmtTokens(t),
+      parts: "输入 " + fmtTokens(p) + " · 输出 " + fmtTokens(c),
+    };
+  }
+
+  function fmtTokens(n) {
+    n = Number(n) || 0;
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+    return String(n);
+  }
+
   /* 工具清单 → 分类分组（mcp 视图要用）。 */
   function toToolGroups(payload) {
     if (!payload) return [];
@@ -952,6 +1016,11 @@
     verifyChains: verifyChains,
     diagnoseWorkspace: diagnoseWorkspace,
     toolManifest: toolManifest,
+    workspaceTree: workspaceTree,
+    workspaceFile: workspaceFile,
+    workspaceInfo: workspaceInfo,
+    workspaceSearch: workspaceSearch,
+    workspaceTerminal: workspaceTerminal,
     rollback: rollback,
 
     // 翻译（纯函数，便于单测）
@@ -963,6 +1032,8 @@
     toChangesets: toChangesets,
     toChainVerify: toChainVerify,
     toToolGroups: toToolGroups,
+    toUsage: toUsage,
+    fmtTokens: fmtTokens,
 
     _state: state,
     attach: function (h) { host = h; },

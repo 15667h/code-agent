@@ -848,6 +848,15 @@ var UI = (function () {
     return String(n);
   }
 
+  /* 字节大小。文件树里每个文件都显示它 —— 让"这个文件多大"一眼可见，
+     而不是点开才知道。用 1024 进制（与文件系统一致）。 */
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+    return (n / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
   return {
     announce: announce,
     toast: toast,
@@ -862,6 +871,7 @@ var UI = (function () {
     fmtRel: fmtRel,
     fmtNum: fmtNum,
     fmtTokens: fmtTokens,
+    fmtBytes: fmtBytes,
     trapFocus: trapFocus,
     lockScroll: lockScroll,
   };

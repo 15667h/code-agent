@@ -2313,3 +2313,94 @@ kbd {
   color: var(--jade);
   background: var(--jade-a14);
 }
+
+/* ============================================================
+   真实数据接入后的补充样式
+   ============================================================ */
+
+/* 资源管理器底部的工作区信息块（原来是编的"已索引 …"） */
+.idxnote {
+  margin: 0 12px;
+  padding: 8px 10px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-faint);
+  white-space: pre-line;
+  text-wrap: pretty;
+}
+
+/* 编辑器底部：这个文件的真实元信息（大小 / 行数 / 编码） */
+.filemeta {
+  position: sticky;
+  bottom: 0;
+  margin-top: 8px;
+  padding: 5px 8px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  word-break: break-all;
+}
+
+/* 真实纯文本行：不猜语法，只保证可读 */
+.t-plain { color: var(--text); }
+
+/* 搜索结果行 */
+.srcline {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+/* 源码管理：按运行分组的行 */
+.scmrun {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+.scmrun:first-child { border-top: 0; }
+.scmrun__top {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+.scmrun__id {
+  flex: none;
+  font-size: 10px;
+  color: var(--brass);
+}
+.scmrun__model {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.scmrun__time { flex: none; font-size: 10px; color: var(--text-faint); }
+
+/* 文件树读取出错 */
+.treeerr {
+  padding: var(--sp-2) var(--sp-4);
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--vermilion);
+}
+
+/* 自证条的"有未通过项"状态点 —— 与"通过"区分开 */
+.verify__dot--warn { background: var(--amber); }
+
+/* 文件树里子层级缩进 */
+.filetree--sub { padding-left: 10px; }

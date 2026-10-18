@@ -3550,6 +3550,173 @@ class TestServerStartupModes(unittest.TestCase):
         for bad in ("../etc/passwd", r"..\windows", "/abs", r"\abs", ".hidden"):
             self.assertIsNone(h._find_run_dir(bad, "/"), f"{bad} 应被拒绝")
 
+    def test_workspace_readonly_endpoints(self):
+        """工作区只读端点：文件树 / 读文件 / 概要 / 搜索 / 终端白名单。
+
+        这几条端点是**绕过 policy 的只读接口**（用户在看自己的工作区，
+        不是 agent 在动手），所以必须自己把安全校验做严。
+        """
+        import urllib.request
+        import urllib.parse
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        port = self._port()
+        ws = TempWorkspace()
+        proc = None
+        try:
+            os.makedirs(os.path.join(ws.path, "sub"), exist_ok=True)
+            with open(os.path.join(ws.path, "hello.py"), "w", encoding="utf-8") as f:
+                f.write("print('你好')\n")
+            with open(os.path.join(ws.path, "sub", "deep.txt"), "w", encoding="utf-8") as f:
+                f.write("deep content\n")
+
+            proc = subprocess.Popen(
+                [sys.executable, "harness/server.py", "--port", str(port)],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(60):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/api/health", timeout=1) as r:
+                        if json.load(r).get("ok"):
+                            break
+                except Exception:
+                    time.sleep(0.1)
+
+            # 参数名用 `endpoint` 而不是 `path` —— 后面要传 `path=` 查询参数，
+            # 同名会让 Python 报 "got multiple values for argument"。
+            def get(endpoint, **kw):
+                q = urllib.parse.urlencode(dict(workspace=ws.path, **kw))
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}{endpoint}?{q}", timeout=10) as r:
+                    return json.load(r)
+
+            # 文件树：列出真实内容，跳过噪声目录
+            tree = get("/api/workspace/tree")
+            names = [e["name"] for e in tree.get("entries", [])]
+            self.assertIn("hello.py", names, f"文件树没列出真实文件：{names}")
+            self.assertIn("sub", names)
+
+            # 读文件：UTF-8 中文不能被损坏（这是实测踩过的坑）
+            f1 = get("/api/workspace/file", path="hello.py")
+            self.assertEqual(f1.get("encoding"), "utf-8")
+            self.assertIn("你好", "\n".join(f1.get("lines") or []),
+                          "读文件损坏了 UTF-8 中文")
+
+            # 概要：真实计数 + 明确说明没有索引
+            info = get("/api/workspace/info")
+            self.assertGreaterEqual(info.get("files"), 2)
+            self.assertIs(info.get("indexed"), False,
+                          "必须如实说没有索引，不能编一个已索引状态")
+            self.assertIn("没有代码索引", info.get("index_note", ""))
+
+            # 搜索：复用 agent 的 grep
+            sr = get("/api/workspace/search", q="deep content")
+            self.assertTrue(sr.get("ok"))
+            self.assertIn("grep", sr.get("engine", ""),
+                          "搜索必须复用 agent 的 grep 工具（否则两处会漂移）")
+            self.assertTrue(any("deep.txt" in l for l in sr.get("lines") or []))
+
+            # 终端：白名单放行只读、拒绝危险
+            t1 = get("/api/workspace/terminal", cmd="ls")
+            self.assertTrue(t1.get("ok"), f"ls 应放行：{t1}")
+            # cat 走的是"后端直读"，保证编码正确
+            t2 = get("/api/workspace/terminal", cmd="cat hello.py")
+            self.assertIn("你好", t2.get("text") or "",
+                          "cat 经 shell 会被控制台编码弄坏，应委托读文件函数")
+            for bad_cmd, expect_code in (
+                    ("rm -rf /", "not_allowed"),
+                    ("ls | wc -l", "metachar"),
+                    ("git reset --hard", "not_allowed"),
+                    # python 只允许 --version；允许 -c 等于开放任意代码执行
+                    ("python -c \"import os\"", "not_allowed"),
+                    ("ls > out.txt", "metachar")):
+                tb = get("/api/workspace/terminal", cmd=bad_cmd)
+                self.assertFalse(tb.get("ok"), f"危险命令应被拒：{bad_cmd}")
+                self.assertEqual(tb.get("code"), expect_code,
+                                 f"{bad_cmd} 的拒绝原因码应为 {expect_code}：{tb}")
+                self.assertTrue(tb.get("detail"), "拒绝时必须给出原因")
+
+            # head -n 3 里的数字不能被当成文件名（实测踩过）
+            t3 = get("/api/workspace/terminal", cmd="head -n 1 hello.py")
+            self.assertNotEqual(t3.get("code"), "not_allowed",
+                                f"head -n 1 是合法命令，不该被拒：{t3}")
+
+            # 路径穿越：一律拒绝，且不区分"被拒"与"不存在"
+            for bad in ("../etc/passwd", r"..\windows", "/etc/passwd"):
+                fb = get("/api/workspace/file", path=bad)
+                self.assertTrue(fb.get("error"), f"{bad} 应被拒绝：{fb}")
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            ws.cleanup()
+
+    def test_result_endpoint_falls_back_to_replay(self):
+        """`/result` 也必须能读历史 run —— 否则历史运行取不到用量。
+
+        实测踩到：`/result` 原本只认内存态，于是进程重启后：
+          · 历史运行取不到 `usage`（"这次花了多少 token"的唯一来源）
+        这与 `/events` 曾是同一个坑。**同一个 bug 出现在两个端点，
+        说明上次修的时候只修了眼前那一个** —— 所以这次两处一起测。
+        """
+        import urllib.request
+        import urllib.parse
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        port = self._port()
+        ws = TempWorkspace()
+        proc = None
+        try:
+            run_dir = os.path.join(ws.path, ".crucible", "runs", "histres01")
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump({"session_id": "histres01", "workspace": ws.path,
+                           "model": "m", "created_at": 1.0}, f)
+            evs = [
+                {"type": "turn.started", "seq": 1, "ts": 1.0,
+                 "data": {"workspace": ws.path}},
+                {"type": "turn.completed", "seq": 2, "ts": 2.0,
+                 "data": {"status": "completed", "reason": "任务完成。",
+                          "iterations": 2, "tool_calls": 1,
+                          "usage": {"prompt_tokens": 120, "completion_tokens": 30,
+                                    "total_tokens": 150}}},
+            ]
+            with open(os.path.join(run_dir, "events.jsonl"), "w", encoding="utf-8") as f:
+                for e in evs:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+            proc = subprocess.Popen(
+                [sys.executable, "harness/server.py", "--port", str(port)],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(60):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/api/health", timeout=1) as r:
+                        if json.load(r).get("ok"):
+                            break
+                except Exception:
+                    time.sleep(0.1)
+
+            q = urllib.parse.urlencode({"workspace": ws.path})
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/run/histres01/result?{q}",
+                    timeout=8) as r:
+                body = json.load(r)
+            self.assertEqual(body.get("mode"), "replay")
+            self.assertEqual(body["result"]["status"], "completed")
+            self.assertEqual(body["result"]["usage"]["total_tokens"], 150,
+                             "历史运行的用量必须能读出来")
+            self.assertEqual(body["summary"]["events"], 2)
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            ws.cleanup()
+
     def test_route_handlers_avoid_relative_imports(self):
         """静态检查：路由处理函数里不得出现局部相对导入。
 

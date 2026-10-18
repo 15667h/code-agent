@@ -100,8 +100,13 @@
 
   /* ---------- 状态 ---------- */
   var state = {
-    activeTab: OPEN_TABS[0].path,
-    tabs: OPEN_TABS.map(function (t) { return { path: t.path, dirty: t.dirty }; }),
+    // 初始标签页：**空**。
+    // 原来预置了 mock 的四个文件标签（reconnect.ts / sse-client.ts / …），
+    // 那些文件在真实工作区里不存在 —— 编辑器会显示"无法打开"，
+    // 而标签栏还挂着它们，看起来像"项目里有这几个文件"。
+    // 真实场景下标签来自用户点开的文件，所以初值必须是空的。
+    activeTab: null,
+    tabs: [],
     railView: persisted.activeView || "explorer",
     gateResolved: null,      // null | "approved" | "rejected"
     planOpen: true,
@@ -141,11 +146,77 @@
     streamMode: "mock",
     replayRunId: null,
     replayDetail: null,      // { runId, model, status, count, workspace }
-    replayVMs: null,         // 回放出的视图模型数组
-    replayError: null,       // 回放失败原因（与"没有事件"分开）
+    // ── 工作区真实文件（explorer / editor）──
+    // `treeCache` 按目录缓存已列出的子项：展开一个目录只请求一次，
+    // 收起再展开不重复请求。用 `null` 表示"正在加载"而不是 `{}` ——
+    // 后者会被读成"这个目录是空的"。
+    treeCache: {},
+    treeError: null,
+    fileCache: {},           // path -> { lines, encoding, line_count, truncated }
+    fileError: null,
+    wsInfo: null,            // 工作区概要（状态栏 / 索引提示）
+    wsInfoError: null,
+    searchQuery: "",         // 搜索词
+    searchHits: undefined,   // undefined=没搜过 / null=搜索中 / {..}=结果
+    searchError: null,
+
+    // ── 用量 ──
+    usage: null,
+    usageSource: null,       // "live" | "replay"
   };
 
-  var dirtyFile = { "src/transport/reconnect.ts": true };
+  /* 把外层可见的"重绘钩子"放在 state 旁边。
+     为什么需要它：`updateMeter` / `renderStatusbar` 依赖 DOM 且定义在
+     `init()` 内部（那里才保证 DOM 已就绪），但 `Backend.loadUsage()` 是
+     外层函数、拿不到它们。用 `var` 声明 + 在 init 里赋值，
+     既保住了 init 里的 DOM 时序，外层也能安全调用（未就绪时是空操作）。
+     替代方案是把这几个函数提到外层 —— 那样它们在 init 之前就可能被调到，
+     而那时 DOM 还没准备好。**时序问题不能用作用域调整来绕过。** */
+  var uiHooks = {};
+
+  // 未保存改动的标记表。初值**必须是空的** ——
+  // 原来预置了 `{"src/transport/reconnect.ts": true}`，那是一个 mock 文件，
+  // 会让一个不存在的文件在标签上永远显示"未保存"圆点。
+  // 真实场景下"有未保存改动"只可能来自用户在编辑器里的操作。
+  var dirtyFile = {};
+
+  /* 斜杠命令：**只列真实可用的**。
+     原来这份清单来自 mock-data.js，里面有 /plan、/mcp、/goal、/resume ——
+     这些在 harness 里**都不存在**（没有计划、没有 MCP 服务管理、
+     没有会话续接端点）。把它们摆在"Agent 命令"分组里，
+     用户敲下去只会得到一句"模型看不懂的文本"。
+     现在只保留真有对应行为的，并在描述里写清它做什么。 */
+  var SLASH_COMMANDS = [
+    { cmd: "/clear", desc: "清空事件流（仅前端视图，不影响已落盘的记录）" },
+    { cmd: "/status", desc: "查看上次运行的真实 token 用量" },
+    { cmd: "/sessions", desc: "切到「会话历史」，可回放任一次运行" },
+    { cmd: "/trace", desc: "切到「执行轨迹」，看实际做过的每一步" },
+    { cmd: "/search", desc: "切到「搜索」，在工作区里按内容查找" },
+  ];
+
+  /* 执行一条界面命令。**不在输入框里插文本** ——
+     插文本的旧行为会让用户以为命令发给了模型（实际上模型只是读到
+     一段看不懂的文字）。这里的每条命令都映射到一个真实的界面动作。 */
+  function runSlashCommand(cmd) {
+    var name = String(cmd || "").replace(/^\//, "");
+    if (name === "clear") {
+      if (state.streamMode === "replay") { Backend.exitReplay(); }
+      else { liveVMs = []; }
+      renderStream();
+      updateStreamStat();
+      UI.toast({ tone: "ok", title: "已清空事件流视图",
+                 desc: "只清前端显示；已落盘的记录不受影响。", duration: 3200 });
+      return;
+    }
+    if (name === "status") { showTokenDetail(); return; }
+    if (name === "sessions") { goView("sessions"); return; }
+    if (name === "trace") { if (typeof setPlanOpen === "function") setPlanOpen(true); return; }
+    if (name === "search") { goView("search"); return; }
+    UI.toast({ tone: "warning", title: "未知命令 /" + name,
+               desc: "可用命令见命令面板（Ctrl+K）。", duration: 3600 });
+  }
+
+
 
   /* ---------- 已装好的 DOM 引用 ---------- */
   var D = {};
@@ -613,6 +684,108 @@
       updateStreamStat();
       UI.announce("已退出历史回放");
     },
+
+    /* ---------- 工作区真实文件 ---------- */
+    /* 工作区可能被 agent 改动过 → 丢弃缓存，下次读的是磁盘上最新的。
+       为什么不"精确失效被改的文件"：agent 可能改了任意路径，
+       而我们只能从事件里看到一部分（shell 的改动不总是带 files_changed）。
+       全丢一遍的代价是重新请求，比"显示旧内容"安全得多。 */
+    invalidateWorkspace: function () {
+      state.treeCache = {};
+      state.fileCache = {};
+      Backend.loadWorkspaceInfo();
+      if (state.railView === "explorer") Backend.loadTree("");
+      if (state.activeTab && Backend.available()) Backend.loadFile(state.activeTab);
+    },
+
+    loadTree: function (path) {
+      if (!this.available()) return Promise.resolve(null);
+      var key = path || "";
+      if (state.treeCache[key] !== undefined) {
+        return Promise.resolve(state.treeCache[key]);
+      }
+      state.treeCache[key] = null;      // 加载中
+      renderRail();
+      return window.Harness.workspaceTree(state.workspace, key)
+        .then(function (r) {
+          state.treeCache[key] = r;
+          state.treeError = null;
+          // 父目录的结果也要刷新 —— 展开子目录后父级的"已加载"标记仍有效，
+          // 但如果没有这一步，重绘时会看不到新内容。
+          renderRail();
+          return r;
+        })
+        .catch(function (e) {
+          state.treeCache[key] = { error: String(e && e.message || e) };
+          state.treeError = String(e && e.message || e);
+          renderRail();
+          return null;
+        });
+    },
+
+    loadFile: function (path) {
+      if (!this.available()) return Promise.resolve(null);
+      if (state.fileCache[path]) return Promise.resolve(state.fileCache[path]);
+      // 先占位，避免重复请求
+      state.fileCache[path] = null;
+      return window.Harness.workspaceFile(state.workspace, path)
+        .then(function (r) {
+          if (r && r.error) {
+            state.fileCache[path] = { error: r.error, path: path };
+          } else {
+            state.fileCache[path] = r;
+          }
+          state.fileError = null;
+          renderEditor();
+          return r;
+        })
+        .catch(function (e) {
+          // **失败不写占位**：写下 `{error}` 后再次打开会一直命中错误缓存，
+          // 用户重试也没用（因为缓存判定的是"有没有值"，不是"值是否有效"）。
+          delete state.fileCache[path];
+          state.fileError = String(e && e.message || e);
+          renderEditor();
+          UI.toast({ tone: "danger", title: "打开文件失败",
+                     desc: state.fileError, duration: 5000 });
+          return null;
+        });
+    },
+
+    loadWorkspaceInfo: function () {
+      if (!this.available()) return Promise.resolve(null);
+      return window.Harness.workspaceInfo(state.workspace)
+        .then(function (r) {
+          state.wsInfo = r && !r.error ? r : null;
+          state.wsInfoError = r && r.error ? r.error : null;
+          if (uiHooks.renderStatusbar) uiHooks.renderStatusbar();
+          if (uiHooks.renderBranchChip) uiHooks.renderBranchChip();
+          return state.wsInfo;
+        })
+        .catch(function (e) {
+          state.wsInfo = null;
+          state.wsInfoError = String(e && e.message || e);
+          return null;
+        });
+    },
+
+    /* ---------- 用量 ---------- */
+    loadUsage: function (runId, workspace, source) {
+      if (!this.available()) return Promise.resolve(null);
+      return window.Harness.runResult(runId, workspace)
+        .then(function (r) {
+          var u = window.Harness.toUsage(r && r.result);
+          state.usage = u;
+          state.usageSource = source || "unknown";
+          if (uiHooks.updateMeter) uiHooks.updateMeter();
+          return u;
+        })
+        .catch(function () {
+          state.usage = null;
+          state.usageSource = null;
+          if (uiHooks.updateMeter) uiHooks.updateMeter();
+          return null;
+        });
+    },
   };
 
   /* 事件流统计条：把"当前看的是什么"写清楚。
@@ -878,6 +1051,110 @@
     }
   }
 
+  /* ---------- 真实文件树（按需展开）----------
+     与 mock 版的 FILE_TREE 渲染最大的不同：
+     **只有列出来的那一层才在 DOM 里**。展开一个目录才请求它一次。
+     这不是优化，是必须的 —— 一个真实仓库全量递归会把侧栏塞进几千个节点。
+
+     三态（加载中 / 失败 / 有数据）都要能分辨：
+     `treeCache[path] === undefined` 还没查、`=== null` 正在查、
+     `{error}` 查失败、有 `entries` 才是数据。 */
+  function renderRealTree(path, depth) {
+    var wrap = el("div", "filetree" + (depth ? " filetree--sub" : ""));
+
+    var cached = state.treeCache[path];
+    if (cached === undefined) {
+      // 首次进入：先显示加载占位，再异步取
+      wrap.appendChild(el("div", "dloading", "读取目录…"));
+      Backend.loadTree(path);
+      return wrap;
+    }
+    if (cached === null) {
+      wrap.appendChild(el("div", "dloading", "读取目录…"));
+      return wrap;
+    }
+    if (cached && cached.error) {
+      var e = el("div", "treeerr");
+      e.appendChild(el("span", null, "读取失败：" + cached.error));
+      var retry = el("button", "dbtn", "重试");
+      retry.type = "button";
+      retry.addEventListener("click", function () {
+        delete state.treeCache[path];
+        renderRail();
+      });
+      e.appendChild(retry);
+      wrap.appendChild(e);
+      return wrap;
+    }
+
+    var entries = (cached && cached.entries) || [];
+    if (!entries.length) {
+      wrap.appendChild(el("div", "dloading", "（空目录）"));
+      return wrap;
+    }
+
+    entries.forEach(function (en) {
+      var isDir = en.kind === "dir";
+      var row = el("div", "fileitem" + (isDir ? " fileitem--dir" : ""));
+      row.setAttribute("data-path", en.path);
+      row.appendChild(svg(isDir ? ICONS.dirClosed : ICONS.file, "fileitem__icon"));
+      row.appendChild(el("span", "fileitem__name truncate", en.name));
+      if (!isDir && en.size) {
+        row.appendChild(el("span", "fileitem__size tabular", UI.fmtBytes(en.size)));
+      }
+      row.setAttribute("data-tip", en.path);
+
+      if (isDir) {
+        var openKey = "open:" + en.path;
+        var opened = !!treeState[openKey];
+        row.classList.toggle("is-open", opened);
+        row.querySelector(".fileitem__icon").innerHTML =
+          opened ? ICONS.dirOpen : ICONS.dirClosed;
+        row.addEventListener("click", function () {
+          treeState[openKey] = !treeState[openKey];
+          if (treeState[openKey]) Backend.loadTree(en.path);
+          renderRail();
+        });
+        wrap.appendChild(row);
+        if (opened) wrap.appendChild(renderRealTree(en.path, depth + 1));
+      } else {
+        row.addEventListener("click", function () {
+          if (en.text) {
+            openTab(en.path);
+          } else {
+            UI.toast({ tone: "info", title: "这是二进制文件",
+                       desc: en.path + " 不按文本打开。", duration: 3600 });
+          }
+        });
+        row.addEventListener("contextmenu", function (ev) {
+          ev.preventDefault();
+          UI.contextMenu(ev.clientX, ev.clientY, [
+            { label: "打开", icon: ICONS.file, onClick: function () { openTab(en.path); } },
+            { label: "复制路径", icon: ICONS.file, onClick: function () { UI.copy(en.path, "路径"); } },
+            { label: "复制文件名", icon: ICONS.file, onClick: function () { UI.copy(en.name, "文件名"); } },
+            { sep: true },
+            { label: "加入 agent 上下文", icon: ICONS.book, onClick: function () {
+                addCtxRef(en.path);
+                UI.toast({ tone: "ok", title: "已加入上下文", desc: en.path, duration: 2800 });
+              } },
+          ]);
+        });
+        wrap.appendChild(row);
+      }
+    });
+
+    // 目录被截断 / 有目录被跳过时要说出来，否则会被读成"这里只有这些"
+    if (cached && cached.truncated) {
+      wrap.appendChild(el("div", "dnote", "目录内容超过单次上限，只列出了前 "
+        + entries.length + " 项。"));
+    }
+    if (cached && (cached.skipped || []).length) {
+      wrap.appendChild(el("div", "dnote",
+        "已跳过：" + cached.skipped.join("、") + "（构建产物/依赖目录）"));
+    }
+    return wrap;
+  }
+
   function renderRail() {
     var body = $("#rail-body");
     var title = $("#rail-title");
@@ -885,13 +1162,24 @@
     body.innerHTML = "";
 
     if (state.railView === "explorer") {
+      body.appendChild(dataStateBar());
+
+      if (!Backend.available()) {
+        body.appendChild(emptyHint("后端未连接",
+          "资源管理器读取的是工作区磁盘上的真实内容。启动后端后即可看到。"));
+        return;
+      }
+
+      var wsName = String(state.workspace || "").split(/[\\/]/).filter(Boolean).pop() || "工作区";
       var sect = el("div", "sect");
       var head = el("button", "sect__head");
       head.type = "button";
       head.setAttribute("aria-expanded", "true");
       head.appendChild(svg(ICONS.chevron, "sect__chev"));
-      head.appendChild(el("span", null, "crucible-core"));
-      head.appendChild(el("span", "sect__tail", "· " + WORKSPACE.branch));
+      head.appendChild(el("span", null, wsName));
+      // 分支来自真实的 .git/HEAD（不是编的）
+      head.appendChild(el("span", "sect__tail",
+        state.wsInfo && state.wsInfo.branch ? "· " + state.wsInfo.branch : ""));
       var listWrap = el("div");
       head.addEventListener("click", function () {
         var open = head.getAttribute("aria-expanded") === "true";
@@ -900,60 +1188,109 @@
       });
       sect.appendChild(head);
       sect.appendChild(listWrap);
-      listWrap.appendChild(renderTree(FILE_TREE, 0, listWrap));
+      listWrap.appendChild(renderRealTree("", 0));
       body.appendChild(sect);
-
-      var ig = el("div", "sect");
-      var igHead = el("button", "sect__head");
-      igHead.type = "button";
-      igHead.setAttribute("aria-expanded", "false");
-      igHead.appendChild(svg(ICONS.chevron, "sect__chev"));
-      igHead.appendChild(el("span", null, "未纳管 / 已忽略"));
-      igHead.appendChild(el("span", "sect__tail", "3"));
-      var igWrap = el("div");
-      igWrap.hidden = true;
-      ["node_modules", ".next", "dist"].forEach(function (n) {
-        var r = el("div", "fileitem");
-        r.appendChild(svg(ICONS.dirClosed, "fileitem__icon"));
-        r.appendChild(el("span", "fileitem__name", n));
-        igWrap.appendChild(r);
-      });
-      igHead.addEventListener("click", function () {
-        var open = igHead.getAttribute("aria-expanded") === "true";
-        igHead.setAttribute("aria-expanded", open ? "false" : "true");
-        igWrap.hidden = open;
-      });
-      ig.appendChild(igHead);
-      ig.appendChild(igWrap);
-      body.appendChild(ig);
 
       body.appendChild(buildIndexNote());
       return;
     }
 
     if (state.railView === "search") {
+      // 真实搜索：走 /api/workspace/search，后端复用 agent 的 grep 工具。
+      // 三态（未搜 / 搜索中 / 有结果或明确空）都要分得清。
       var wrap = el("div", "railinput");
       wrap.appendChild(svg(ICONS.search));
       var inp = el("input");
       inp.type = "search";
       inp.placeholder = "在工作区内搜索…";
       inp.setAttribute("aria-label", "在工作区内搜索");
+      inp.value = state.searchQuery || "";
       wrap.appendChild(inp);
       body.appendChild(wrap);
 
-      var hits = [
-        { f: "src/transport/sse-client.ts", l: 9, t: "private cursor: number = 0;" },
-        { f: "src/transport/sse-client.ts", l: 23, t: "this.cursor = frame.seq;" },
-        { f: "src/protocol.ts", l: 88, t: "export type SessionCursor = number;" },
-        { f: "harness/loop.py", l: 141, t: "cursor = session.cursor" },
-        { f: "harness/loop.py", l: 203, t: "if cursor < last_seq:  # 检测丢序" },
-      ];
+      if (!Backend.available()) {
+        body.appendChild(emptyHint("后端未连接",
+          "搜索由后端复用 agent 的 grep 工具执行。"));
+        return;
+      }
+
+      var doSearch = function (q) {
+        q = String(q || "").trim();
+        state.searchQuery = q;
+        if (!q) {
+          state.searchHits = null;
+          state.searchError = null;
+          renderRail();
+          return;
+        }
+        state.searchHits = null;      // 搜索中
+        state.searchError = null;
+        renderRail();
+        // 重绘后输入框是新的，恢复焦点与光标
+        window.Harness.workspaceSearch(state.workspace, q)
+          .then(function (r) {
+            if (r && r.error) {
+              state.searchHits = { error: r.error, detail: r.detail || "" };
+            } else {
+              state.searchHits = r;
+            }
+            renderRail();
+            var ni = $("#rail-body input[type=search]");
+            if (ni) { ni.focus(); ni.setSelectionRange(ni.value.length, ni.value.length); }
+          })
+          .catch(function (e) {
+            state.searchError = String(e && e.message || e);
+            state.searchHits = null;
+            renderRail();
+          });
+      };
+
+      var timer = null;
+      inp.addEventListener("input", function () {
+        if (timer) clearTimeout(timer);
+        var v = inp.value;
+        timer = setTimeout(function () { doSearch(v); }, 260);
+      });
+      inp.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") { if (timer) clearTimeout(timer); doSearch(inp.value); }
+      });
+
+      // 首次进入且没有查过 → 提示怎么用（不自动搜，避免打开就触发全库扫描）
+      if (state.searchHits === undefined || state.searchHits === null) {
+        if (!state.searchQuery) {
+          body.appendChild(emptyHint("输入关键词开始搜索",
+            "搜索复用 agent 使用的 grep 工具，逐文件匹配内容。"));
+          return;
+        }
+      }
+      if (state.searchError) {
+        body.appendChild(emptyHint("搜索失败", state.searchError));
+        return;
+      }
+      if (state.searchHits === null) {
+        body.appendChild(el("div", "dloading", "搜索中…"));
+        return;
+      }
+      if (state.searchHits && state.searchHits.error) {
+        body.appendChild(emptyHint("搜索未执行", state.searchHits.error
+          + (state.searchHits.detail ? " —— " + state.searchHits.detail : "")));
+        return;
+      }
+
+      var lines = (state.searchHits && state.searchHits.lines) || [];
       var hr = el("div", "sect__head");
-      hr.appendChild(el("span", null, "cursor · 5 命中 · 4 文件"));
+      hr.appendChild(el("span", null, state.searchQuery + " · " + lines.length + " 行"));
+      if (state.searchHits) {
+        hr.appendChild(el("span", "sect__tail", state.searchHits.truncated ? "已截断" : ""));
+      }
       body.appendChild(hr);
-      hits.forEach(function (h) {
-        var it = el("button", "fileitem");
-        it.type = "button";
+      if (!lines.length) {
+        body.appendChild(emptyHint("没有命中",
+          "关键词 " + state.searchQuery + " 在工作区里没有匹配到内容。"));
+        return;
+      }
+      lines.forEach(function (ln) {
+        var it = el("div", "fileitem");
         it.style.alignItems = "flex-start";
         it.style.paddingTop = "5px";
         it.style.paddingBottom = "5px";
@@ -961,76 +1298,98 @@
         var box = el("div");
         box.style.minWidth = "0";
         box.style.flex = "1 1 auto";
-        var l1 = el("div", null, h.f);
-        l1.style.fontFamily = "var(--font-mono)";
-        l1.style.fontSize = "11px";
-        l1.style.color = "var(--text)";
-        l1.style.overflow = "hidden";
-        l1.style.textOverflow = "ellipsis";
-        l1.style.whiteSpace = "nowrap";
-        var l2 = el("div", null, h.l + "  " + h.t);
-        l2.style.fontFamily = "var(--font-mono)";
-        l2.style.fontSize = "10px";
-        l2.style.color = "var(--text-faint)";
-        l2.style.overflow = "hidden";
-        l2.style.textOverflow = "ellipsis";
-        l2.style.whiteSpace = "nowrap";
-        box.appendChild(l1);
+        var l2 = el("div", null, ln);
+        l2.className = "srcline";
         box.appendChild(l2);
         it.appendChild(box);
-        it.addEventListener("click", function () {
-          if (h.f === "src/transport/sse-client.ts" || h.f === "src/protocol.ts") openTab(h.f);
-        });
         body.appendChild(it);
       });
+      var note = el("div", "dnote");
+      // **说明搜索范围有限**：grep 是逐文件文本匹配，没有索引，
+      // 也不理解语义。不写这句会让人以为这是全文检索。
+      note.textContent = (state.searchHits && state.searchHits.engine
+        ? "引擎：" + state.searchHits.engine : "")
+        + " —— 逐文件文本匹配，无索引、无语义理解。";
+      body.appendChild(note);
       return;
     }
 
     if (state.railView === "scm") {
+      // 源码管理视图 = **当前工作区被 agent 改过的文件**。
+      // 真实来源是变更集（ChangeSetStore），它按 run 记录每次写操作 ——
+      // 这才是"这次 agent 动了什么"的准确答案。
+      // mock 的"4 个改动 +40 −12"是编的，删掉。
+      body.appendChild(dataStateBar());
+
+      if (!Backend.available()) {
+        body.appendChild(emptyHint("后端未连接",
+          "工作区改动来自 harness 的变更集记录。启动后端后即可看到。"));
+        return;
+      }
+      if (!state.runs) {
+        body.appendChild(el("div", "dloading", "读取运行记录…"));
+        Backend.loadRuns();
+        return;
+      }
+      if (!state.runs.length) {
+        body.appendChild(emptyHint("还没有运行记录",
+          "变更集是按运行记录的。跑过一次任务后，这里会列出它改过的文件。"));
+        return;
+      }
+
       var sess = el("div", "sect");
       var sh = el("button", "sect__head");
       sh.type = "button";
       sh.setAttribute("aria-expanded", "true");
       sh.appendChild(svg(ICONS.chevron, "sect__chev"));
       sh.appendChild(el("span", null, "工作区改动"));
-      sh.appendChild(el("span", "sect__tail", "4"));
+      sh.appendChild(el("span", "sect__tail", state.runs.length + " 次运行"));
       sess.appendChild(sh);
 
-      var changes = WORKSPACE_CHANGES;
-      changes.forEach(function (c) {
-        var it = el("button", "fileitem");
-        it.type = "button";
-        it.style.paddingLeft = "16px";
-        it.appendChild(svg(ICONS.file, "fileitem__icon"));
-        it.appendChild(el("span", "fileitem__name", c.path.split("/").pop()));
-        it.title = c.path;
-        var s = el("span", "fileitem__status st-" + c.st, c.st);
-        it.appendChild(s);
-        var st = el("span", "fileitem__lines");
-        st.innerHTML = '<span style="color:var(--jade)">+' + c.a + "</span>";
-        if (c.d) st.innerHTML += ' <span style="color:var(--vermilion)">−' + c.d + "</span>";
-        it.appendChild(st);
-        if (c.openable) {
-          it.addEventListener("click", function () { openTab(c.path); });
-        }
-        body.appendChild(it);
+      // 列出最近几次运行；每次可以展开看它改了哪些文件。
+      // 这里**不做全量聚合**：变更集是 per-run 的，
+      // 而"总共改了什么"需要跨 run 求并集 —— 那会掩盖"哪次改的"，
+      // 而后者才是回滚时要的信息。
+      state.runs.slice(0, 12).forEach(function (r) {
+        var row = el("div", "scmrun");
+        var top = el("div", "scmrun__top");
+        top.appendChild(el("span", "scmrun__id tabular", r.id));
+        top.appendChild(el("span", "scmrun__model truncate", r.model || ""));
+        top.appendChild(el("span", "scmrun__time", r.tsMin == null ? "" : UI.fmtRel(r.tsMin)));
+        row.appendChild(top);
+        var act = el("button", "dbtn", "查看改动");
+        act.type = "button";
+        act.addEventListener("click", function () {
+          window.Harness.runChangesets(r.id, r.workspace).then(function (p) {
+            var cs = window.Harness.toChangesets(p);
+            if (!cs.summary || cs.summary.changes === 0) {
+              UI.toast({ tone: "info", title: "这次运行没有可回滚的改动",
+                         desc: "r.id = " + r.id, duration: 4000 });
+              return;
+            }
+            UI.toast({
+              tone: "info", duration: 6000,
+              title: r.id + " · " + cs.summary.changes + " 处改动 / "
+                + cs.summary.files + " 个文件",
+              desc: cs.history.slice(0, 5).map(function (h) {
+                return "seq " + (h.seq == null ? "?" : h.seq) + " "
+                  + (h.paths || []).join("、");
+              }).join("\n"),
+            });
+          }).catch(function (e) {
+            UI.toast({ tone: "danger", title: "读取变更集失败",
+                       desc: String(e && e.message || e), duration: 5000 });
+          });
+        });
+        row.appendChild(act);
+        sess.appendChild(row);
       });
       body.appendChild(sess);
 
-      var box = el("div");
-      box.style.padding = "0 12px";
-      var cb = el("button", "btn btn--primary");
-      cb.type = "button";
-      cb.style.width = "100%";
-      var totA = changes.reduce(function (n, c) { return n + c.a; }, 0);
-      var totD = changes.reduce(function (n, c) { return n + c.d; }, 0);
-      cb.appendChild(el("span", null, "提交 " + changes.length + " 个文件 · +" + totA + " −" + totD));
-      box.appendChild(cb);
       var wt = el("div");
-      wt.style.cssText = "margin-top:10px;font-size:10px;color:var(--text-faint);font-family:var(--font-mono);line-height:1.5;word-break:break-all";
-      wt.textContent = "worktree: " + WORKSPACE.worktree;
-      box.appendChild(wt);
-      body.appendChild(box);
+      wt.className = "dnote";
+      wt.textContent = "变更集按每次运行独立记录。回滚入口在「会话历史」里选中那条运行后的明细中。";
+      body.appendChild(wt);
       return;
     }
 
@@ -1185,10 +1544,34 @@
     }
   }
 
+  /* 资源管理器底部的提示块。
+     原来显示的是 mock 的"已索引 · 1,284 文件 · 18.6 万 token" ——
+     那个数字**根本不存在**：这个 harness 没有代码索引。
+     现在只显示能核实的量，并把"没有索引"如实说出来。为什么重要：
+     编一个索引状态会让人以为搜索是走索引的，从而误判搜索结果的可信度。 */
   function buildIndexNote() {
     var d = el("div");
-    d.style.cssText = "margin:0 12px;padding:8px 10px;background:var(--surface-raised);border:1px solid var(--border);border-radius:6px;font-size:10px;line-height:1.6;color:var(--text-faint)";
-    d.textContent = WORKSPACE.indexStatus;
+    d.className = "idxnote";
+    if (!Backend.available()) {
+      d.textContent = "后端未连接，无法读取工作区信息。";
+      return d;
+    }
+    var info = state.wsInfo;
+    if (!info) {
+      d.textContent = state.wsInfoError
+        ? "读取工作区信息失败：" + state.wsInfoError
+        : "正在读取工作区…";
+      Backend.loadWorkspaceInfo();
+      return d;
+    }
+    var parts = [
+      info.files + " 个文件 · " + info.dirs + " 个目录",
+      info.branch ? "分支 " + info.branch : "不在 git 仓库中",
+    ];
+    if (info.truncated) {
+      parts.push("（扫描已截断：超过 " + info.scan.max_files + " 个文件）");
+    }
+    d.textContent = parts.join(" · ") + "\n" + info.index_note;
     return d;
   }
 
@@ -1460,20 +1843,6 @@
     return out.join("\n");
   }
 
-  /* 由正文生成 diff：行数、行号、内容三者天然一致，不可能漂移 */
-  function buildDiffFor(path) {
-    var body = FILE_BODIES[path];
-    if (!body) return null;
-    var rows = body.map(function (segs, i) {
-      var txt = (segs || []).map(function (s) { return s[1]; }).join("");
-      return { t: i === 0 ? "add" : "add", n: [null, i + 1], text: txt };
-    });
-    // 在注释块之间插一条上下文行，让它看起来像真实 patch 而不是整文件转储
-    if (rows.length > 16) {
-      rows.splice(15, 0, { t: "ctx", n: [null, null], text: "" });
-    }
-    return rows;
-  }
 
   function renderEditor() {
     var pre = $("#editor-code");
@@ -1492,30 +1861,59 @@
     gutter.hidden = false;
     empty.hidden = true;
 
-    var body = FILE_BODIES[state.activeTab];
-    if (body && body.length) {
-      code.innerHTML = renderCodeLines(body);
-      gutter.textContent = gutterFor(body.length);
-      $("#editor-scroll").scrollTop = 0;
+    var path = state.activeTab;
+
+    // 后端未连接 → 明确说明来源，而不是显示不存在的文件内容
+    if (!Backend.available()) {
+      code.innerHTML = '<span class="t-cm">'
+        + escHtml("// 后端未连接，无法读取工作区文件。\n// 启动 `python harness/server.py` 后刷新即可。")
+        + "</span>";
+      gutter.textContent = "";
       return;
     }
 
-    // 没有正文的文件：给一段说明性占位，行数如实标为 0，不伪造
-    var ph = [
-      "// " + state.activeTab,
-      "//",
-      "// 这个文件还没有内置正文。当前演示完整着色的文件有三个：",
-      "//   src/transport/reconnect.ts",
-      "//   src/transport/sse-client.ts",
-      "//   harness/approval.py",
-      "//",
-      "// 从左侧资源管理器点开任一即可看到带真实行号的正文。",
-    ];
-    code.innerHTML = ph.map(function (l) {
-      return '<span class="t-cm">' + escHtml(l) + "</span>";
-    }).join("\n");
-    gutter.textContent = gutterFor(ph.length);
-    $("#editor-scroll").scrollTop = 0;
+    var f = state.fileCache[path];
+    if (f === undefined || f === null) {
+      // 首次打开：显示加载态并异步取真实内容
+      code.innerHTML = '<span class="t-cm">' + escHtml("// 读取中…") + "</span>";
+      gutter.textContent = "";
+      Backend.loadFile(path);
+      return;
+    }
+    if (f.error) {
+      code.innerHTML = '<span class="t-cm">'
+        + escHtml("// 无法打开：" + f.error + "\n// 这不等于「文件是空的」。")
+        + "</span>";
+      gutter.textContent = "";
+      return;
+    }
+
+    var lines = f.lines || [];
+    if (lines.length) {
+      // 真实文本：**不做语法着色**。着色需要语言解析器，
+      // 而瞎猜关键字会把普通文本染成花花绿绿 —— 那比不着色更难看懂。
+      // 只在行尾如实标出编码与截断情况。
+      code.innerHTML = lines.map(function (l) {
+        return '<span class="t-plain">' + (l === "" ? "&nbsp;" : escHtml(l)) + "</span>";
+      }).join("\n");
+      // 行号直接来自服务端（它读了多少行就是多少行）——
+      // 前端自己 split 会在"正好卡在截断处"时错位
+      gutter.textContent = gutterFor(lines.length);
+      $("#editor-scroll").scrollTop = 0;
+
+      var meta = el("div", "filemeta");
+      meta.textContent = f.path + " · " + UI.fmtBytes(f.size) + " · "
+        + f.line_count + " 行 · " + f.encoding
+        + (f.truncated ? " · **已截断（只显示前 " + lines.length + " 行）**" : "");
+      var oldMeta = $("#editor-scroll .filemeta");
+      if (oldMeta) oldMeta.remove();
+      $("#editor-scroll").appendChild(meta);
+      return;
+    }
+
+    // 空文件：如实说是空的（不伪造占位正文）
+    code.innerHTML = '<span class="t-cm">' + escHtml("// （空文件）") + "</span>";
+    gutter.textContent = "";
   }
 
   /* ============================================================
@@ -1524,9 +1922,13 @@
   /* ============================================================
      三、终端 —— 带命令历史与真实回显
      ============================================================ */
-  var termLines = TERMINAL_LINES.slice();
+  // 终端：**真实只读命令**。
+  // 原来这里是纯 mock（假 zsh、编好的输出、连"command not found"都是写死的）。
+  // 现在走后端 /api/workspace/terminal —— 它有白名单 + 元字符拒绝两道限制。
+  var termLines = [];
   var termHistory = [];
   var termHistIdx = -1;
+  var termBusy = false;
 
   function termAppend(l) {
     termLines.push(l);
@@ -1565,17 +1967,49 @@
       return;
     }
     if (cmd === "help") {
-      termAppend({ t: "dim", text: "演示终端支持：git status · npx tsc · npm test · ls · crucible · clear" });
+      termAppend({ t: "dim", text: "这是**受控只读终端**：允许 ls/cat/head/tail/grep/find/wc/"
+        + "git status 等只读命令；禁止管道、重定向、命令串联等 shell 元字符。" });
       return;
     }
 
-    var hit = TERM_RESPONSES.filter(function (r) { return r.match.test(cmd); })[0];
-    if (hit) {
-      hit.lines.forEach(function (l) { termAppend(l); });
-    } else {
-      termAppend({ t: "fail", text: "zsh: command not found: " + cmd.split(/\s+/)[0] });
-      termAppend({ t: "dim", text: "这是演示终端；输入 help 看支持的命令。" });
+    if (!Backend.available()) {
+      termAppend({ t: "fail", text: "后端未连接，命令无法执行。" });
+      termAppend({ t: "dim", text: "这个终端由 harness 执行真实命令，不是前端模拟的。" });
+      return;
     }
+
+    termBusy = true;
+    termAppend({ t: "dim", text: "…执行中" });
+    window.Harness.workspaceTerminal(state.workspace, cmd)
+      .then(function (r) {
+        termBusy = false;
+        // 去掉那行"执行中"占位
+        for (var i = termLines.length - 1; i >= 0; i--) {
+          if (termLines[i].text === "…执行中") { termLines.splice(i, 1); break; }
+        }
+        if (!r) { renderTerminal(); termAppend({ t: "fail", text: "请求失败。" }); return; }
+        if (r.ok === false && r.code) {
+          // 被白名单 / 元字符拒绝：**把原因显示出来**。
+          // 静默失败会让人以为终端坏了，而不是"这条命令不允许"。
+          renderTerminal();
+          termAppend({ t: "fail", text: "已拒绝：" + (r.detail || r.code) });
+          return;
+        }
+        renderTerminal();
+        var txt = (r.text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        txt.split("\n").forEach(function (line, i, arr) {
+          if (i === arr.length - 1 && !line) return;
+          termAppend({ t: r.ok ? "out" : "fail", text: line });
+        });
+        if (typeof r.exit_code === "number" && r.exit_code !== 0) {
+          termAppend({ t: "dim", text: "退出码 " + r.exit_code });
+        }
+      })
+      .catch(function (e) {
+        termBusy = false;
+        renderTerminal();
+        termAppend({ t: "fail", text: "执行失败：" + String(e && e.message || e) });
+      });
   }
 
   function termHistoryMove(dir) {
@@ -1590,29 +2024,72 @@
   /* ============================================================
      四、Agent 面板：计划 / 事件流 / 闸门
      ============================================================ */
+  /* 执行计划视图。
+     ## 这里有个必须说清楚的边界
+     **harness 没有"计划"概念** —— 它不做 Plan DAG、不预告步骤，
+     而是 ReAct 单循环（走一步看一步）。所以这个面板**不能接真实计划**，
+     因为它不存在。编一份假的计划比留空更坏：它会让人以为 agent
+     真按某个计划在走，从而误判"它偏离计划了没有"。
+
+     能做的是接**真实的执行轨迹**：每次工具调用就是一步，
+     状态来自它的 ok/失败。这是真实数据，只是它的语义是
+     "已经做了什么"，不是"打算做什么"。面板标题与文案都据此改写。 */
   function renderPlan() {
     var list = $("#plan-list");
     var goal = $("#plan-goal");
+    var count = $("#plan-count");
+    var card = $("#plan-view");
     list.innerHTML = "";
-    goal.textContent = PLAN.goal;
-    PLAN.steps.forEach(function (s, i) {
-      var li = el("li", "pstep pstep--" + s.state);
+    if (!card) return;
+
+    var vms = state.streamMode === "replay" ? (state.replayVMs || []) : liveVMs;
+    var steps = vms.filter(function (v) {
+      return v.kind === "tool" || v.kind === "gate";
+    });
+
+    if (state.streamMode === "mock" || !steps.length) {
+      // 没有真实轨迹时的说明态。标题也改掉 —— 写"执行计划"会误导。
+      var label = $("#plan-view .planv__label");
+      if (label) label.textContent = "执行轨迹";
+      goal.textContent = Backend.available()
+        ? "还没有可显示的步骤。发一条指令、或回放一条历史运行后，"
+          + "这里会按时间列出 agent 实际做过的每一步。"
+        : "后端未连接。这是演示占位 —— 真实轨迹来自 harness 的事件流。";
+      if (count) count.textContent = "0/0";
+      return;
+    }
+
+    var label2 = $("#plan-view .planv__label");
+    if (label2) label2.textContent = "执行轨迹";
+    goal.textContent = state.streamMode === "replay"
+      ? "历史运行 · " + String(state.replayDetail && state.replayDetail.runId || "")
+      : "本次运行 · 按时间顺序";
+
+    steps.forEach(function (v, i) {
+      var st = v.state === "running" ? "active"
+             : (v.kind === "gate" ? "todo" : "done");
+      var li = el("li", "pstep pstep--" + st);
       var mark = el("span", "pstep__mark");
-      if (s.state === "done") {
-        mark.appendChild(svg(ICONS.check, null));
-      } else {
-        mark.textContent = String(i + 1);
-      }
+      if (st === "done") mark.appendChild(svg(ICONS.check, null));
+      else mark.textContent = String(i + 1);
       li.appendChild(mark);
+
       var box = el("div");
-      var txt = el("span", "pstep__text", s.text);
-      box.appendChild(txt);
-      if (s.evidence) box.appendChild(el("span", "pstep__ev", s.evidence));
+      box.appendChild(el("span", "pstep__text",
+        v.kind === "gate" ? "闸门 · " + (v.action || "") : (v.title || v.tool || "")));
+      // 依据：真实工具的耗时 / 闸门的风险等级
+      var ev = v.kind === "gate" ? ("风险 " + (v.risk || "?"))
+             : ((v.output && v.output.length)
+                 ? (v.state === "done" ? "已返回结果" : "执行中")
+                 : "");
+      if (v.dur) ev += (ev ? " · " : "") + v.dur;
+      if (ev) box.appendChild(el("span", "pstep__ev", ev));
       li.appendChild(box);
       list.appendChild(li);
     });
-    var done = PLAN.steps.filter(function (s) { return s.state === "done"; }).length;
-    $("#plan-count").textContent = done + "/" + PLAN.steps.length;
+
+    var done = steps.filter(function (v) { return v.state === "done"; }).length;
+    if (count) count.textContent = done + "/" + steps.length;
   }
 
   function renderStream() {
@@ -1637,23 +2114,15 @@
       return;
     }
 
-    // mock 模式（后端未连接时的原型演示）
-    EVENT_STREAM.forEach(function (ev, i) { stream.appendChild(buildEvent(ev, i)); });
-
-    // 闸门已批准 → 注入后续事件
-    if (state.gateResolved === "approved") {
-      DEFERRED_AFTER_GATE.forEach(function (ev, i) {
-        stream.appendChild(buildEvent(ev, EVENT_STREAM.length + i));
-      });
-      showVerify();
-    } else if (state.gateResolved === "rejected") {
-      var halt = el("div", "ev ev--halt");
-      var bar = el("div", "haltbar");
-      bar.appendChild(svg(ICONS.pause));
-      bar.appendChild(el("span", null, "你拒绝了这次执行。后续 4 个事件未运行，工作区保持原样。"));
-      halt.appendChild(bar);
-      stream.appendChild(halt);
-    }
+    // 事件流没有任何 mock 兜底（按"纯真实数据"要求）：
+    // 没有真实事件时显示怎么产生事件，而不是铺一屏假事件。
+    // 假事件最坏的地方在于它**看起来像真跑过一次**。
+    stream.appendChild(emptyHint(
+      Backend.available() ? "还没有事件" : "后端未连接",
+      Backend.available()
+        ? "在下方输入框发一条指令即可看到真实事件流；"
+          + "或在左侧「会话历史」里选一条历史运行点「回放」。"
+        : "事件流来自 harness。启动后端后发一条指令即可看到真实事件。"));
 
     applyFilter();
     if (refreshStreamFade) refreshStreamFade();
@@ -1766,16 +2235,58 @@
     UI.announce("筛选：" + label);
   }
 
+  /* 自证条。
+     ## 三态必须守住（这是本项目反复强调的那条）
+     mock 版写死"自证检查通过 · 4/4"——**它永远说通过**，
+     而那正是这个项目花了一整轮去消灭的东西（假成功报告）。
+     现在按真实数据分三态：
+       · 有检查事件   → 显示"通过 N 条 / 有 M 条未满足"
+       · 没有检查事件 → 显示"本次运行没有目标条件"，**不写"通过"**
+       · 后端未连接   → 显示演示态并明确标注
+     关键：**不许在没有任何证据时显示"通过"**。 */
   function showVerify() {
     var v = $("#verify-bar");
+    if (!v) return;
     v.innerHTML = "";
     var dot = el("span", "verify__dot");
     dot.setAttribute("aria-hidden", "true");
     v.appendChild(dot);
-    v.appendChild(el("span", "verify__label", "自证检查通过 · " + VERIFY.checked + "/" + VERIFY.total + " 条目标条件"));
-    var spacer = el("span", "verify__spacer");
-    v.appendChild(spacer);
-    v.appendChild(el("span", "verify__model", VERIFY.model));
+
+    var vms = state.streamMode === "replay" ? (state.replayVMs || []) : liveVMs;
+    // 只统计**真实的**自证信号：check 事件里的 target/goal 检查
+    var checks = vms.filter(function (x) { return x.kind === "check" && x.scope; });
+    var errs = vms.filter(function (x) {
+      return x.kind === "check" && (x.items || []).some(function (it) { return it.ok === false; });
+    });
+
+    if (state.streamMode === "mock") {
+      dot.className = "verify__dot";
+      v.appendChild(el("span", "verify__label", "演示数据 · 无真实自证"));
+      v.appendChild(el("span", "verify__spacer"));
+      v.appendChild(el("span", "verify__model", "未连接"));
+      v.hidden = false;
+      return;
+    }
+
+    if (!checks.length && !errs.length) {
+      dot.className = "verify__dot";
+      v.appendChild(el("span", "verify__label",
+        "本次运行没有自证检查记录 —— 这不等于「检查通过」"));
+      v.appendChild(el("span", "verify__spacer"));
+      v.appendChild(el("span", "verify__model",
+        state.streamMode === "replay" ? "历史回放" : "实时"));
+      v.hidden = false;
+      return;
+    }
+
+    var bad = errs.length;
+    dot.className = "verify__dot" + (bad ? " verify__dot--warn" : "");
+    v.appendChild(el("span", "verify__label",
+      bad ? ("自证检查有 " + bad + " 项未通过 · 共 " + checks.length + " 项记录")
+          : ("自证检查通过 · " + checks.length + " 项记录")));
+    v.appendChild(el("span", "verify__spacer"));
+    v.appendChild(el("span", "verify__model",
+      state.streamMode === "replay" ? "历史回放" : "实时"));
     v.hidden = false;
   }
 
@@ -1938,9 +2449,10 @@
 
     var bodyEl = el("div", "tool__body");
 
-    // 优先用后端给的真实 diff；没有才回退到 mock 的 PATCHES
-    var rows = parseUnifiedDiff(ev.diffText) || buildDiffFor(ev.patch || ev.file);
-    var meta = PATCHES[ev.patch || ev.file] || {};
+    // 只用**真实** diff。mock 的 PATCHES 回退已删除 ——
+    // 没有 diff 时显示"未提供 diff"比编一段更像补丁的文本安全得多：
+    // 编出来的 diff 会被当成"agent 真的这样改的"。
+    var rows = ev.diffText ? parseUnifiedDiff(ev.diffText) : null;
 
     if (rows) {
       // 统计增删
@@ -1949,7 +2461,11 @@
 
       var diff = el("div", "diff");
       var dh = el("div", "diff__head");
-      if (meta.isNew) dh.appendChild(el("span", "diff__badge", "新增"));
+      // "新增文件"的判断改用**真实 diff 形状**：全是 add 且没有 del。
+      // 依赖 mock 的 meta.isNew 会在真实运行时永远不显示这个标记。
+      if (adds > 0 && dels === 0 && !rows.some(function (r) { return r.t === "ctx"; })) {
+        dh.appendChild(el("span", "diff__badge", "新增"));
+      }
       dh.appendChild(el("span", "diff__file", ev.file));
       var nums = el("span", "diff__nums");
       nums.innerHTML = '<span class="diff__add">+' + adds + "</span>" +
@@ -1982,14 +2498,16 @@
       dbody.appendChild(lines);
       diff.appendChild(dbody);
       bodyEl.appendChild(diff);
+    } else {
+      // 没有 diff 时如实说明。**不编一段补丁** ——
+      // 编出来的 diff 会被读成"agent 真的这样改的"。
+      var nd = el("div", "outlines out-dim copyscope");
+      nd.textContent = ev.file
+        ? "这个文件被改动了，但事件里没有携带 diff 正文。"
+        : "这次工具调用没有可显示的 diff。";
+      bodyEl.appendChild(nd);
     }
 
-    if (meta.verified) {
-      var v = el("div", "verified");
-      v.appendChild(svg(ICONS.check));
-      v.appendChild(el("span", null, meta.verified));
-      bodyEl.appendChild(v);
-    }
     card.appendChild(bodyEl);
 
     var expanded = true;
@@ -2031,7 +2549,13 @@
     var gate = el("div", "gate");
     var head = el("div", "gate__head");
     head.appendChild(svg(ICONS.shield, "gate__ico"));
-    head.appendChild(el("span", "gate__label", "审批闸门 · 等待你的决定"));
+    // **回放模式下的闸门不可操作**：那条 run 早就结束了，
+    // 它的闸门当时决过或超时过。给一个能点的"批准"会让人以为
+    // 可以改变历史结果 —— 而它只会静默失败（后端没有这次调用）。
+    // 所以这里显式标成"历史记录 · 不可操作"。
+    var replaying = state.streamMode === "replay";
+    head.appendChild(el("span", "gate__label",
+      replaying ? "审批闸门 · 历史记录（已结束，不可操作）" : "审批闸门 · 等待你的决定"));
     head.appendChild(el("span", "gate__risk", ev.risk));
     gate.appendChild(head);
 
@@ -2044,6 +2568,12 @@
     bodyEl.appendChild(act);
 
     bodyEl.appendChild(el("p", "gate__reason", ev.reason));
+
+    if (replaying) {
+      gate.appendChild(bodyEl);
+      wrap.appendChild(gate);
+      return wrap;
+    }
 
     var acts = el("div", "gate__acts");
 
@@ -2105,18 +2635,9 @@
     cancelAnimationFrame(gateRaf);
     renderStream();
 
-    if (decision === "approved") {
-      if (PLAN.steps[2].state !== "done") {
-        PLAN.steps[2].state = "done";
-        PLAN.steps[2].evidence = "12 passed";
-        PLAN.steps[3].state = "active";
-        renderPlan();
-      }
-    } else {
-      PLAN.steps[2].state = "todo";
-      delete PLAN.steps[2].evidence;
-      renderPlan();
-    }
+    // 原来这里会改 mock 的 PLAN 步骤状态 —— 已删除：
+    // harness 没有计划概念，改一份假计划来"反映"决定是纯粹的表演。
+    // 决定本身已经通过 /approve 回灌给后端，真实状态在事件流里。
   }
 
   var gateRaf = 0;
@@ -2182,15 +2703,22 @@
     var lbl = el("span", "ctxpop__label", "加入上下文");
     pop.appendChild(lbl);
 
-    var files = [];
-    (function walk(nodes, prefix) {
-      nodes.forEach(function (n) {
-        if (n.kind === "file" && !/\.(md|json)$/.test(n.name) && n.name.indexOf(".") !== -1) {
-          files.push(prefix ? prefix + "/" + n.name : n.name);
-        }
-        if (n.kind === "dir") walk(n.children, prefix ? prefix + "/" + n.name : n.name);
-      });
-    })(FILE_TREE, "");
+    // 候选文件来自**真实文件树缓存**（`allFiles()`）。
+    // 原来递归 mock 的 FILE_TREE —— 候选里全是工作区里不存在的路径，
+    // 选了之后 `@` 引用的是一个幽灵文件。
+    var files = allFiles().filter(function (p) {
+      // 排除明显的非源码文件（md/json 噪音太多，用户很少要引用它们）
+      return !/\.(md|json)$/.test(p);
+    });
+    if (!files.length) {
+      var tip = el("div", "mention__tip",
+        Backend.available()
+          ? "还没有列出任何文件。先在左侧资源管理器展开目录，再回来添加引用。"
+          : "后端未连接，无法列出工作区文件。");
+      pop.appendChild(tip);
+      pop.hidden = false;
+      return;
+    }
 
     files.slice(0, 6).forEach(function (f) {
       var it = el("button", "ctxpop__item");
@@ -2346,17 +2874,24 @@
      ============================================================ */
   var mentionItems = [], mentionIdx = 0, mentionMode = null, mentionQuery = "";
 
+  /* `@` 补全的候选文件 —— 来自**已加载的真实文件树缓存**。
+     原来递归 mock 的 FILE_TREE，于是补全出来的路径在真实工作区里都不存在。
+     现在只收集已经列出来过的目录（用户在树里展开过的那部分）：
+     这是有意的 —— 全量扫描工作区会在大仓库上卡住输入体验，
+     而"补全你正在看的目录"本来就是更贴合直觉的行为。
+     缓存里没有的目录不会出现在候选里，但补全框会提示这一点。 */
   function allFiles() {
     var out = [];
-    (function walk(nodes, prefix) {
-      nodes.forEach(function (n) {
-        if (n.kind === "file" && !/^(AGENTS\.md|package\.json|\.codexignore)$/.test(n.name)) {
-          out.push(prefix ? prefix + "/" + n.name : n.name);
-        }
-        if (n.kind === "dir") walk(n.children, prefix ? prefix + "/" + n.name : n.name);
+    Object.keys(state.treeCache || {}).forEach(function (dir) {
+      var node = state.treeCache[dir];
+      if (!node || !node.entries) return;
+      node.entries.forEach(function (en) {
+        if (en.kind === "file") out.push(en.path);
       });
-    })(FILE_TREE, "");
-    return out;
+    });
+    // 去重 + 排序（同名字段来自不同目录时顺序稳定，便于键盘选择）
+    out.sort();
+    return out.filter(function (p, i) { return i === 0 || p !== out[i - 1]; });
   }
 
   function showMention(mode, query, caret) {
@@ -2364,6 +2899,18 @@
     mentionQuery = query;
     var box = D.mine;
     box.innerHTML = "";
+
+    // 文件池为空时给出**原因**，而不是空框 ——
+    // 空框会被读成"这个工作区没有文件"。
+    if (mode !== "cmd" && !allFiles().length) {
+      var tip = el("div", "mention__tip",
+        Backend.available()
+          ? "还没有列出任何文件。先在左侧资源管理器展开一个目录，再回来用 @ 引用。"
+          : "后端未连接，无法列出工作区文件。");
+      box.appendChild(tip);
+      box.hidden = false;
+      return;
+    }
 
     var items;
     if (mode === "slash") {
@@ -2557,16 +3104,16 @@
         { label: "刷新索引", icon: ICONS.play, onClick: refreshIndex },
         { label: "在路径中查找…", icon: ICONS.search, hint: "Ctrl+Shift+F", onClick: function () { goView("search"); } },
       ] : view === "scm" ? [
-        { label: "全部暂存", icon: ICONS.check, onClick: function () { UI.toast({ tone: "ok", title: "已暂存 4 个文件", duration: 2600 }); } },
-        { label: "丢弃全部改动", icon: ICONS.x, danger: true, onClick: function () {
-            UI.confirm({
-              title: "丢弃全部改动？",
-              desc: "4 个文件的未提交改动都会被还原。这个操作无法撤销。",
-              confirmLabel: "丢弃", cancelLabel: "取消", tone: "danger",
-              detail: WORKSPACE_CHANGES.map(function (c) { return c.st + " " + c.path; }).join("\n"),
-            }).then(function (ok) {
-              if (ok) UI.toast({ tone: "warn", title: "已丢弃改动", desc: "演示环境，未真正还原。", duration: 4000,
-                actions: [{ label: "撤销", primary: true, onClick: function () { UI.toast({ tone: "ok", title: "已撤销", duration: 2000 }); } }] });
+        // 这两个动作在真实后端**没有对应能力**，所以不提供按钮：
+        //   · "暂存"    —— harness 不管 git 暂存区
+        //   · "丢弃全部" —— 变更集只支持"回滚到某一步之前"，没有全丢
+        // 放一个点了没用的按钮比不放更坏：用户会以为操作生效了。
+        { label: "怎么回滚", icon: ICONS.book, onClick: function () {
+            UI.toast({
+              tone: "info", duration: 8000,
+              title: "回滚入口在「会话历史」",
+              desc: "选中一条运行 → 展开明细 → 「变更集 · 可回滚」里逐条回滚到某一步之前。"
+                + "\nharness 不支持「丢弃全部改动」，也不管 git 暂存区。",
             });
           } },
       ] : [
@@ -2669,22 +3216,29 @@
           onRun: function () { openTab(f); } });
       });
 
-      // 会话
-      SESSIONS.forEach(function (s) {
-        cmds.push({ label: s.title, sub: s.branch + " · " + UI.fmtRel(s.tsMin), group: "会话", icon: ICONS.clock,
-          onRun: function () { goView("sessions"); UI.toast({ tone: "info", title: "已切到会话「" + s.title + "」", duration: 3000 }); } });
+      // 会话（真实运行记录）
+      (state.runs || []).slice(0, 8).forEach(function (r) {
+        cmds.push({
+          label: r.model || r.id, sub: r.id + (r.tsMin == null ? "" : " · " + UI.fmtRel(r.tsMin)),
+          group: "运行记录", icon: ICONS.clock,
+          onRun: function () {
+            goView("sessions");
+            // 直接回放这条 —— 比"切过去然后自己找"少两步
+            Backend.replayRun(r.id, r.workspace, { model: r.model });
+            UI.toast({ tone: "info", title: "正在回放 " + r.id, duration: 3000 });
+          },
+        });
       });
 
       // 斜杠命令
       SLASH_COMMANDS.forEach(function (c) {
-        cmds.push({ label: c.cmd, sub: c.desc, group: "Agent 命令", icon: ICONS.terminal,
-          onRun: function () {
-            var ta = $("#dock-input");
-            ta.value = c.cmd + " ";
-            ta.focus();
-            ta.dispatchEvent(new Event("input", { bubbles: true }));
-            UI.toast({ tone: "info", title: "已插入 " + c.cmd, desc: "补上参数后按 Enter 发送。", duration: 3400 });
-          } });
+        cmds.push({
+          label: c.cmd, sub: c.desc, group: "界面命令", icon: ICONS.terminal,
+          // **真正执行**，而不是把文本插进输入框。
+          // 插文本的旧行为会让用户以为 `/status` 是发给模型的一条指令 ——
+          // 而模型看它只是一段普通文字，什么都不会发生。
+          onRun: function () { runSlashCommand(c.cmd); },
+        });
       });
 
       // 动作
@@ -2842,40 +3396,190 @@
       var r = this.getBoundingClientRect();
       UI.contextMenu(r.left, r.top - 84, [
         { label: "重新索引工作区", icon: ICONS.play, onClick: refreshIndex },
-        { label: "索引详情", icon: ICONS.book, onClick: function () {
-            UI.toast({ tone: "info", title: "索引进度", desc: WORKSPACE.indexStatus, duration: 4200 });
+        { label: "工作区详情", icon: ICONS.book, onClick: function () {
+            var i = state.wsInfo;
+            if (!i) {
+              UI.toast({ tone: "warning", title: "还没读到工作区信息",
+                         desc: state.wsInfoError || "正在读取或后端未连接。", duration: 5000 });
+              return;
+            }
+            UI.toast({
+              tone: "info", duration: 8000,
+              title: i.files + " 个文件 · " + i.dirs + " 个目录",
+              desc: i.workspace + "\n" + i.index_note,
+            });
           } },
       ]);
     });
     $("#btn-diag").addEventListener("click", function (e) {
       var r = this.getBoundingClientRect();
+      // 原来这里列了"reconnect.ts:22 未使用的常量"之类 —— 全是编的，
+      // 而且指向一个不存在的文件。**harness 不做 lint / 类型检查**，
+      // 所以没有真实的诊断可列。这里如实说明，而不是继续编两条。
       UI.contextMenu(r.left - 100, r.top - 84, [
-        { label: "2 个警告", icon: ICONS.warning, disabled: true },
+        { label: "无诊断来源", icon: ICONS.help, disabled: true },
         { sep: true },
-        { label: "reconnect.ts:22 未使用的常量 JITTER_RATIO", icon: ICONS.warning, onClick: function () { openTab("src/transport/reconnect.ts"); } },
-        { label: "approval.py:31 分支缺少返回值注释", icon: ICONS.warning, onClick: function () { openTab("harness/approval.py"); } },
+        { label: "harness 不做 lint/类型检查", icon: ICONS.book, disabled: true },
+        { label: "看代码改动 → 会话历史", icon: ICONS.file, onClick: function () { goView("sessions"); } },
       ]);
     });
     $("#btn-meter").addEventListener("click", showTokenDetail);
 
     function showTokenDetail() {
+      var u = state.usage;
+      if (!state.usageSource) {
+        UI.toast({
+          tone: "info",
+          title: "还没有用量数据",
+          desc: "发一次真实运行、或在「会话历史」里回放一条记录后，这里会显示该次运行的 token 用量。",
+          duration: 6000,
+        });
+        return;
+      }
+      if (!u || !u.available) {
+        // **不编数字**：没有记录就说没有记录。
+        // 显示一个编出来的 "38.2k / 200k" 会让人以为真花了那些钱。
+        UI.toast({
+          tone: "warning",
+          title: "这次运行没有用量记录",
+          desc: (u && u.note) || "端点未返回 usage。这不等于「用量为零」。",
+          duration: 6000,
+        });
+        return;
+      }
       UI.toast({
         tone: "info",
-        title: "上下文用量 38.2k / 200k",
-        desc: "系统提示 3.1k · AGENTS.md 0.8k · 文件正文 12.4k · 工具结果 18.9k · 压缩余量 3.0k",
-        duration: 7000,
-        actions: [{ label: "压缩上下文", primary: true, onClick: function () {
-          UI.toast({ tone: "ok", title: "已压缩上下文", desc: "保留结构化工作记忆，丢弃可重建的工具输出。", duration: 4000 });
-        } }],
+        title: "上次运行用量 " + u.fmt + " token",
+        desc: u.parts + " · 来源：" + (state.usageSource === "live" ? "实时运行" : "历史回放")
+          + "\n这是**单次运行**的计量，不是上下文窗口占用。",
+        duration: 8000,
       });
     }
 
-    function refreshIndex() {
-      UI.toast({ tone: "info", title: "正在重建索引…", duration: 1800 });
-      setTimeout(function () {
-        UI.toast({ tone: "ok", title: "索引已更新", desc: WORKSPACE.indexStatus, duration: 3200 });
-      }, 1500);
+    /* 把用量反映到输入坞的进度条上。
+       ## 分母问题（这里曾经是编的）
+       mock 时显示 "38.2k / 200k"，那个 200k 是假的上限。
+       现在**只用真实数字**：
+         · 有用量 → 显示总量，进度条按"相对该次运行的输入量"画满，
+           并在 title 里说清它不是窗口占用
+         · 没用量 → 显示"未记录"，进度条归零
+       编一个上限比不显示更坏：用户会据此判断"还能不能再加东西"。 */
+    function updateMeter() {
+      var bar = $("#btn-meter");
+      if (!bar) return;
+      var fill = bar.querySelector(".dock__meterfill");
+      var label = bar.querySelector(".tabular");
+      var prog = bar.querySelector(".dock__meterbar");
+      var u = state.usage;
+      if (u && u.available) {
+        if (label) label.textContent = u.fmt + " tok";
+        if (prog) prog.setAttribute("aria-valuenow", String(u.total));
+        // 进度条按输入量相对总用量画（输入通常占大头）——
+        // 只是一个"这次运行里输入占多少"的可视化，不是窗口占用率
+        var pct = u.total ? Math.round(u.prompt / u.total * 100) : 0;
+        if (fill) fill.style.width = Math.max(3, pct) + "%";
+        bar.setAttribute("data-tip",
+          "上次运行用量：" + u.parts + "（来源：" + state.usageSource + "）");
+      } else {
+        if (label) label.textContent = "未记录用量";
+        if (prog) prog.setAttribute("aria-valuenow", "0");
+        if (fill) fill.style.width = "0%";
+        bar.setAttribute("data-tip",
+          state.usageSource ? "这次运行没有用量记录" : "还没有运行过；发一条指令后会显示真实用量");
+      }
     }
+
+    function refreshIndex() {
+      // 这个 harness **没有代码索引**（搜索走 grep 工具）。
+      // 所以这里不假装"正在重建索引"，而是如实说明并重新读一次工作区概要。
+      if (!Backend.available()) {
+        UI.toast({ tone: "warning", title: "后端未连接",
+                   desc: "工作区信息由 harness 提供。", duration: 5000 });
+        return;
+      }
+      Backend.loadWorkspaceInfo().then(function (info) {
+        if (!info) {
+          UI.toast({ tone: "danger", title: "读取工作区失败",
+                     desc: state.wsInfoError || "", duration: 5000 });
+          return;
+        }
+        UI.toast({
+          tone: "info", duration: 6000,
+          title: "工作区：" + info.files + " 个文件 · " + info.dirs + " 个目录",
+          desc: "**没有代码索引** — " + info.index_note
+            + "（扫描上限：深度 " + info.scan.max_depth
+            + "、最多 " + info.scan.max_files + " 个文件）",
+        });
+      });
+    }
+
+    /* 状态栏：把真实工作区信息写回去。
+       mock 版写着"已索引 · 1,284 文件 · 18.6 万 token" —— 全是编的。
+       现在只显示能核实的量（文件数、分支），没有的就说没有。 */
+    function renderStatusbar() {
+      var idx = $("#btn-index");
+      if (!idx) return;
+      var dot = idx.querySelector(".statusitem__dot");
+      var info = state.wsInfo;
+      if (!Backend.available()) {
+        idx.setAttribute("data-tip", "后端未连接，无法读取工作区");
+        if (dot) dot.className = "statusitem__dot";
+        idx.lastChild.textContent = "未连接";
+        return;
+      }
+      if (!info) {
+        idx.setAttribute("data-tip", state.wsInfoError || "读取工作区中…");
+        idx.lastChild.textContent = state.wsInfoError ? "读取失败" : "读取中";
+        return;
+      }
+      // 明确写"未索引"而不是"已索引" —— 后端确实没有索引
+      idx.lastChild.textContent = (info.truncated ? "≥" : "") + info.files + " 文件";
+      idx.setAttribute("data-tip",
+        info.workspace + "\n" + info.files + " 个文件 · " + info.dirs + " 个目录"
+        + (info.branch ? "\n分支 " + info.branch : "")
+        + "\n" + info.index_note);
+      if (dot) dot.className = "statusitem__dot statusitem__dot--ok";
+    }
+
+    /* 把真实工作区信息填进顶栏 / 状态栏 / 终端标题。
+       这些位置原本是**硬编码在 index.html 里的 mock 字样**
+       （仓库名 crucible-core、分支 feat/stream-reconnect、
+       终端标题 zsh — crucible-core）—— 静态 HTML 不会自动更新，
+       所以要显式替换，否则页面上永远挂着一个不存在的仓库名。 */
+    function renderBranchChip() {
+      var info = state.wsInfo;
+      var name = "";
+      if (info && info.workspace) {
+        var segs = String(info.workspace).split(/[\\/]/).filter(Boolean);
+        name = segs.length ? segs[segs.length - 1] : info.workspace;
+      }
+      var repo = $("#ctx-repo");
+      if (repo) repo.textContent = name || "（未连接）";
+      var branch = $("#ctx-branch");
+      if (branch) {
+        branch.textContent = (info && info.branch) || (Backend.available() ? "—" : "未连接");
+        branch.hidden = !(info && info.branch);
+      }
+      var sb = $("#status-branch");
+      if (sb) sb.textContent = (info && info.branch) || (Backend.available() ? "—" : "未连接");
+      var tt = $("#term-tab");
+      if (tt) tt.textContent = name ? ("shell — " + name) : "shell";
+      var tp = $("#term-prompt");
+      if (tp) tp.textContent = (name || "workspace") + " $";
+      var il = $("#status-index-label");
+      if (il) {
+        il.textContent = info ? ((info.truncated ? "≥" : "") + info.files + " 文件")
+                              : (Backend.available() ? "读取中" : "未连接");
+      }
+      var dot = $("#btn-index .statusitem__dot");
+      if (dot && info) dot.className = "statusitem__dot statusitem__dot--ok";
+    }
+
+    // 挂到外层钩子：Backend 在 init 之后才会用到它们，
+    // 而且只有挂上之后调用才有效 —— 未挂时是空操作，不会在 DOM 未就绪时炸。
+    uiHooks.updateMeter = updateMeter;
+    uiHooks.renderStatusbar = renderStatusbar;
+    uiHooks.renderBranchChip = renderBranchChip;
 
     // ---------- 计划视图 ----------
     $("#plan-toggle").addEventListener("click", function () {
@@ -3506,6 +4210,18 @@
       },
       onDone: function (data) {
         if (data && data.status) UI.announce("运行结束：" + data.status);
+        // 运行结束 → 拉这次的真实用量，并刷新运行列表
+        // （新 run 已经在落盘里了，刷新后「会话历史」能看到它）
+        var rid = window.Harness.runId && window.Harness.runId();
+        if (rid) {
+          Backend.loadUsage(rid, state.workspace, "live");
+        }
+        Backend.loadChainSummary();
+        Backend.loadRuns();
+        // 工作区可能被改动了 → 让文件树与工作区概要失效重读。
+        // **不清缓存的话，改完文件后树里还是旧的** ——
+        // 那会让人以为 agent 没生效。
+        Backend.invalidateWorkspace();
       },
     });
   }
@@ -3585,6 +4301,11 @@
         Backend.loadChainSummary();
         Backend.loadRuns();
         if (state.railView === "mcp") Backend.loadTools();
+        // 工作区真实数据：概要（状态栏）+ 文件树根层。
+        // 三个只读查询并发发出 —— 串行会让首屏白等三倍。
+        Backend.loadWorkspaceInfo();
+        Backend.loadTree("");
+        uiHooks.updateMeter();
         // 把已保存的模型接入配置反映到界面。
         // 若未配置，状态栏模型会显示"未配置"并在 title 里提示点此接入 ——
         // 不静默显示一个假模型名，否则用户会以为真的在用那个模型。

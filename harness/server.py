@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -42,6 +43,7 @@ if __package__ in (None, ""):
     from harness.policy import ApprovalPolicy, Policy, SandboxMode
     from harness.protocol import Event, EventBus, EventType
     from harness.session import Session, list_runs
+    from harness.tools.shell import ShellTool
 else:
     from .chain import verify_all, verify_chain
     from .context import DEFAULT_SYSTEM_PROMPT, StaticPrefix
@@ -53,6 +55,7 @@ else:
     from .policy import ApprovalPolicy, Policy, SandboxMode
     from .protocol import Event, EventBus, EventType
     from .session import Session, list_runs
+    from .tools.shell import ShellTool
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -375,6 +378,107 @@ class Handler(BaseHTTPRequestHandler):
         ws = (q.get("workspace") or [None])[0]
         return self._find_run_dir(rid, ws)
 
+    def _replay_result(self, rid: str, run_dir: str) -> Dict[str, Any]:
+        """从落盘事件重建"运行结果"。
+
+        ## 为什么必须有它
+
+        `/result` 原本只认内存态，**历史 run 取不到结果与用量** ——
+        进程一重启就 404。而 usage（"这次花了多少 token"）恰恰只在这里。
+        与 `/events` 曾是同一个坑：**同一类缺陷出现在两个端点，
+        说明上次修的时候只修了眼前那一个。**
+
+        ## 重建原则：只读结构化字段
+
+        `status` / `iterations` / `tool_calls` / `reason` / `usage` 全部来自
+        `turn.completed` 事件的 `data`（结构化），**不解析任何模型文本**。
+        这与 verify / preflight / capability / certificate 是同一条纪律。
+
+        取**最后一个** `turn.completed`：一次会话可能有多次（重试/多轮），
+        最终状态是最后一次。
+        """
+        ev_path = os.path.join(run_dir, "events.jsonl")
+        if not os.path.isfile(ev_path):
+            return {"error": "no events recorded",
+                    "detail": "这个 run 目录里没有 events.jsonl，无法重建结果。"}
+
+        final: Optional[Dict[str, Any]] = None
+        counts: Dict[str, int] = {}
+        usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        usage_seen = False
+        files_changed: List[str] = []
+        errors = 0
+
+        with open(ev_path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    e = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                t = e.get("type")
+                counts[t] = counts.get(t, 0) + 1
+                d = e.get("data") or {}
+                if t == "turn.completed":
+                    # 用 last 而不是累积 —— reason/status 是"最终状态"语义
+                    final = d
+                    u = d.get("usage") or {}
+                    if u:
+                        usage_seen = True
+                        for k in usage_total:
+                            try:
+                                usage_total[k] += int(u.get(k) or 0)
+                            except (TypeError, ValueError):
+                                pass
+                if t == "tool.output":
+                    for p in (d.get("files_changed") or []):
+                        if p not in files_changed:
+                            files_changed.append(p)
+                if t == "error":
+                    errors += 1
+
+        final = final or {}
+        return {
+            "run_id": rid,
+            "mode": "replay",
+            "run_dir": run_dir,
+            "summary": {
+                "session_id": rid,
+                "run_dir": run_dir,
+                "events": sum(counts.values()),
+                "by_type": counts,
+                # 链状态一并给出：审计信息不该藏在需要额外调用的地方
+                # （与 session.summary 保持一致的口径）
+                "chain_head": self._chain_head(run_dir),
+            },
+            "result": {
+                "status": final.get("status") or "",
+                "reason": final.get("reason") or "",
+                "answer": final.get("answer") or "",
+                "iterations": final.get("iterations"),
+                "tool_calls": final.get("tool_calls"),
+                # usage 为 0 时给 None 而不是三个 0 ——
+                # "没记录用量"与"用量确实是零"不是一回事，
+                # 报成 0 会让人以为这次调用不花钱。
+                "usage": usage_total if usage_seen else None,
+                "files_changed": files_changed,
+                "errors": errors,
+            },
+        }
+
+    @staticmethod
+    def _chain_head(run_dir: str) -> Optional[str]:
+        p = os.path.join(run_dir, "chain.head")
+        if not os.path.isfile(p):
+            return None
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+
     def _json(self, code: int, obj: Any) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -493,6 +597,66 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/tools":
             return self._json(200, _tool_manifest())
+
+        # ── 工作区只读访问（前端 explorer / editor 用真实数据）──
+        # 刻意不用 `/api/run/...` 前缀：它们与"某次运行"无关，
+        # 而是"当前工作区现在长什么样"。
+        if path == "/api/workspace/tree":
+            ws = (q.get("workspace") or [default_workspace()])[0]
+            rel = (q.get("path") or [""])[0]
+            try:
+                depth = int((q.get("depth") or ["1"])[0])
+            except ValueError:
+                depth = 1
+            return self._json(200, _list_tree(ws, rel, depth, max_entries=400))
+
+        if path == "/api/workspace/file":
+            ws = (q.get("workspace") or [default_workspace()])[0]
+            rel = (q.get("path") or [""])[0]
+            try:
+                limit = int((q.get("max_bytes") or [str(512 * 1024)])[0])
+            except ValueError:
+                limit = 512 * 1024
+            limit = max(1024, min(limit, 4 * 1024 * 1024))
+            return self._json(200, _read_workspace_file(ws, rel, limit))
+
+        if path == "/api/workspace/terminal":
+            # **受白名单限制的只读命令执行**。
+            #
+            # ## 为什么不是"开放任意 shell"
+            # 这是浏览器发起的请求，不是 agent 的动作 —— 但它会真的执行命令。
+            # 开放任意命令等于把 harness 变成一个远程 shell：任何能打开
+            # 这个页面的人（本机任何进程、任何浏览器扩展）都能执行任意代码。
+            # harness 的沙箱与审批闸门保护的是 **agent**，不保护这条路径。
+            #
+            # 所以这里用**白名单 + 元字符拒绝**双重限制：
+            #   1. 首词必须在白名单里（ls/cat/git status/…）
+            #   2. 命令里不得出现 shell 元字符（| & ; > < ` $ ( ) 换行）
+            # 两道都过才执行。**拒绝时给原因**，不静默失败。
+            ws = (q.get("workspace") or [default_workspace()])[0]
+            cmd = (q.get("cmd") or [""])[0]
+            return self._json(200, _run_readonly_command(ws, cmd))
+
+        if path == "/api/workspace/info":
+            # 工作区概要：前端状态栏与索引提示需要它。
+            # 只报**能可靠得到**的几个量（路径、文件数、是否有 .git）。
+            ws = (q.get("workspace") or [default_workspace()])[0]
+            return self._json(200, _workspace_info(ws))
+
+        if path == "/api/workspace/search":
+            # 工作区文本搜索。
+            #
+            # **刻意复用 agent 用的 grep 工具**，而不是另写一套实现：
+            # 两套实现迟早会漂移，而漂移会让用户看到"搜索结果与 agent
+            # 看到的不一样" —— 那是很难解释的一种不一致。
+            ws = (q.get("workspace") or [default_workspace()])[0]
+            pat = (q.get("q") or [""])[0]
+            if not pat.strip():
+                return self._json(400, {
+                    "error": "empty query",
+                    "detail": "搜索词不能为空。",
+                })
+            return self._json(200, _workspace_search(ws, pat, q))
         if path == "/api/config":
             ws = (q.get("workspace") or [default_workspace()])[0]
             ep = load_config(ws)
@@ -503,16 +667,32 @@ class Handler(BaseHTTPRequestHandler):
                 "env_vars": [ENV_BASE_URL, ENV_API_KEY, ENV_MODEL],
             })
         if path.startswith("/api/run/") and path.endswith("/result"):
+            # 与 /events 同一处理：内存态优先，否则回落到落盘。
+            #
+            # 实测踩到：`/result` 原本**只认内存态**，于是历史 run 取不到
+            # 运行结果与用量 —— 而 usage 恰恰是"这次花了多少"的唯一来源。
+            # 这与 /events 曾是同一个坑（同一类缺陷的第二处）：
+            # **同一个 bug 出现在两个端点，说明修的时候只修了眼前那一个。**
+            # 所以这次把两者都改成"内存态 → 落盘"的统一形态。
             rid = path.split("/")[3]
             st = RUNS.get(rid)
-            if st is None:
-                return self._json(404, {"error": "run not found"})
-            return self._json(200, {
-                "run_id": rid,
-                "result": st.result,
-                "error": st.error,
-                "summary": st.session.summary() if st.session else None,
-            })
+            if st is not None:
+                return self._json(200, {
+                    "run_id": rid,
+                    "mode": "live",
+                    "result": st.result,
+                    "error": st.error,
+                    "summary": st.session.summary() if st.session else None,
+                })
+            run_dir = self._resolve_run_dir(rid, q)
+            if run_dir is None:
+                return self._json(404, {
+                    "error": "run not found",
+                    "detail": "既不在本次进程的运行表里，也没能在落盘目录中找到。"
+                              "若这是另一个工作区跑出来的，请带上 workspace 参数。",
+                })
+            return self._json(200, self._replay_result(rid, run_dir))
+
         if path.startswith("/api/run/") and path.endswith("/events"):
             # 两种形态，靠**运行是否还在内存里**区分：
             #   · 在跑 / 刚跑完（RUNS 有）→ SSE 实时流，前端 EventSource 订阅
@@ -953,6 +1133,448 @@ def _tool_manifest() -> Dict[str, Any]:
                 "specs": reg.specs()}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════
+# 工作区只读访问（文件树 / 读文件）
+# ══════════════════════════════════════════════════════════════════
+# 前端展示"真实工作区"需要这两个端点。设计要点：
+#
+# 1. **这是只读接口，不经过 policy/沙箱**。理由：它不是 agent 的动作，
+#    是**用户在看自己的工作区**。把它塞进 agent 的工具链会混淆
+#    "谁在动这个文件"这件事 —— 而审批闸门的存在意义正是回答这个问题。
+#    但正因为它绕过了 policy，**路径校验必须自己做，且做得更严**。
+# 2. **必须防穿越**：任何 `..`、绝对路径、符号链接逃逸都要挡住。
+#    这里用 realpath 后做前缀比对，而不是字符串前缀匹配 ——
+#    后者会被 `..` 绕过（`/ws/../etc` 的字符串前缀仍是 `/ws`）。
+# 3. **列目录时跳过噪声**，但要**如实告诉前端跳了什么**：
+#    静默省略会让人以为"这个仓库就这么点东西"。
+
+_SKIP_DIRS = {".git", "node_modules", ".next", "dist", "build", ".venv",
+              "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
+              ".idea", ".vscode", ".DS_Store"}
+_TEXT_EXT = {".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt",
+             ".css", ".html", ".htm", ".yml", ".yaml", ".toml", ".ini",
+             ".cfg", ".sh", ".bat", ".ps1", ".sql", ".java", ".go", ".rs",
+             ".c", ".h", ".cpp", ".hpp", ".rb", ".php", ".xml", ".csv"}
+
+
+def _safe_join(workspace: str, rel: str) -> Optional[str]:
+    """把相对路径安全地拼到工作区下。
+
+    返回 None 表示**拒绝**。拒绝的情形一律视为"不存在"，
+    并且**不区分**"逃逸被拒"与"文件不存在" —— 否则这个端点就变成了
+    "探测工作区之外有什么"的工具（存在性本身就是信息）。
+    """
+    if not rel:
+        return os.path.realpath(workspace)
+    if os.path.isabs(rel):
+        return None
+    # 拒绝任何显式向上跳的路径段（realpath 之后还会再校验一次，
+    # 这里是早退，让拒绝更明显）
+    parts = [p for p in re.split(r"[\\/]+", rel) if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return None
+    ws = os.path.realpath(workspace)
+    full = os.path.realpath(os.path.join(ws, *parts))
+    # realpath 之后必须仍在工作区内 —— 这一条防的是符号链接逃逸：
+    # 字符串前缀匹配挡不住指向外面的软链。
+    if full != ws and not full.startswith(ws + os.sep):
+        return None
+    return full
+
+
+def _list_tree(workspace: str, rel: str, depth: int, max_entries: int) -> Dict[str, Any]:
+    """列一层目录（前端按需展开，不做全量递归）。
+
+    返回当前层的直接子项。为什么只列一层：
+    全量递归在大型仓库上会变成一次扫描上千文件的操作，
+    而前端只需要"用户展开的那个目录"。
+    """
+    target = _safe_join(workspace, rel)
+    if target is None or not os.path.isdir(target):
+        return {"error": "not a directory", "path": rel}
+
+    entries: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    try:
+        names = sorted(os.listdir(target), key=lambda s: (not os.path.isdir(
+            os.path.join(target, s)), s.lower()))
+    except OSError as e:
+        return {"error": f"listdir failed: {e}", "path": rel}
+
+    for name in names:
+        full = os.path.join(target, name)
+        if name in _SKIP_DIRS:
+            skipped.append(name)
+            continue
+        try:
+            is_dir = os.path.isdir(full)
+            size = 0 if is_dir else os.path.getsize(full)
+        except OSError:
+            continue
+        child_rel = (rel + "/" + name).lstrip("/")
+        # 只标"能不能当文本打开"，不读内容 —— 读内容是另一个端点的活。
+        # 无扩展名的文件（.gitignore / Makefile / LICENSE）**也算文本候选**：
+        # 实测踩到，早期只按扩展名判 → .gitignore 被判成二进制，
+        # 而它恰恰是最常被打开来看的文件之一。
+        ext = "" if is_dir else os.path.splitext(name)[1].lower()
+        entries.append({
+            "name": name,
+            "path": child_rel,
+            "kind": "dir" if is_dir else "file",
+            "size": size,
+            "ext": ext,
+            "text": is_dir or ext in _TEXT_EXT or ext == "",
+        })
+        if len(entries) >= max_entries:
+            break
+
+    return {
+        "path": rel,
+        "entries": entries,
+        "truncated": len(entries) >= max_entries,
+        # **跳过的目录要如实报出来**：静默省略会让人以为仓库就这么点东西
+        "skipped": skipped,
+        "depth": depth,
+    }
+
+
+def _read_workspace_file(workspace: str, rel: str, max_bytes: int) -> Dict[str, Any]:
+    """读一个工作区内的文本文件。
+
+    行号在**服务端**加，不在前端加 —— 因为行号必须与实际内容用同一次
+    读取算出来；前端自己 split 会在"正好卡在截断处"时错位。
+    """
+    target = _safe_join(workspace, rel)
+    if target is None or not os.path.isfile(target):
+        return {"error": "file not found", "path": rel}
+    try:
+        size = os.path.getsize(target)
+        with open(target, "rb") as f:
+            raw = f.read(max_bytes)
+    except OSError as e:
+        return {"error": f"read failed: {e}", "path": rel}
+
+    truncated = size > len(raw)
+    # 解码：优先 UTF-8，失败退回本地代码页（Windows 上中文源码常见 GBK）。
+    # 直接 `errors="replace"` 也行，但那会把内容变成一堆问号，
+    # 而"这个文件不是 UTF-8"本身是有用的信息。
+    enc = "utf-8"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("gbk")
+            enc = "gbk"
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", "replace")
+            enc = "utf-8(replace)"
+
+    lines = text.split("\n")
+    return {
+        "path": rel,
+        "size": size,
+        "encoding": enc,
+        "truncated": truncated,
+        "line_count": len(lines),
+        "lines": lines,
+    }
+
+
+# 终端白名单：只允许**只读、只读工作区、不改变系统状态**的命令。
+# 分两类：
+#   · 直接放行（无参数或参数已被本函数校验过）
+#   · 需要额外校验参数（如 `git` 只允许 status/log/diff/branch）
+_TERM_ALLOWED = {
+    "ls", "dir", "cat", "type", "head", "tail", "wc", "pwd", "cd",
+    "find", "grep", "rg", "tree",
+    "python", "python3", "node", "npm", "pip",  # 仅 --version 形态
+    "echo", "date", "whoami", "hostname",
+    "git", "wc",
+    "help", "clear",
+}
+# 元字符一律拒绝。它们是把"一条只读命令"变成"任意命令链"的唯一手段，
+# 所以挡住元字符比逐个白名单命令更根本。
+_TERM_FORBIDDEN = set("|&;><`$()\n\r\t")
+# python/node/npm 这类解释器只允许"查版本" ——
+# 允许 `python -c "..."` 等于开放任意代码执行。
+_VERSION_ONLY = {"python", "python3", "node", "npm", "pip"}
+
+
+def _run_readonly_command(workspace: str, cmd: str) -> Dict[str, Any]:
+    """在受控白名单下执行一条只读命令。
+
+    ## 为什么需要这么严
+
+    这是**浏览器发起的**命令执行，不是 agent 的动作。harness 的沙箱与审批
+    闸门保护的是 agent，管不到这条路径；而开放任意命令会把服务变成
+    一个远程 shell（本机任何进程、任何浏览器扩展都能用）。
+
+    三道限制（缺一不可）：
+      1. **元字符拒绝** —— `| & ; > < ` $ ( )` 与换行
+      2. **首词白名单** —— 不在名单里直接拒
+      3. **参数形态校验** —— 解释器类只允许 `--version`；`git` 只允许
+         status/log/diff/branch/show；`find`/`grep` 禁 `-exec`/`-delete`
+
+    ## 拒绝时给原因
+
+    和这个项目一贯的做法一致：不静默失败。"为什么不让跑"本身是有用的信息
+    （用户会知道这是只读终端，而不是终端坏了）。
+    """
+    ws = os.path.realpath(workspace)
+    raw = (cmd or "").strip()
+    if not raw:
+        return {"ok": False, "code": "empty", "detail": "命令为空。",
+                "workspace": ws}
+
+    if any(ch in _TERM_FORBIDDEN for ch in raw):
+        bad = sorted({ch for ch in raw if ch in _TERM_FORBIDDEN})
+        return {"ok": False, "code": "metachar", "workspace": ws,
+                "detail": "命令包含被禁止的 shell 元字符："
+                          + " ".join(repr(c) for c in bad)
+                          + "。这个终端是**只读**的，不支持管道、重定向与命令串联。"}
+
+    parts = raw.split()
+    head = parts[0].lower()
+    if head not in _TERM_ALLOWED:
+        return {"ok": False, "code": "not_allowed", "workspace": ws,
+                "detail": f"`{head}` 不在只读白名单里。"
+                          "允许的命令：" + "、".join(sorted(_TERM_ALLOWED))}
+
+    args = parts[1:]
+    low_args = [a.lower() for a in args]
+
+    if head in _VERSION_ONLY:
+        if not any(a in ("--version", "-v", "-V") for a in args):
+            return {"ok": False, "code": "not_allowed", "workspace": ws,
+                    "detail": f"`{head}` 只允许查版本（--version）——"
+                              "允许执行任意代码会把这个只读终端变成代码执行入口。"}
+
+    if head == "git":
+        sub = low_args[0] if low_args else ""
+        if sub not in ("status", "log", "diff", "branch", "show", "rev-parse"):
+            return {"ok": False, "code": "not_allowed", "workspace": ws,
+                    "detail": "`git` 只允许 status / log / diff / branch / show / rev-parse。"
+                              "写操作（commit/checkout/reset/…）不在这里做。"}
+
+    for bad_arg in ("-exec", "-execdir", "-delete", "-ok", "rm", "-fdelete"):
+        if bad_arg in low_args:
+            return {"ok": False, "code": "not_allowed", "workspace": ws,
+                    "detail": f"参数 `{bad_arg}` 会改变文件系统，已拒绝。"}
+
+    # ── 读文件内容的命令：**不经 shell，直接走读文件函数** ──
+    #
+    # 这是实测踩出来的修法。原因值得写清楚：
+    # Windows 上 shell 的输出按**控制台代码页（GBK/936）**解码，而且用了
+    # `errors="replace"` —— 读 UTF-8 文件时字节流被 GBK 解错，无法解码的
+    # 字节变成 U+FFFD 替换字符。**信息在这一步就永久丢了**，
+    # 事后 `encode("gbk").decode("utf-8")` 也救不回来（实测确实救不回来）。
+    #
+    # 所以不能事后转码，只能**不走那条会损坏数据的路径**：
+    # `cat`/`head`/`tail` 本质就是"读文件内容"，而
+    # `_read_workspace_file` 本来就按 UTF-8 → GBK 的顺序试解码，是对的。
+    # 委托给它，等于让两条路径共用同一个正确的实现。
+    #
+    # 判据：首词在白名单里且带一个文件参数。`head -n 20 f` 这类参数
+    # 也要能处理，所以先剥掉以 `-` 开头的选项。
+    if head in ("cat", "type", "head", "tail"):
+        # 剥掉选项**及其数值**：`head -n 3 file` 里的 `3` 是选项参数，
+        # 不是文件。实测踩到：早期只跳过 `-` 开头的项，于是 `3` 被当成
+        # 第二个文件参数，报"一次只允许读一个文件" —— 把一条合法命令
+        # 拒掉，而且理由完全指错方向。
+        file_args = []
+        skip_next = False
+        for a in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if a in ("-n", "--lines"):
+                skip_next = True
+                continue
+            if a.startswith("-"):
+                continue          # 其它选项（-v / --number 等）直接忽略
+            file_args.append(a)
+
+        if len(file_args) == 1:
+            limit = 64 * 1024
+            n = 20
+            if head in ("head", "tail"):
+                for i, a in enumerate(args):
+                    if a in ("-n", "--lines") and i + 1 < len(args):
+                        try:
+                            n = max(1, int(args[i + 1]))
+                        except ValueError:
+                            n = 20
+                    elif a.startswith("-") and a.lstrip("-").isdigit():
+                        n = max(1, int(a.lstrip("-")))
+                limit = max(64 * 1024, n * 8192)
+            fread = _read_workspace_file(ws, file_args[0], limit)
+            if fread.get("error"):
+                return {"ok": False, "code": "read_failed", "workspace": ws,
+                        "detail": fread["error"], "command": raw}
+            lines = fread.get("lines") or []
+            if head == "tail":
+                lines = lines[-n:]
+            elif head == "head":
+                lines = lines[:n]
+            return {
+                "ok": True, "workspace": ws, "command": raw,
+                "exit_code": 0,
+                "text": "\n".join(lines),
+                "encoding": fread.get("encoding"),
+                "truncated": bool(fread.get("truncated")),
+                "restricted": True,
+                # 说明这条命令是**直接读文件**完成的，没经过 shell ——
+                # 否则用户看到输出与 shell 行为不一致会困惑
+                "via": "read_file（后端直读，保证编码正确）",
+            }
+        if len(file_args) > 1:
+            return {"ok": False, "code": "not_allowed", "workspace": ws,
+                    "detail": f"{head} 一次只允许读一个文件。"}
+
+    shell = ShellTool(ws)
+    try:
+        res = shell({"command": raw, "timeout_ms": 15000})
+        text = res.text
+        return {
+            "ok": bool(res.ok),
+            "workspace": ws,
+            "command": raw,
+            "exit_code": res.exit_code,
+            "text": text,
+            "truncated": res.truncated,
+            # shell 路径的输出按控制台代码页解码（对 dir/git status 这类正确）
+            "encoding": "控制台代码页（shell 输出）",
+            "restricted": True,
+        }
+    except Exception as e:      # noqa: BLE001
+        return {"ok": False, "code": "exec_failed", "workspace": ws,
+                "detail": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            shell.reset()
+        except Exception:
+            pass
+
+
+def _workspace_search(workspace: str, pattern: str, q: Dict[str, List[str]]) -> Dict[str, Any]:
+    """在工作区内按内容搜索。
+
+    ## 复用 agent 的 grep 工具，而不是另写一套
+
+    两套实现迟早会漂移，而漂移的后果是"用户搜到的结果与 agent 看到的
+    不一样" —— 那是最难解释的一类不一致。所以这里直接调注册表里的 grep。
+
+    返回结构里带 `engine` 字段，明确说明是谁搜的；将来换实现时
+    前端能据此分辨结果来源（而不是以为搜索算法悄悄变了）。
+    """
+    ws = os.path.realpath(workspace)
+    if not os.path.isdir(ws):
+        return {"error": "workspace not found", "workspace": ws}
+
+    try:
+        limit = int((q.get("limit") or ["200"])[0])
+    except ValueError:
+        limit = 200
+    limit = max(1, min(limit, 2000))
+
+    reg, shell = build_default_registry(ws)
+    try:
+        tool = reg.tool("grep")
+        if tool is None:
+            return {"error": "grep tool unavailable",
+                    "detail": "当前注册表里没有 grep 工具，无法搜索。"}
+        # 直接调 handler（不经过 router）—— 因为 router 会走审批闸门，
+        # 而**用户在前端点搜索不该被审批拦下**：这不是 agent 的动作。
+        # 这也正是这个端点是只读接口的原因（见上方说明）。
+        res = tool.handler({"pattern": pattern, "limit": limit})
+    except Exception as e:      # noqa: BLE001
+        return {"error": f"search failed: {type(e).__name__}: {e}"}
+    finally:
+        try:
+            shell.reset()
+        except Exception:
+            pass
+
+    # grep 工具的返回是带行号的文本。这里**不解析文本**——
+    # 解析会引入一类只在特定格式下才错的 bug。
+    # 直接把原文交给前端，由前端按行渲染（前端已经有一套同样的行渲染）。
+    return {
+        "query": pattern,
+        "workspace": ws,
+        "engine": "grep（与 agent 用的是同一个工具）",
+        "ok": bool(getattr(res, "ok", False)),
+        "lines": [l for l in (getattr(res, "text", "") or "").split("\n") if l.strip()],
+        "truncated": bool(getattr(res, "truncated", False)),
+    }
+
+
+def _workspace_info(workspace: str) -> Dict[str, Any]:
+    """工作区概要。
+
+    ## 只报**能可靠得到**的量
+
+    刻意**不报**"已索引 / N 个 token"这类需要真正建索引才有的数字 ——
+    当前 harness 没有代码索引（explorer 的搜索走的是 grep 工具，
+    没有向量库）。编一个数字比不报更坏：它会被当成真的。
+
+    文件计数用**有限深度**扫描（默认 4 层、上限 20000）：
+    拒不设上限会让一个巨大的 node_modules 把端点拖成超时。
+    """
+    ws = os.path.realpath(workspace)
+    if not os.path.isdir(ws):
+        return {"error": "workspace not found", "workspace": ws}
+
+    files = 0
+    dirs = 0
+    by_ext: Dict[str, int] = {}
+    truncated = False
+    max_files = 20000
+
+    for root, subdirs, filenames in os.walk(ws):
+        rel = os.path.relpath(root, ws)
+        if rel.count(os.sep) >= 4:
+            subdirs[:] = []
+            continue
+        # 原地过滤噪声目录，避免走进 node_modules 这类巨型目录
+        subdirs[:] = [d for d in subdirs if d not in _SKIP_DIRS and d != ".crucible"]
+        dirs += len(subdirs)
+        for fn in filenames:
+            files += 1
+            ext = os.path.splitext(fn)[1].lower() or "(无扩展名)"
+            by_ext[ext] = by_ext.get(ext, 0) + 1
+            if files >= max_files:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    git_head = None
+    head_path = os.path.join(ws, ".git", "HEAD")
+    if os.path.isfile(head_path):
+        try:
+            with open(head_path, "r", encoding="utf-8") as f:
+                ref = f.read().strip()
+            git_head = ref.replace("ref: refs/heads/", "") or ref
+        except OSError:
+            git_head = None
+
+    top = sorted(by_ext.items(), key=lambda kv: -kv[1])[:8]
+    return {
+        "workspace": ws,
+        "files": files,
+        "dirs": dirs,
+        "truncated": truncated,
+        "by_ext": dict(top),
+        "branch": git_head,
+        "has_git": os.path.isdir(os.path.join(ws, ".git")),
+        # 明确声明没有索引 —— 前端据此显示"未索引"而不是编一个数字
+        "indexed": False,
+        "index_note": "当前 harness 没有代码索引；搜索走 grep 工具（逐文件匹配）。",
+        "scan": {"max_depth": 4, "max_files": max_files,
+                 "skipped_dirs": sorted(_SKIP_DIRS)},
+    }
 
 
 # ══════════════════════════════════════════════════════════════════

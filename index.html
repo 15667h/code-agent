@@ -47,13 +47,13 @@
   </div>
 
   <div class="topbar__center">
-    <span class="ctxchip"><span class="ctxchip__repo">crucible-core</span></span>
-    <span class="ctxchip ctxchip--dim" title="当前分支">
+    <span class="ctxchip" data-tip="当前工作区"><span class="ctxchip__repo" id="ctx-repo">—</span></span>
+    <span class="ctxchip ctxchip--dim" title="当前分支" id="ctx-branch">
       <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" class="ico-12"><path d="M5 3v7.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/><circle cx="5" cy="11.5" r="1.8" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="5" cy="3" r="1.8" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="11.5" cy="8" r="1.8" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5 5.2c0 2 6.5 1.2 6.5 2.9" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>
-      feat/stream-reconnect
+      —
     </span>
-    <span class="ctxchip ctxchip--ahead" title="领先远程提交数">
-      <span class="tabular">↑3</span>
+    <span class="ctxchip ctxchip--ahead" title="领先远程提交数" id="ctx-ahead" hidden>
+      <span class="tabular">↑0</span>
     </span>
   </div>
 
@@ -180,7 +180,7 @@
       <section class="terminal" id="terminal" aria-label="终端">
         <div class="terminal__bar">
           <div class="terminal__tabs" role="tablist" aria-label="终端会话">
-            <button type="button" class="termtab is-on" role="tab" aria-selected="true">zsh — crucible-core</button>
+            <button type="button" class="termtab is-on" role="tab" aria-selected="true" id="term-tab">shell</button>
             <button type="button" class="termtab" role="tab" aria-selected="false">测试</button>
             <button type="button" class="termtab" role="tab" aria-selected="false">git</button>
           </div>
@@ -204,7 +204,7 @@
         </div>
         <form class="termform" id="termform" autocomplete="off">
           <label class="sr-only" for="term-input">终端命令</label>
-          <span class="termform__prompt" aria-hidden="true">crucible-core $</span>
+          <span class="termform__prompt" aria-hidden="true" id="term-prompt">$</span>
           <input class="termform__input" id="term-input" type="text" spellcheck="false"
                  autocapitalize="off" autocorrect="off"
                  placeholder="输入命令，↑ / ↓ 翻阅历史">
@@ -311,7 +311,7 @@
       <span class="statusitem__icon" aria-hidden="true">⚖</span><span data-approval>on-request</span>
     </button>
     <button type="button" class="statusitem statusitem--btn" id="btn-index" data-tip="代码库索引状态">
-      <span class="statusitem__dot statusitem__dot--ok" aria-hidden="true"></span>已索引
+      <span class="statusitem__dot" aria-hidden="true"></span><span id="status-index-label">读取中</span>
     </button>
   </div>
   <div class="statusbar__right">
@@ -323,7 +323,7 @@
     <span class="statusitem tabular" id="status-pos" data-tip="光标位置">L1, C1</span>
     <span class="statusitem" data-tip="文件编码">UTF-8</span>
     <span class="statusitem" data-tip="缩进设置">2 spaces</span>
-    <span class="statusitem" data-tip="当前分支">feat/stream-reconnect</span>
+    <span class="statusitem" data-tip="当前分支" id="status-branch">—</span>
   </div>
 </footer>
 
@@ -333,7 +333,9 @@
 <!-- @ 补全浮层 -->
 <div class="mention" id="mention" hidden role="listbox" aria-label="文件与命令建议"></div>
 
-<script src="scripts/mock-data.js"></script>
+<!-- ui-help.js：界面自身帮助常量（快捷键总览）。
+     原来的 mock-data.js 已删除 —— 它装的假数据全部零引用。 -->
+<script src="scripts/ui-help.js"></script>
 <script src="scripts/ui-kit.js"></script>
 <script src="scripts/harness-bridge.js"></script>
 <script src="scripts/app.js"></script>

@@ -51,6 +51,22 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
                          ".workbuddy", "bench")
 REPOS_DIR = os.path.join(CACHE_DIR, "repos")
 
+# ## 为什么脚本**不删** checkout 出来的仓库
+#
+# 实测踩到：脚本原本在每次跑完后 `shutil.rmtree(ws)` 清理，结果被环境的
+# **安全删除护栏**拦下 —— 一个 NodeBB 仓库有 4679 个文件，超过护栏阈值，
+# 需要交互确认，脚本因此直接失败退出（13 分钟的运行为此白跑）。
+#
+# 那条护栏是对的：它保护的是用户数据，脚本不该绕过它。
+# 所以改成本地策略：
+#   · **复用**已 checkout 的仓库（同题再跑就不必重新 fetch，省几分钟）
+#   · `prepare_repo` 里用 `git reset --hard <sha>` + `git clean -fd`
+#     把工作区恢复到 base_commit —— 这是 git 自己的清理，不碰用户目录
+#   · 真要删整个缓存，由用户显式跑 `--clean`（这时他预期就是删）
+#
+# 这也顺带修了一个真实缺陷：原实现每次跑都重新 fetch，
+# 而 benchmark 常要反复跑同一批题对比 —— 那是几分钟 × N 的浪费。
+
 
 # ══════════════════════════════════════════════════════════════════
 # 仓库准备
@@ -98,6 +114,11 @@ def prepare_repo(task: Dict[str, Any], workspace: str) -> Dict[str, Any]:
     r = _run(["git", "checkout", "-q", "FETCH_HEAD"], cwd=workspace, timeout=180)
     if r.returncode != 0:
         return {"ok": False, "reason": f"checkout 失败：{r.stderr[:300]}"}
+
+    # 若这次是复用已有 checkout，工作区可能被上一轮 agent 改脏。
+    # 用 git 自己的复位（不碰用户目录、不触发安全删除护栏）。
+    _run(["git", "reset", "--hard", "-q", sha], cwd=workspace, timeout=180)
+    _run(["git", "clean", "-fdq"], cwd=workspace, timeout=180)
     n_files = sum(len(fs) for _, _, fs in os.walk(workspace)
                   if ".git" not in _)
     return {"ok": True, "files": n_files, "sha": sha[:8]}
@@ -175,7 +196,7 @@ def run_one(task: Dict[str, Any], *, model, sandbox_mode, max_iter: int = 20,
     m = RunMetrics(task_id=tid, repo=task.get("repo") or "")
 
     ws = os.path.join(REPOS_DIR, tid[:60].replace("/", "_").replace(":", "_"))
-    shutil.rmtree(ws, ignore_errors=True)
+    # 不再 rmtree（见文件开头说明）：复用已有 checkout，靠 git 复位到 base_commit
     prep = prepare_repo(task, ws)
     if not prep.get("ok"):
         m.note = f"仓库准备失败：{prep.get('reason')}"
@@ -250,7 +271,8 @@ def run_one(task: Dict[str, Any], *, model, sandbox_mode, max_iter: int = 20,
         m.cert_codes = cert.reason_codes()
 
     shell.reset()
-    shutil.rmtree(ws, ignore_errors=True)
+    # **保留**仓库（见文件开头说明）：下次跑同一题直接复用，省一次 fetch。
+    # 工作区脏了没关系 —— 下次 prepare_repo 会用 git reset --hard 复位。
     return m
 
 
@@ -329,7 +351,20 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default="hard")
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--clean", action="store_true",
+                    help="删除整个仓库缓存目录（显式确认才做；脚本平时不删）")
     args = ap.parse_args(argv)
+
+    if args.clean:
+        if not os.path.isdir(REPOS_DIR):
+            print("缓存目录不存在，无需清理")
+            return 0
+        n = sum(len(fs) for _, _, fs in os.walk(REPOS_DIR))
+        print(f"将要删除 {REPOS_DIR}（约 {n} 个文件）")
+        print("这是**显式**清理请求 —— 只有你主动加 --clean 时才会走到这里。")
+        shutil.rmtree(REPOS_DIR, ignore_errors=True)
+        print("已清理")
+        return 0
 
     tasks = load_tasks(args.config)
     res = run_layer2(tasks, n=args.n, timeout_s=args.timeout)

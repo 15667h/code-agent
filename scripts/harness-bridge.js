@@ -263,7 +263,7 @@
               { ok: true, text: "证书指纹：" + String(d.digest || "").slice(0, 16) },
               { ok: false, warn: true,
                 text: "证书只证明「声称的事项在记录的轨迹里有成功证据」，"
-                    + "**不**证明产物在语义上正确。" },
+                    + "但不能证明产物在语义上正确。" },
             ],
           };
         }
@@ -426,7 +426,7 @@
         if (d.claim) {
           items.push({
             ok: true, warn: true,
-            text: "生成者自述（**非证据**）：" + String(d.claim).slice(0, 160),
+            text: "生成者自述（非证据）：" + String(d.claim).slice(0, 160),
           });
         }
         return {

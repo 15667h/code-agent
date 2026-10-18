@@ -1375,7 +1375,7 @@
         body.appendChild(emptyHint(
           state.searchMode === "index" ? "输入符号名开始查定义" : "输入关键词开始搜内容",
           state.searchMode === "index"
-            ? "索引是**符号索引 + 词表倒排**，不是语义索引：它只懂字面。"
+            ? "索引是「符号索引 + 词表倒排」，不是语义索引：它只懂字面。"
               + "搜「处理完成判定的那段逻辑」这类意图搜不到。"
             : "grep 逐文件匹配内容，无索引、无语义理解，但结果永远是当前磁盘状态。"));
         return;
@@ -2081,7 +2081,7 @@
       var meta = el("div", "filemeta");
       meta.textContent = f.path + " · " + UI.fmtBytes(f.size) + " · "
         + f.line_count + " 行 · " + f.encoding
-        + (f.truncated ? " · **已截断（只显示前 " + lines.length + " 行）**" : "");
+        + (f.truncated ? " · 已截断（只显示前 " + lines.length + " 行）" : "");
       var oldMeta = $("#editor-scroll .filemeta");
       if (oldMeta) oldMeta.remove();
       $("#editor-scroll").appendChild(meta);
@@ -2144,7 +2144,7 @@
       return;
     }
     if (cmd === "help") {
-      termAppend({ t: "dim", text: "这是**受控只读终端**：允许 ls/cat/head/tail/grep/find/wc/"
+      termAppend({ t: "dim", text: "这是受控只读终端：允许 ls/cat/head/tail/grep/find/wc/"
         + "git status 等只读命令；禁止管道、重定向、命令串联等 shell 元字符。" });
       return;
     }
@@ -3691,7 +3691,7 @@
         tone: "info",
         title: "上次运行用量 " + u.fmt + " token",
         desc: u.parts + " · 来源：" + (state.usageSource === "live" ? "实时运行" : "历史回放")
-          + "\n这是**单次运行**的计量，不是上下文窗口占用。",
+          + "\n这是单次运行的计量，不是上下文窗口占用。",
         duration: 8000,
       });
     }
@@ -3750,7 +3750,7 @@
         UI.toast({
           tone: "ok", duration: 6000,
           title: "索引已重建：" + ix.unique_symbols + " 个符号 · " + ix.files + " 个文件",
-          desc: "这是**符号索引 + 词表倒排**，不是语义索引（只懂字面）。"
+          desc: "这是「符号索引 + 词表倒排」，不是语义索引（只懂字面）。"
             + "语言分布：" + Object.keys(ix.languages || {}).join("、"),
         });
       });
@@ -4755,7 +4755,7 @@
       var wrap = el("div", "settings__sect");
       wrap.appendChild(el("h3", "settings__h", "工作区"));
       wrap.appendChild(el("p", "settings__p",
-        "只读。这里展示的是**真实状态** —— 读不到就写读不到，不留占位数字。"));
+        "只读。这里展示的是真实状态 —— 读不到就写读不到，不留占位数字。"));
 
       var rows = el("dl", "settings__kv");
       function kv(k, v) {

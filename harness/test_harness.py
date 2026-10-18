@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -3601,12 +3602,30 @@ class TestServerStartupModes(unittest.TestCase):
             self.assertIn("你好", "\n".join(f1.get("lines") or []),
                           "读文件损坏了 UTF-8 中文")
 
-            # 概要：真实计数 + 明确说明没有索引
+            # 概要：真实计数 + 索引状态必须如实（未建就说未建）
             info = get("/api/workspace/info")
             self.assertGreaterEqual(info.get("files"), 2)
             self.assertIs(info.get("indexed"), False,
-                          "必须如实说没有索引，不能编一个已索引状态")
-            self.assertIn("没有代码索引", info.get("index_note", ""))
+                          "没建过索引时必须如实说没有，不能编一个已索引状态")
+            self.assertIn("尚未建立", info.get("index_note", ""))
+            self.assertNotIn("**", info.get("index_note", ""),
+                             "前端用 textContent 渲染这句话，markdown 星号会原样显示")
+
+            # ★ 建完索引之后，同一个端点不能再声称"没有索引" ——
+            #   这里曾经写死 indexed=False + "当前 harness 没有代码索引"，
+            #   而状态栏同时显示真实符号数，同一屏上自相矛盾。
+            ix = get("/api/workspace/index")
+            self.assertGreater(ix.get("files", 0), 0)
+            info2 = get("/api/workspace/info")
+            self.assertIs(info2.get("indexed"), True,
+                          "建过索引后仍报未索引 —— 与状态栏的符号数矛盾")
+            # 「符号名数」与「定义处数」是两个不同的量，都必须出现：
+            # 只报一个会让同一屏上的状态栏与提示块数字打架。
+            self.assertIn(str(ix.get("unique_symbols")), info2.get("index_note", ""),
+                          "缺少符号名数 —— 状态栏报的就是这个名字数")
+            self.assertIn(str(ix.get("symbols")), info2.get("index_note", ""),
+                          "缺少定义处数")
+            self.assertNotIn("没有代码索引", info2.get("index_note", ""))
 
             # 搜索：复用 agent 的 grep
             sr = get("/api/workspace/search", q="deep content")
@@ -4101,6 +4120,45 @@ class TestFrontendWiring(unittest.TestCase):
                       "Esc 处理没有检查模态层级 —— 会越过确认框关掉整页")
         self.assertIn("backs[backs.length - 1] !== back", seg,
                       "判据必须是「自己是最后一个模态」才处理 Esc")
+
+    def test_user_facing_strings_contain_no_markdown_emphasis(self):
+        """用户可见文案里不许出现 markdown 的 `**强调**`。
+
+        界面全部用 `textContent` 渲染（没有 markdown 渲染器），所以
+        `**符号索引 + 词表倒排**` 会**原样显示成星号**。
+        实测就是这样暴露的：资源管理器底部的提示块里出现了裸 `**`。
+
+        判据：把注释（`//`、`/* */`、`<!-- -->`）全部抹掉之后，代码里不许再有 `**`。
+        （注释里写 `**` 是给读代码的人看的，不算。）
+        """
+        def strip_comments(text):
+            out, i, n = [], 0, len(text)
+            while i < n:
+                if text.startswith("/*", i):
+                    j = text.find("*/", i + 2)
+                    j = n if j < 0 else j + 2
+                    out.append("\n" * text.count("\n", i, j))
+                elif text.startswith("<!--", i):
+                    j = text.find("-->", i + 4)
+                    j = n if j < 0 else j + 3
+                    out.append("\n" * text.count("\n", i, j))
+                else:
+                    out.append(text[i]); i += 1
+                    continue
+                i = j
+            code = "".join(out)
+            return "\n".join(re.sub(r"//.*$", "", ln) for ln in code.splitlines())
+
+        offenders = []
+        for parts in (("scripts", "app.js"), ("scripts", "harness-bridge.js"),
+                      ("index.html",)):
+            text = self._read(*parts)
+            for i, line in enumerate(strip_comments(text).splitlines(), 1):
+                if "**" in line:
+                    offenders.append(f"{'/'.join(parts)}:{i}: {line.strip()[:70]}")
+        self.assertEqual(offenders, [],
+                         "用户可见文案里出现了 markdown 强调号（会原样显示成 *）：\n"
+                         + "\n".join(offenders))
 
 
 # ══════════════════════════════════════════════════════════════════

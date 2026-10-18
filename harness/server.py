@@ -690,7 +690,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 **idx.to_json(with_symbols=False),
                 "cache": "memory" if ws in _INDEX_CACHE else "disk",
-                "limit_note": "这是**符号索引 + 词表倒排**，不是语义索引："
+                "limit_note": "这是「符号索引 + 词表倒排」，不是语义索引："
                               "搜「处理完成判定的逻辑」这类意图搜不到。"
                               "也不含跨文件调用关系（谁调用了谁）。",
             })
@@ -898,7 +898,7 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "no capability record",
                     "detail": "这次运行没有能力账本记录"
                               "（会话可能在 capability_ledger 关闭时运行）。"
-                              "这**不等于**「没有越权」，而是「无法判断」。",
+                              "这不等于「没有越权」，而是「无法判断」。",
                 })
             with open(cap_path, "r", encoding="utf-8") as f:
                 return self._json(200, json.load(f))
@@ -922,7 +922,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {
                     "error": "no subagent records",
                     "detail": "这次运行没有派出任何子代理。"
-                              "这**不等于**「子代理都失败了」，而是「没有记录」。",
+                              "这不等于「子代理都失败了」，而是「没有记录」。",
                 })
             out = []
             for name in sorted(os.listdir(root)):
@@ -965,7 +965,7 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "no certificate",
                     "detail": "这次运行没有证书记录：可能尚未收尾、"
                               "或运行时 certificate 被关闭。"
-                              "这**不等于**「任务未完成」。",
+                              "这不等于「任务未完成」。",
                 })
             with open(cert_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
@@ -1412,7 +1412,7 @@ def _run_readonly_command(workspace: str, cmd: str) -> Dict[str, Any]:
         return {"ok": False, "code": "metachar", "workspace": ws,
                 "detail": "命令包含被禁止的 shell 元字符："
                           + " ".join(repr(c) for c in bad)
-                          + "。这个终端是**只读**的，不支持管道、重定向与命令串联。"}
+                          + "。这个终端是只读的，不支持管道、重定向与命令串联。"}
 
     parts = raw.split()
     head = parts[0].lower()
@@ -1689,12 +1689,16 @@ def _workspace_info(workspace: str) -> Dict[str, Any]:
 
     ## 只报**能可靠得到**的量
 
-    刻意**不报**"已索引 / N 个 token"这类需要真正建索引才有的数字 ——
-    当前 harness 没有代码索引（explorer 的搜索走的是 grep 工具，
-    没有向量库）。编一个数字比不报更坏：它会被当成真的。
-
     文件计数用**有限深度**扫描（默认 4 层、上限 20000）：
     拒不设上限会让一个巨大的 node_modules 把端点拖成超时。
+
+    ## 索引状态必须如实报（这里曾是一句过期的话）
+
+    早期这里写死 `indexed: False` + 「当前 harness 没有代码索引」。
+    后来 `harness/index.py` 建好了，这句就成了**与同一屏上的状态栏
+    自相矛盾**的假话（底栏说"没有代码索引"，状态栏说"1336 符号 · 53 文件"）。
+    说"没有"和说"有"一样都是断言，过期了同样要改。现在按实际状态报：
+    内存索引 → 落盘缓存 → 都没有才是"尚未建立"。
     """
     ws = os.path.realpath(workspace)
     if not os.path.isdir(ws):
@@ -1735,6 +1739,42 @@ def _workspace_info(workspace: str) -> Dict[str, Any]:
             git_head = None
 
     top = sorted(by_ext.items(), key=lambda kv: -kv[1])[:8]
+
+    # ── 索引状态：按实际状态报，不再写死「没有」──
+    # 只在**已经建过**的前提下读缓存：info 是页面首屏就会调的端点，
+    # 在这里 build_index 会让"看个文件数"变成一次全量扫描。
+    idx = _INDEX_CACHE.get(ws)
+    if idx is None:
+        cache_path = os.path.join(ws, ".crucible", "index.json")
+        if os.path.isfile(cache_path):
+            idx = load_index(cache_path)
+            if idx is not None:
+                _INDEX_CACHE[ws] = idx            # 读到了就留着，别反复解析
+    if idx is not None:
+        n_files = len(idx.files)
+        n_syms = sum(len(v) for v in idx.symbols.values())   # 定义**处数**
+        n_names = len(idx.symbols)                           # 不同**名字**数
+        indexed = n_files > 0
+        # 带上构建时间：数字与时间都可核对，读者才不用无条件相信这句话。
+        # 索引**会过期**（改文件不重建），所以"有索引"不等于"索引是最新的"——
+        # 过期判定归 /api/workspace/index/query 的 stale 字段，这里不重复下结论。
+        try:
+            built = time.strftime("%m-%d %H:%M", time.localtime(idx.built_at))
+        except (ValueError, OSError):
+            built = ""
+        # 处数与名字数是**两个不同的量**，都写"符号 N 个"会让同屏两个数字打架
+        # （状态栏报的是名字数），所以这里把两者都标清楚。
+        index_note = (f"符号索引：{n_names} 个符号名 · {n_syms} 处定义 · {n_files} 个文件"
+                      + (f"（构建于 {built}）" if built else "")
+                      + "。这是「符号索引 + 词表倒排」，不是语义索引"
+                      "（搜不到「处理完成判定的逻辑」这类意图，也不含调用关系）。")
+        index_built_at = idx.built_at
+    else:
+        indexed = False
+        index_built_at = 0.0
+        index_note = ("尚未建立代码索引；首次搜索或点『重建索引』会自动建立。"
+                      "未建立时搜索走 grep 工具（逐文件匹配，无索引无语义）。")
+
     return {
         "workspace": ws,
         "files": files,
@@ -1743,9 +1783,9 @@ def _workspace_info(workspace: str) -> Dict[str, Any]:
         "by_ext": dict(top),
         "branch": git_head,
         "has_git": os.path.isdir(os.path.join(ws, ".git")),
-        # 明确声明没有索引 —— 前端据此显示"未索引"而不是编一个数字
-        "indexed": False,
-        "index_note": "当前 harness 没有代码索引；搜索走 grep 工具（逐文件匹配）。",
+        "indexed": indexed,
+        "index_built_at": index_built_at,
+        "index_note": index_note,
         "scan": {"max_depth": 4, "max_files": max_files,
                  "skipped_dirs": sorted(_SKIP_DIRS)},
     }

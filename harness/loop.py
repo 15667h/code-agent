@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -135,6 +136,17 @@ class AgentLoop:
         self._iterations = 0
         self._tool_calls = 0
         self._usage: Dict[str, Any] = {}
+        # 是否观察到过**原生** tool_calls。用来决定要不要在状态栏里提醒文本协议：
+        # 端点支持原生调用时完全不提；不支持时每轮提醒（提醒是追加式的，不进前缀）。
+        self._saw_native_tool_calls = False
+        # "只描述意图、不动手"的累计次数。上限 2，避免把它变成另一种死循环
+        # （书 §5：每条恢复路径都要有上限）。
+        self._intent_retries = 0
+        # 当前这批工具调用是否来自文本协议。工具结果要以对应形态回灌，
+        # 否则上游会 400（tool calls / tool results 对不上）。
+        self._current_batch_is_text = False
+        # 上一条模型回复的工具调用是否来自文本协议（供 _execute_tool_calls 读取）
+        self._last_reply_was_text_protocol = False
 
     # ------------------------------------------------------------------
     # 主入口
@@ -195,6 +207,11 @@ class AgentLoop:
             self.corrector.note_success("retry")
             self._accumulate_usage(reply)
 
+            # 端点支持原生 function calling 时就不再提醒文本格式了。
+            # 判据是**观察到的行为**（reply.tool_calls_were_text），不是配置猜测。
+            if reply.tool_calls and not reply.tool_calls_were_text:
+                self._saw_native_tool_calls = True
+
             # ── 记录 assistant 消息（思考文字与凭证分开存 —— 书 §5 中立格式）──
             self.bus.emit(EventType.REASONING, text=reply.reasoning or "")
             if reply.content:
@@ -206,11 +223,56 @@ class AgentLoop:
                 signature=reply.reasoning_signature,
                 origin_model=reply.model,
             )
+            # 标记"这批工具调用是用文本协议表达的"。
+            # 回放时必须按原样还原（见 protocol.render_for）——
+            # 伪装成原生 tool_calls 会让上游报
+            # `tool calls and tool results do not match`。
+            #
+            # 判据用**模型实例的模式**而不是单条回复的标记：
+            # 文本协议端点一旦进入该模式，整条会话都必须是文本形态，
+            # 否则历史里会混着两种形态，上游一样会拒绝。
+            force_text = bool(getattr(self.model, "text_protocol_only", False))
+            if reply.tool_calls_were_text or force_text:
+                am.meta["tool_calls_were_text"] = True
+            self._last_reply_was_text_protocol = bool(
+                reply.tool_calls_were_text or force_text)
             self.session.persist_message(am)
 
             # ── 没有工具调用 → 任务结束 ──
             if not reply.tool_calls:
                 answer = reply.content or ""
+
+                # **意图描述检测**（实测踩到的确切形态）：
+                # 模型有时会写"我先读一下 README 看看结构"然后就此打住 ——
+                # 既没有 tool_calls，也没有 <tool_call> 块。
+                # 若不拦，循环会把它当成"最终回答"并在第一轮"成功完成"，
+                # 事件流看起来毫无破绽。这是书 §1 警告的"看上去正常的失败"。
+                #
+                # 判据刻意保守：只在**尚未调用过任何工具**、且回答里出现
+                # 第一人称的动作承诺时才拦一次。已经干过活的收尾语不该被拦。
+                if self._looks_like_intent_only(answer, reply.reasoning):
+                    self._intent_retries += 1
+                    if self._intent_retries <= 2:
+                        self.bus.emit(EventType.ERROR, error_layer=ERR_CONTROL,
+                                      cls="intent_without_action",
+                                      reason="模型描述了将要执行的动作，但没有实际调用工具。"
+                                             "已把这一点作为反馈回灌，要求它真正调用。")
+                        self._append_tool_result(
+                            "",
+                            "[这不是工具结果，是一条纠正指令] 你上一条回复只是在**描述**"
+                            "将要做什么，但没有实际发起工具调用，因此什么都没有发生。"
+                            "如果你确实需要读取文件或执行操作，请立即发出工具调用；"
+                            "如果任务已经完成，请直接给出最终结论并说明依据。",
+                            "harness")
+                        continue
+                    # 连续多次仍不调用 → 如实报告，不假装完成
+                    return self._finish(
+                        "escalated",
+                        "模型连续多次只描述意图而不调用工具，任务无法推进。"
+                        f"最后一条回复：{answer[:200]}",
+                        escalate=True,
+                    )
+
                 if self.goal.conditions and not self.goal.report()["all_met"]:
                     # 书 §5：「给出了回答」不等于「完成了任务」。
                     # 目标未全部达成时，如实报告未达成，而不是把回答当成功。
@@ -303,6 +365,9 @@ class AgentLoop:
         本实现按顺序执行（安全性优先），因此单点失败只影响该点，
         天然满足这条原则 —— 不会因为一个文件读不到就取消其他调用。
         """
+        # 记录本批调用的来源形态：工具结果要按对应形态回灌（见 _append_tool_result）。
+        self._current_batch_is_text = self._last_reply_was_text_protocol
+
         for i, call in enumerate(calls):
             if i >= self.cfg.max_tool_batches_per_turn:
                 note = (f"[已跳过] 本次回复包含 {len(calls)} 个工具调用，"
@@ -375,6 +440,11 @@ class AgentLoop:
                             ok: bool = True) -> None:
         m = Message.tool_result(call_id, text, name)
         m.meta["ok"] = ok
+        # 文本协议下的工具结果必须以**普通用户消息**回灌（见 protocol.render_for）：
+        # 上游根本没有原生 tool_call_id 可以对上，硬塞 role=tool 会被 400 拒绝。
+        if self._current_batch_is_text:
+            m.meta["text_protocol_result"] = True
+            m.meta["tool_name"] = name
         # tool_call_id 在渲染时按目标厂商重新生成（书 §5），
         # 所以这里保持为空是**刻意**的 —— 中立格式不携带厂商标识。
         self.context.append(m)
@@ -462,10 +532,66 @@ class AgentLoop:
         git = _git_status(ws)
         if git:
             status["git"] = git
+
+        # ── 工具调用格式提醒（仅在需要时注入）──
+        # 背景：有的 OpenAI 兼容端点完全不实现原生 function calling
+        # （实测 deepseek-v4.1-flash：tool_calls 恒为 None，即使 tool_choice=required）。
+        # 静态系统提示词里虽然写了格式，但实测**模型并不照做** ——
+        # 它会在思考里写"我打算读取 README"然后就此打住，任务第一轮就"成功完成"。
+        #
+        # 决定性实验发现：**只要在对话里给出一个具体的格式示例，模型就会照做。**
+        # 所以这里把示例作为**追加式**提醒注入（而不是改静态前缀，那会破坏 KV-cache）。
+        # 只在确实需要时注入：模型已经能输出结构化 tool_calls 时完全不提，
+        # 免得白白占用上下文。
+        if self._needs_text_protocol():
+            status["工具调用格式"] = (
+                "你的接口不支持原生 function calling。"
+                "调用工具必须写成下面这个格式（正文里直接写，不要只描述意图）：\n"
+                '<tool_call>{"name": "工具名", "arguments": {"参数": "值"}}</tool_call>\n'
+                "示例：要读 README.md 就写 "
+                '<tool_call>{"name": "read_file", "arguments": {"path": "README.md"}}</tool_call>'
+            )
+
         self.context.inject_status(status)
         # 状态栏消息也落盘（它是轨迹的一部分，重放时需要）
         if self.context.trajectory():
             self.session.persist_message(self.context.trajectory()[-1])
+
+    def _needs_text_protocol(self) -> bool:
+        """模型是否需要用文本协议表达工具调用。
+
+        判据来自**观察**而不是配置猜测：只要模型此前已经产出过原生 tool_calls，
+        就说明它支持，此后不再提醒；否则持续提醒（每轮都要，
+        因为提醒是在末尾追加、不进前缀，不会破坏缓存）。
+        """
+        return not self._saw_native_tool_calls
+
+    def _looks_like_intent_only(self, answer: str, reasoning: Optional[str]) -> bool:
+        """判断这条回复是不是"只在描述意图、没有真的动手"。
+
+        实测形态：模型写 "Let me start by reading README.md and exploring
+        the workspace." 或 "我先读一下 README" 然后就此结束。
+
+        判据**刻意保守**，宁可漏判也不误判 —— 误判会把正常的收尾回答
+        当成未完成，凭空多跑两轮；漏判只是维持现有的（较差的）行为。
+        所以要求同时满足：
+          1. 本次会话**还没有成功调用过任何工具**（已经干过活的收尾语不该被拦）
+          2. 文本里出现「第一人称 + 动作承诺」的表述
+          3. 文本很短（真的收尾回答通常有实质结论，不会只是一句承诺）
+        """
+        if self._tool_calls > 0:
+            return False
+        text = ((answer or "") + " " + (reasoning or "")).strip()
+        if not text or len(text) > 240:
+            return False
+        patterns = (
+            # 中文
+            r"(我|让我|我先|首先)\s*(先|去|来|将|会|要)?\s*(读|看|查看|检查|列|搜索|搜|找|运行|执行|创建|写|改|修|实现)",
+            r"接下来(我|将|会)",
+            # 英文
+            r"\b(let me|i'?ll|i will|i'?m going to|first,? i)\b.*\b(read|look|check|list|search|find|run|create|write|implement|explore|start)\b",
+        )
+        return any(re.search(p, text, re.IGNORECASE) for p in patterns)
 
     # ------------------------------------------------------------------
     # 用量

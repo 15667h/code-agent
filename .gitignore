@@ -61,3 +61,4 @@ temp/
 # 模型接入配置：**含明文 API Key**，绝不能入库
 **/.crucible/config.json
 **/.crucible/config.json.tmp
+.workbuddy/commit-msg.txt

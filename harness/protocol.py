@@ -209,6 +209,23 @@ class Message:
             text = self.content
             if self.reasoning and not text:
                 text = self.reasoning
+
+            # ── 工具调用要以**原样**回放 ──
+            # 如果这批调用当初是用文本协议表达出来的（端点不支持原生 function calling），
+            # 就必须还原成文本，**不能**伪装成原生 tool_calls ——
+            # 否则上游会看到「有 tool 结果消息、但 assistant 里没有对应的 tool_calls」，
+            # 直接 400：`tool calls and tool results do not match`。
+            # （实测踩到：deepseek-v4.1-flash 就是这么拒绝第二轮的。）
+            text_protocol = self.meta.get("tool_calls_were_text")
+            if self.tool_calls and text_protocol:
+                blocks = "".join(
+                    '<tool_call>%s</tool_call>' % json.dumps(
+                        {"name": c.name, "arguments": c.args}, ensure_ascii=False)
+                    for c in self.tool_calls
+                )
+                out["content"] = (text or "").rstrip() + ("\n" if text else "") + blocks
+                return out
+
             out["content"] = text
             if self.tool_calls:
                 out["tool_calls"] = [
@@ -223,6 +240,11 @@ class Message:
             return out
 
         if self.role == ROLE_TOOL:
+            # 文本协议下，工具结果以**普通用户消息**的形式回灌 ——
+            # 因为上游根本没有原生 tool_call_id 可以对上。
+            if self.meta.get("text_protocol_result"):
+                return {"role": ROLE_USER,
+                        "content": "[工具结果 %s]\n%s" % (self.meta.get("tool_name") or "", self.content)}
             out["tool_call_id"] = self.tool_call_id or call_id_factory()
             out["content"] = self.content
             return out

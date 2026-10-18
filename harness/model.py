@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -274,6 +275,9 @@ class ModelReply:
     raw_error: Optional[str] = None
     error_layer: Optional[str] = None
     retryable: Optional[bool] = None
+    # 这批工具调用是否来自**文本协议**（而非原生 tool_calls）。
+    # loop 据此判断端点是否支持原生调用，从而决定要不要继续提醒格式。
+    tool_calls_were_text: bool = False
 
     def to_message(self) -> Message:
         return Message.assistant(
@@ -283,6 +287,191 @@ class ModelReply:
             signature=self.reasoning_signature,
             origin_model=self.model,
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# 文本工具调用解析（不支持原生 function calling 的端点）
+# ══════════════════════════════════════════════════════════════════
+# 格式：<tool_call>{"name": "read_file", "arguments": {"path": "a.py"}}</tool_call>
+#
+# 为什么用这个格式而不是"自己发明一套"：
+#   ReAct 原始论文用的就是 `Action: <name> / Action Input: <json>`，
+#   而 <tool_call> 标签是社区（Qwen / Hermes 等）已验证的既有约定，
+#   模型在预训练里见过，**不需要额外教学**就能稳定输出。
+#   自创格式则要花大量提示词去教，且换个模型就失效。
+_TEXT_CALL_RE = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    re.DOTALL | re.IGNORECASE,
+)
+# 容错：有的模型会漏掉闭合标签或写成 ```json 围栏
+_TEXT_CALL_LOOSE_RE = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+# ── DeepSeek 系模型的特殊标记 `<｜｜DSML｜｜ invoke name="x">` ──
+# 实测：同一个模型在没走原生 tool_calls 时，会在 **两种格式之间漂移** ——
+# 一会儿输出 <tool_call>{"name":...}，一会儿输出 <｜｜DSML｜｜ invoke>。
+# 更糟的是它会把两种混着写，导致前面那个正则只截到半截 JSON，
+# 解析失败后正文原样回灌，下一轮上下文就更乱。
+# 所以两种格式都要认，并且 **DSML 优先**（它的结构更明确，不易误切）。
+_DSML_INVOKE_RE = re.compile(
+    r"<\s*\uff5c\uff5c\s*DSML\s*\uff5c\uff5c\s*invoke\s+name\s*=\s*\"([^\"]+)\"\s*>(.*?)"
+    r"(?:</\s*\uff5c\uff5c\s*DSML\s*\uff5c\uff5c\s*invoke\s*>|$)",
+    re.DOTALL,
+)
+_DSML_PARAM_RE = re.compile(
+    r"<\s*\uff5c\uff5c\s*DSML\s*\uff5c\uff5c\s*parameter\s+name\s*=\s*\"([^\"]+)\"[^>]*>(.*?)"
+    r"(?:</\s*\uff5c\uff5c\s*DSML\s*\uff5c\uff5c\s*parameter\s*>|$)",
+    re.DOTALL,
+)
+
+
+def extract_text_tool_calls(content: str) -> "tuple[List[ToolCall], str]":
+    """从正文里抽出文本形式的工具调用。
+
+    同时支持两种格式（实测同一模型会在两者之间漂移，甚至混写）：
+
+    1. `DSML`：`<｜｜DSML｜｜invoke name="x"><｜｜DSML｜｜parameter name="k">v</...>`
+    2. 通用：`<tool_call>{"name": "x", "arguments": {...}}</tool_call>`
+
+    **DSML 优先**：它的结构更明确（name 与 parameter 分开），
+    不会像 JSON 正则那样被"混写"截成半截。
+    DSML 先扫并**整块移除**，再对剩余文本扫 `<tool_call>`。
+
+    返回 `(calls, stripped)`。解析失败的块刻意**保留在正文里**，
+    让模型看见自己写坏的原文，下一轮才有机会纠正
+    （书 §5：工具层错误不终止调用，把错误变成模型的输入）。
+    """
+    if not content:
+        return [], content
+
+    calls: List[ToolCall] = []
+    stripped = content
+
+    # ── 1. DSML 格式 ──
+    if "DSML" in stripped:
+        for m in _DSML_INVOKE_RE.finditer(stripped):
+            name = (m.group(1) or "").strip()
+            body = m.group(2) or ""
+            if not name:
+                continue
+            args: Dict[str, Any] = {}
+            for pm in _DSML_PARAM_RE.finditer(body):
+                key = (pm.group(1) or "").strip()
+                raw = (pm.group(2) or "").strip()
+                if not key:
+                    continue
+                try:
+                    args[key] = json.loads(raw)
+                except json.JSONDecodeError:
+                    # 参数值可能不是 JSON（比如裸字符串 / 命令文本）
+                    args[key] = raw
+            # DSML 常把整个参数对象塞进一个名为 arguments 的 parameter，
+            # 形成 {"arguments": {...}} 的多余一层。展平它 ——
+            # 否则 router 看到的参数名会是 arguments，而不是 path / command。
+            if len(args) == 1 and isinstance(args.get("arguments"), dict):
+                args = args["arguments"]
+            calls.append(ToolCall(name, args))
+            stripped = stripped.replace(m.group(0), "")
+
+    # ── 2. 通用 <tool_call>{json} 格式 ──
+    # 关键点：**不能**用 `\{.*?\}` 去做这件事 ——
+    # 模型常把两种格式混写：`<tool_call>{...}` 后面紧跟残缺的
+    # `</｜｜DSML｜｜ parameter>` 而没有 `</tool_call>`，
+    # 非贪婪正则会一路吞到文本结尾，JSON 解析必然失败，
+    # 于是"看起来解析过了"其实什么都没解析出来。
+    # 改成**花括号配平扫描**：从 `{` 起数括号，配平即止。
+    if "<tool_call" in stripped.lower():
+        consumed: List[str] = []
+        low = stripped.lower()
+        pos = 0
+        while True:
+            i = low.find("<tool_call", pos)
+            if i < 0:
+                break
+            gt = stripped.find(">", i)
+            if gt < 0:
+                break
+            brace = stripped.find("{", gt)
+            if brace < 0:
+                break
+            end = _match_brace(stripped, brace)
+            if end < 0:
+                pos = gt + 1
+                continue
+            raw = stripped[brace:end + 1]
+            obj = None
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict):
+                name = obj.get("name") or obj.get("tool") or ""
+                args = obj.get("arguments", obj.get("args", {}))
+                if isinstance(name, str) and name.strip():
+                    if not isinstance(args, dict):
+                        args = {"__malformed__": args}
+                    calls.append(ToolCall(name.strip(), args))
+                    # 闭合标签有就一起吃掉，没有也不影响
+                    tail = stripped.find("</tool_call>", end)
+                    stop = (tail + len("</tool_call>")) if 0 <= tail - end < 40 else end + 1
+                    consumed.append(stripped[i:stop])
+                    pos = stop
+                    continue
+            pos = end + 1
+        for chunk in consumed:
+            stripped = stripped.replace(chunk, "")
+
+    # ── 3. 清掉残标签（两种格式的都要清）──
+    stripped = _DSML_tag_strip(stripped)
+    stripped = re.sub(r"</?tool_call>", "", stripped, flags=re.IGNORECASE)
+    return calls, stripped.strip()
+
+
+def _match_brace(text: str, start: int) -> int:
+    """从 `text[start] == '{'` 起做花括号配平，返回匹配的 `}` 下标；失败 -1。
+
+    必须跳过字符串内部的花括号（含转义），否则
+    `{"cmd": "echo }"}` 会在字符串里的 `}` 处被截断。
+    """
+    if start >= len(text) or text[start] != "{":
+        return -1
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _DSML_tag_strip(text: str) -> str:
+    """清掉 DSML 的标记（calls / invoke / parameter 的开闭标签）。
+
+    这些是**标记**不是内容：留着会污染下一轮上下文，
+    让模型误以为上一轮"已经调用过了"。
+
+    注意 `｜｜DSML｜｜` 与标签名之间**可能有空格**（实测
+    `</｜｜DSML｜｜ parameter>` 就有），所以用 `\\s*` 而不是直接相邻。
+    """
+    return re.sub(
+        r"</?\s*\uff5c\uff5c\s*DSML\s*\uff5c\uff5c\s*(calls|invoke|parameter)[^>]*>",
+        "", text).strip()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -382,10 +571,25 @@ class HttpModel(BaseModel):
 
     def __init__(self, endpoint: EndpointConfig,
                  model: Optional[str] = None,
-                 timeout_s: float = 120.0) -> None:
+                 timeout_s: float = 120.0,
+                 text_protocol_only: bool = True) -> None:
         self.endpoint = endpoint
         self.model_name = (model or endpoint.model or "").strip()
         self.timeout_s = timeout_s
+        # 是否用文本协议表达工具调用（**默认是**）。
+        #
+        # 为什么默认走文本协议而不是"先试原生、失败再降级"：
+        # 端点一旦在某轮返回过文本块，历史里就留下了「assistant 文本块 + 用户消息形态的结果」，
+        # 而如果请求里同时还声明着 `tools`，上游会判定
+        #   `tool calls and tool results do not match` 并 400。
+        # 实测（deepseek-v4.1-flash）**第一轮看起来完全正常、第二轮才炸**，
+        # 这种"延迟失败"最难排查。
+        #
+        # 所以这里选**一开始就自洽**：不声明 tools，全程文本协议。
+        # 代价是丧失原生 function calling 的强约束，但换来的是行为确定性 ——
+        # 对一个"要能接任意中转"的系统，确定性比理论上的最优更重要。
+        # 需要原生调用的端点可显式传 text_protocol_only=False。
+        self.text_protocol_only = text_protocol_only
 
     @property
     def name(self) -> str:
@@ -406,7 +610,14 @@ class HttpModel(BaseModel):
             "messages": request.get("messages", []),
             "temperature": request.get("temperature", 0.2),
         }
-        if request.get("tools"):
+
+        # ── 是否声明 tools ──
+        # 文本协议模式下**不能**声明 tools：上游会认为"你既然声明了工具，
+        # 那工具调用就该走原生 tool_calls"，于是拿不到对应的 tool_calls 时报
+        #   `tool calls and tool results do not match`
+        # 并直接 400（实测 deepseek-v4.1-flash 就是这个行为）。
+        # 所以一旦判定该端点不支持原生调用，就不再传 tools，让模型专心用文本协议。
+        if request.get("tools") and not self.text_protocol_only:
             payload["tools"] = request["tools"]
             payload["tool_choice"] = "auto"
         if request.get("max_tokens"):
@@ -519,6 +730,7 @@ class HttpModel(BaseModel):
         finish = choices[0].get("finish_reason", "")
 
         calls: List[ToolCall] = []
+        used_text_protocol = False
         for tc in msg.get("tool_calls") or []:
             fn = tc.get("function") or {}
             args_raw = fn.get("arguments") or "{}"
@@ -532,14 +744,51 @@ class HttpModel(BaseModel):
                 args = args_raw
             calls.append(ToolCall(fn.get("name", ""), args))
 
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+
+        # ── 文本工具调用降级路径（关键兼容层）──
+        # 有些 OpenAI 兼容端点**不实现原生 function calling**：即使请求里带了
+        # tools、即使 tool_choice="required"，返回的 message 里也没有 tool_calls。
+        #
+        # 实测 deepseek-v4.1-flash 的行为更特别：工具意图被写进 reasoning_content，
+        # 而 **content 是 None**。所以只扫正文是不够的 —— 必须**正文与思考都扫**。
+        #
+        # 若不处理，后果是**极隐蔽的失败**：循环看到"没有 tool_calls"就判定为
+        # 最终回答，任务在第一轮就"成功完成"了，事件流看起来毫无破绽。
+        # 正是书 §1 警告的那种"看上去正常的失败"。
+        #
+        # 剥掉块是必须的：留着它会被当作用户可见的回答回灌进轨迹，污染下一轮上下文。
+        if not calls:
+            for source in ("content", "reasoning"):
+                probe = content if source == "content" else reasoning
+                if not probe:
+                    continue
+                found, stripped = extract_text_tool_calls(probe)
+                if found:
+                    calls = found
+                    used_text_protocol = True
+                    # 自适应切换：观察到文本协议说明该端点不走原生 function calling，
+                    # 此后不再声明 tools（否则上游会 400）。
+                    self.text_protocol_only = True
+                    if source == "content":
+                        content = stripped
+                    else:
+                        reasoning = stripped
+                    # finish_reason 也要修正：端点报 "stop"，但对我们的语义是
+                    # tool_calls。不改的话轨迹里会留下自相矛盾的记录。
+                    finish = "tool_calls"
+                    break
+
         return ModelReply(
-            content=msg.get("content") or "",
-            reasoning=msg.get("reasoning_content") or msg.get("reasoning"),
+            content=content,
+            reasoning=reasoning,
             reasoning_signature=msg.get("reasoning_signature"),
             tool_calls=calls,
             model=body.get("model") or self.model_name,
             usage=body.get("usage") or {},
             finish_reason=finish,
+            tool_calls_were_text=used_text_protocol,
         )
 
     # ---------- 连通性自检 ----------

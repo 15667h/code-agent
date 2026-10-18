@@ -26,7 +26,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 # 既支持 `python -m harness.server`，也支持 `python harness/server.py`。
 # 后者没有父包，相对导入会失败，所以这里补上包路径再统一用绝对导入。
@@ -352,12 +352,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "runs": len(RUNS),
                                     "pid": os.getpid()})
         if path == "/api/runs":
-            ws = (q.get("workspace") or [os.getcwd()])[0]
+            ws = (q.get("workspace") or [default_workspace()])[0]
             return self._json(200, {"runs": list_runs(ws)})
         if path == "/api/tools":
             return self._json(200, _tool_manifest())
         if path == "/api/config":
-            ws = (q.get("workspace") or [os.getcwd()])[0]
+            ws = (q.get("workspace") or [default_workspace()])[0]
             ep = load_config(ws)
             return self._json(200, {
                 "endpoint": ep.to_public(),
@@ -390,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
 
         if path == "/api/run":
-            ws = body.get("workspace") or os.getcwd()
+            ws = body.get("workspace") or default_workspace()
             prompt = (body.get("prompt") or "").strip()
             if not prompt:
                 return self._json(400, {"error": "prompt 不能为空"})
@@ -426,7 +426,7 @@ class Handler(BaseHTTPRequestHandler):
         # 只有三个字段。GET 返回掩码后的形态（**绝不回传明文 key**），
         # POST 保存，/test 用当前配置做一次真实连通性自检。
         if path == "/api/config":
-            ws = body.get("workspace") or os.getcwd()
+            ws = body.get("workspace") or default_workspace()
             incoming = body.get("endpoint") or {}
             current = load_config(ws)
             # api_key 语义：传了新值就替换；传空字符串显式清除；
@@ -442,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "path": p, "endpoint": merged.to_public()})
 
         if path == "/api/config/test":
-            ws = body.get("workspace") or os.getcwd()
+            ws = body.get("workspace") or default_workspace()
             # 优先用请求里带的（用户可能还没保存就想先试），否则用落盘的
             ep = resolve_endpoint(ws, body.get("endpoint"))
             model = HttpModel(ep)
@@ -451,7 +451,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200 if report.get("ok") else 200, report)
 
         if path == "/api/config/clear":
-            ws = body.get("workspace") or os.getcwd()
+            ws = body.get("workspace") or default_workspace()
             removed = clear_config(ws)
             return self._json(200, {"ok": True, "removed": removed,
                                     "endpoint": EndpointConfig().to_public()})
@@ -523,7 +523,7 @@ class Handler(BaseHTTPRequestHandler):
 def _tool_manifest() -> Dict[str, Any]:
     """给前端一份工具清单（按注册顺序），前端可据此渲染工具面板。"""
     try:
-        ws = os.getcwd()
+        ws = default_workspace()
         reg, _ = build_default_registry(ws)
         return {"order": reg.names(), "categories": reg.categories(),
                 "specs": reg.specs()}
@@ -534,15 +534,34 @@ def _tool_manifest() -> Dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 # 启动
 # ══════════════════════════════════════════════════════════════════
-def serve(host: str = "127.0.0.1", port: int = 8787) -> None:
+def default_workspace() -> str:
+    """API 未显式指定 workspace 时用哪个。
+
+    优先级：启动参数写入的环境变量 > 当前进程目录。
+    刻意不做"猜一个最近的 git 仓库"之类的事 —— 工作区必须**显式**，
+    否则 agent 可能在错误的目录里动手。
+    """
+    return os.path.realpath(os.environ.get("CRUCIBLE_DEFAULT_WORKSPACE") or os.getcwd())
+
+
+def serve(host: str = "127.0.0.1", port: int = 8787,
+          workspace: Optional[str] = None) -> None:
+    """起服务。
+
+    `workspace` 指定默认工作区（API 未显式传时会用它）。
+    这样启动时 `--workspace /path/to/proj` 就能把整个工作台绑到那个目录，
+    前端也能通过 `?workspace=` 覆盖 —— 两者一致，避免"服务在 A、前端在 B"。
+    """
+    if workspace:
+        os.environ["CRUCIBLE_DEFAULT_WORKSPACE"] = os.path.realpath(workspace)
     httpd = ThreadingHTTPServer((host, port), Handler)
+    ws = default_workspace()
     # flush=True：后台/管道运行时 stdout 默认块缓冲，不刷新就看不到启动信息
     print(f"Crucible harness 已启动：http://{host}:{port}/", flush=True)
-    print(f"  工作台前端：http://{host}:{port}/index.html", flush=True)
+    print(f"  工作台：    http://{host}:{port}/index.html"
+          f"?workspace={quote(ws)}", flush=True)
+    print(f"  默认工作区：{ws}", flush=True)
     print(f"  工具清单：  http://{host}:{port}/api/tools", flush=True)
-    print(f"  离线演示：  POST /api/run  "
-          f'{{"prompt":"...", "offline_script":["search:TODO","shell:git status"]}}',
-          flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -556,5 +575,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Crucible harness HTTP 服务")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--workspace", default=None,
+                    help="默认工作区（绝对路径）。API 未显式传 workspace 时使用。")
     args = ap.parse_args()
-    serve(args.host, args.port)
+    serve(args.host, args.port, args.workspace)

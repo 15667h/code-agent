@@ -299,7 +299,8 @@
     return post("/api/run", {
       prompt: prompt,
       workspace: opts.workspace,
-      provider: opts.provider || "stub",
+      // 不再有 `provider` 字段：模型接入已收敛为三字段端点，
+      // 未配置时服务端自动走离线脚本。这里只保留一个显式的离线脚本入口。
       sandbox: opts.sandbox || "workspace-write",
       approval: opts.approval || "on-request",
       offline_script: opts.offline_script,

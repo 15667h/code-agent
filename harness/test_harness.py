@@ -1788,6 +1788,137 @@ class TestModelEndpoint(unittest.TestCase):
         self.assertEqual(reply.tool_calls[0].args.get("__malformed__"), "{not json")
 
 
+class TestTextToolCallFallback(unittest.TestCase):
+    """**不支持原生 function calling 的端点**要用文本协议。
+
+    这组测试来自实测：`deepseek-v4.1-flash` 端点即使 `tool_choice="required"`
+    也**不返回 tool_calls**，工具意图被塞进 reasoning_content、content 为空。
+    若不处理，循环看到「没有 tool_calls」就判定为最终回答，
+    任务在第一轮就"成功完成"——事件流看起来毫无破绽。
+    正是书 §1 警告的那种"看上去正常的失败"。
+    """
+
+    def test_extract_single_call(self):
+        from harness.model import extract_text_tool_calls
+        calls, stripped = extract_text_tool_calls(
+            '<tool_call>{"name": "read_file", "arguments": {"path": "a.py"}}</tool_call>')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(calls[0].args, {"path": "a.py"})
+        self.assertEqual(stripped, "", "剥掉块后正文应为空")
+
+    def test_extract_multiple_calls_in_order(self):
+        from harness.model import extract_text_tool_calls
+        text = ('先读再搜。\n'
+                '<tool_call>{"name": "read_file", "arguments": {"path": "a.py"}}</tool_call>\n'
+                '<tool_call>{"name": "grep", "arguments": {"pattern": "foo"}}</tool_call>')
+        calls, stripped = extract_text_tool_calls(text)
+        self.assertEqual([c.name for c in calls], ["read_file", "grep"])
+        self.assertIn("先读再搜。", stripped)
+        self.assertNotIn("<tool_call>", stripped)
+
+    def test_prose_without_blocks_is_not_a_call(self):
+        """**描述意图 ≠ 调用工具**。
+
+        这是实测踩到的确切形态：模型回了
+        "I'll start by reading the README" —— 纯文本，没有 tool_calls。
+        必须判为"没有工具调用"，而不是去猜它想调用什么。
+        """
+        from harness.model import extract_text_tool_calls
+        calls, stripped = extract_text_tool_calls("I'll start by reading the README.")
+        self.assertEqual(calls, [], "纯描述不应被当成工具调用")
+        self.assertEqual(stripped, "I'll start by reading the README.")
+
+    def test_malformed_block_stays_in_text_for_model_to_fix(self):
+        """坏块**不清除** —— 让模型看见自己的原文，下一轮才有机会纠正。"""
+        from harness.model import extract_text_tool_calls
+        text = '<tool_call>{"name": "read_file", "arguments": {not json}}</tool_call>'
+        calls, stripped = extract_text_tool_calls(text)
+        self.assertEqual(calls, [])
+        self.assertIn("not json", stripped, "坏块应保留在正文里")
+
+    def test_alternate_key_names_accepted(self):
+        """有的模型会写 `tool` / `args` 而不是 `name` / `arguments`。"""
+        from harness.model import extract_text_tool_calls
+        calls, _ = extract_text_tool_calls('<tool_call>{"tool": "list_dir", "args": {"path": "."}}</tool_call>')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "list_dir")
+
+    def test_loose_block_without_closing_tag(self):
+        """模型偶尔漏掉闭合标签；不因此丢掉整条调用。"""
+        from harness.model import extract_text_tool_calls
+        calls, _ = extract_text_tool_calls('<tool_call>{"name": "list_dir", "arguments": {"path": "."}}')
+        self.assertEqual(len(calls), 1)
+
+    def test_parse_uses_text_fallback_and_fixes_finish_reason(self):
+        """`_parse` 要能走通降级路径，并把 finish_reason 修正为 tool_calls。
+
+        不修正的话轨迹里会留下自相矛盾的记录（说 stop 却带着工具调用）。
+        """
+        from harness.model import EndpointConfig, HttpModel
+        m = HttpModel(EndpointConfig(base_url="https://x.com/v1", api_key="k", model="m"))
+        reply = m._parse({"choices": [{
+            "message": {"content": '<tool_call>{"name": "list_dir", "arguments": {"path": "."}}</tool_call>'},
+            "finish_reason": "stop",
+        }]})
+        self.assertEqual(len(reply.tool_calls), 1)
+        self.assertEqual(reply.tool_calls[0].name, "list_dir")
+        self.assertEqual(reply.finish_reason, "tool_calls")
+        self.assertEqual(reply.content, "", "块应从正文里剥掉，避免污染下一轮上下文")
+
+    def test_native_tool_calls_take_priority(self):
+        """接口支持原生 function calling 时，**不应**再走文本解析。"""
+        from harness.model import EndpointConfig, HttpModel
+        m = HttpModel(EndpointConfig(base_url="https://x.com/v1", api_key="k", model="m"))
+        reply = m._parse({"choices": [{
+            "message": {
+                "content": '<tool_call>{"name": "should_be_ignored", "arguments": {}}</tool_call>',
+                "tool_calls": [{"function": {"name": "native_call", "arguments": "{}"}}],
+            },
+            "finish_reason": "tool_calls",
+        }]})
+        self.assertEqual(len(reply.tool_calls), 1)
+        self.assertEqual(reply.tool_calls[0].name, "native_call")
+
+
+    def test_text_protocol_calls_replay_as_text_not_native(self):
+        """**文本协议的调用必须原样回放成文本，不能伪装成原生 tool_calls。**
+
+        这是实测踩到的硬 bug：第一轮文本调用被当成原生 tool_calls 存进轨迹，
+        第二轮请求时上游看到「有 role=tool 的结果消息，但 assistant 里
+        没有对应的 tool_calls」，直接 400：
+            `tool calls and tool results do not match`
+        于是整个任务在第二轮就死了，而第一轮看起来完全正常。
+        """
+        from harness.protocol import Message, ROLE_ASSISTANT, ROLE_TOOL, ToolCall
+        # 文本协议来的调用
+        m = Message.assistant(content="", tool_calls=[ToolCall("read_file", {"path": "a.py"})])
+        m.meta["tool_calls_were_text"] = True
+        rendered = m.render_for("openai")
+        self.assertNotIn("tool_calls", rendered,
+                         "文本协议的调用不能渲染成原生 tool_calls")
+        self.assertIn("<tool_call>", rendered["content"],
+                      "必须还原成文本块，否则上游会 400")
+
+        # 对应的结果也必须以普通用户消息回灌
+        r = Message.tool_result("", "# a.py", "read_file")
+        r.meta["text_protocol_result"] = True
+        r.meta["tool_name"] = "read_file"
+        rr = r.render_for("openai")
+        self.assertEqual(rr["role"], "user", "不能回灌成 role=tool")
+        self.assertNotIn("tool_call_id", rr, "文本协议下没有 id 可以对上")
+        self.assertIn("read_file", rr["content"])
+
+    def test_native_calls_still_replay_natively(self):
+        """原生调用**不受影响** —— 仍按标准 OpenAI 形状回放。"""
+        from harness.protocol import Message, ToolCall
+        m = Message.assistant(content="", tool_calls=[ToolCall("read_file", {"path": "a.py"})])
+        rendered = m.render_for("openai")
+        self.assertIn("tool_calls", rendered)
+        self.assertEqual(rendered["tool_calls"][0]["function"]["name"], "read_file")
+        self.assertNotIn("<tool_call>", rendered.get("content") or "")
+
+
 class TempWorkdirOnce:
     _p = None
 

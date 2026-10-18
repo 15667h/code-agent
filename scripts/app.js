@@ -54,6 +54,26 @@
     apply_patch: ICONS.edit,
   };
 
+  /* ---------- URL 参数 ----------
+     支持 `?workspace=<绝对路径>` 指定工作区 —— 这让同一个工作台可以直接
+     指向任意目录，而不用改任何代码。也支持 `?prompt=<文本>` 与 `?autorun=1`
+     用于演示：打开页面即自动发起一次运行，便于"亲眼看到"整条链路。
+     刻意从 URL 读而不是从 localStorage 读：URL 是**显式**的，
+     适合"我这次要在这个目录上干活"这种一次性意图。 */
+  var urlParams = (function () {
+    var out = {};
+    try {
+      (window.location.search || "").replace(/^\?/, "").split("&").forEach(function (kv) {
+        if (!kv) return;
+        var i = kv.indexOf("=");
+        var k = decodeURIComponent(i < 0 ? kv : kv.slice(0, i));
+        var v = i < 0 ? "" : decodeURIComponent(kv.slice(i + 1).replace(/\+/g, " "));
+        if (k) out[k] = v;
+      });
+    } catch (e) { /* 参数坏了不该让页面崩 */ }
+    return out;
+  })();
+
   /* ---------- 持久化：只存真正影响下次打开的东西 ---------- */
   var STORE_KEY = "crucible.ui.v1";
   var persisted = (function () {
@@ -89,6 +109,7 @@
     focusIdx: 0,             // 文件树的键盘游标
     renaming: null,          // 正在内联重命名的路径
     endpoint: null,          // 当前模型接入配置（公开形态，不含明文 key）
+    workspace: urlParams.workspace || state.workspace || null,  // URL 优先
   };
 
   var dirtyFile = { "src/transport/reconnect.ts": true };
@@ -1711,9 +1732,8 @@
     window.Harness.run(text, {
       sandbox: $("[data-sandbox]") ? $("[data-sandbox]").textContent : "workspace-write",
       approval: $("[data-approval]") ? $("[data-approval]").textContent : "on-request",
-      workspace: persisted.workspace,
-      offline_script: persisted.offlineScript,
-      provider: persisted.provider || "stub",
+      workspace: state.workspace,          // null 时由服务端默认工作区决定
+      offline_script: urlParams.offline || persisted.offlineScript,
     }).then(function (info) {
       pending.remove();
       UI.toast({
@@ -2018,7 +2038,7 @@
                 confirmLabel: "清除", tone: "danger",
               }).then(function (ok) {
                 if (!ok) return;
-                window.Harness.clearConfig(persisted.workspace).then(function (r2) {
+                window.Harness.clearConfig(state.workspace).then(function (r2) {
                   applyEndpoint(r2 && r2.endpoint);
                   UI.toast({ tone: "info", title: "已清除模型配置",
                              desc: r2 && r2.removed ? "配置已删除。" : "本来就没有配置文件。",
@@ -2643,7 +2663,7 @@
       return;
     }
 
-    var ws = persisted.workspace;
+    var ws = state.workspace;
     var dlg = null, api = null;
     var current = { base_url: "", model: "", has_key: false, api_key_masked: "" };
 
@@ -2826,7 +2846,7 @@
   /* 启动时把已保存的配置反映到界面 */
   function loadEndpoint() {
     if (!window.Harness || !window.Harness.isLive()) return Promise.resolve(null);
-    return window.Harness.getConfig(persisted.workspace).then(function (r) {
+    return window.Harness.getConfig(state.workspace).then(function (r) {
       applyEndpoint(r && r.endpoint);
       return r && r.endpoint;
     }).catch(function () { return null; });
@@ -2960,6 +2980,18 @@
             if (h) {
               h.textContent = "";
               h.appendChild(el("span", null, "已连接 harness · 点左下角设置接入模型"));
+            }
+            return;
+          }
+          // 演示用：`?autorun=1&prompt=...` 打开即自动发起一次真实运行。
+          // 这是给"演示/验收"用的显式入口 —— 默认绝不自动跑，
+          // 否则每次打开页面都会产生一次真实副作用。
+          if (urlParams.autorun === "1" && urlParams.prompt) {
+            var ta = $("#dock-input");
+            if (ta) {
+              ta.value = urlParams.prompt;
+              ta.dispatchEvent(new Event("input", { bubbles: true }));
+              $("#btn-dock-send").click();
             }
           }
         });

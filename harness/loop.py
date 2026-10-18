@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from .capability import CapabilityLedger, LedgerBook, derive_ceiling
 from .context import ContextBuilder, StaticPrefix
 from .correct import Corrector, Fault, FaultClass, LoopDetector, Watchdog, classify
 from .model import BaseModel, ModelReply
@@ -90,6 +91,13 @@ class LoopConfig:
     # 默认关闭以保持最纯粹的前缀稳定性，需要时显式打开 ——
     # 打开时它**追加到末尾**，不破坏前缀。
     inject_status: bool = True
+
+    # ── 能力账本（G-5，CapScope）──
+    # 从任务文本推导上限，对照观察每次调用，把越界记成结构化信号。
+    # **只观察、不判定** —— 拒绝仍由 policy 负责。理由见 capability.py 开头的说明。
+    # 默认开：它不改变任何执行结果，但一次都不开的话，
+    # "注入尝试执行了多少次"这个问题在事后永远无法回答（缺历史）。
+    capability_ledger: bool = True
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -158,6 +166,13 @@ class AgentLoop:
         self.watchdog = Watchdog(self.cfg.idle_timeout_s)
         self.goal = GoalVerifier(goal_conditions or [])
 
+        # 能力账本（G-5，CapScope）：上限在 `run()` 的第一行从**用户任务文本**
+        # 推导，这里先建登记处。刻意不在构造时推导 —— 因为上限必须在
+        # **读到任何仓库内容之前**确定（CapScope 第 1 点），
+        # 而构造函数运行在 append_user 之后、读工具之前，时点不对。
+        self.ledgers = LedgerBook(session.meta.workspace)
+        self.ledger: Optional[CapabilityLedger] = None
+
         self._consecutive_failures = 0
         self._iterations = 0
         self._tool_calls = 0
@@ -219,6 +234,23 @@ class AgentLoop:
         # 这是**用户输入**，不是模型输出 —— 可信度与系统提示同级。
         self._user_prompt = user_message
         self.facts = TraceFacts()
+
+        # ── 能力上限：必须在**读到任何仓库内容之前**确定 ──
+        # CapScope 第一步就是这个顺序要求。理由是因果而非性能：
+        # 上限一旦晚推导，就有可能被已经读进来的不可信内容影响 ——
+        # 而仓库内容正是间接注入的载体（"能命名一个资源，就足以对它动手"）。
+        # 所以这一行放在 append_user 之后、第一次工具调用之前的唯一窗口里。
+        if self.cfg.capability_ledger:
+            ceiling = derive_ceiling(self._user_prompt, self.policy.sandbox,
+                                     grantee="main")
+            self.ledger = self.ledgers.open(ceiling)
+            self.router.ledger = self.ledger
+            self.bus.emit(EventType.CHECK, scope="capability", ok=True,
+                          reason="已从任务文本推导本次会话的能力上限。",
+                          ceiling=ceiling.to_json())
+        else:
+            self.ledger = None
+            self.router.ledger = None
 
         while True:
             # ── 全局终止条件（书 §5）──
@@ -874,6 +906,19 @@ class AgentLoop:
         if goal_report:
             data["goal"] = goal_report
             self.bus.emit(EventType.CHECK, scope="goal", **goal_report)
+        # 能力账本随结束事件一起给出。为什么放在这里而不是让人去查：
+        # "这次会话里，有没有出现过任务之外的能力"是审计第一眼要看的东西，
+        # 藏在需要额外调用的地方就等于没有。
+        # 落盘成独立文件也是为了**不依赖进程还活着**（与哈希链同理）。
+        if self.ledger is not None:
+            cap_report = self.ledger.report()
+            data["capability"] = cap_report["summary"]
+            try:
+                self.session.write_capability(cap_report)
+            except Exception as e:
+                # 落盘失败不终止循环（书 §5：错误路径上禁用副作用逻辑），
+                # 但要计数 —— 它是一次真实的数据丢失风险。
+                self.session.note_persist_failure(f"capability: {e}")
         if escalate:
             # 书 §5：暴露给用户时**必须附上已经尝试过的恢复动作**
             data["attempted_recoveries"] = self.corrector.attempted_actions()

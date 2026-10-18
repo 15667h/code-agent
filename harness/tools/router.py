@@ -92,6 +92,11 @@ class ToolRouter:
         # 事件序号提供者：用于把变更挂到具体 seq 上（支持"回滚到第 N 步"）
         self.seq_provider: Optional[Callable[[], int]] = None
 
+        # 能力账本（G-5，CapScope）。由 loop 在 run() 开头注入 ——
+        # 上限必须从**任务文本**推导，而任务文本只有 loop 知道。
+        # **只观察，不参与判定**：它不改变 res，只看。
+        self.ledger = None          # 类型为 capability.CapabilityLedger 或 None
+
     # ------------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------------
@@ -125,6 +130,18 @@ class ToolRouter:
             action.summary = call.name + " " + json.dumps(call.args, ensure_ascii=False)[:120]
 
         # ── 3. 策略判定 ──
+        # 能力观察放在判定**之前**。理由：被 policy 拒绝的动作
+        # 恰恰是越权的最硬证据 —— 等拒绝之后再看，就看不到它们了。
+        # `observe()` 只看不判，返回值不参与下面的流程控制。
+        if self.ledger is not None:
+            for ev in self.ledger.observe(action, call.name, seq=self._next_seq()):
+                self.bus.emit(EventType.CHECK, scope="capability",
+                              ok=False, out_of_scope=True,
+                              code=ev.code, capability=ev.capability,
+                              severity=ev.severity, agent_id=ev.agent_id,
+                              reason=ev.detail, evidence=ev.evidence,
+                              tool=ev.tool)
+
         verdict = self.policy.decide(action)
         self.bus.emit(EventType.TOOL_REQUESTED,
                       call_id=call_id, tool=call.name, args=call.args,
@@ -137,6 +154,11 @@ class ToolRouter:
             res = tool_error(call.name, "refused",
                              f"操作被策略拒绝：{verdict.reason}",
                              escalated_by=verdict.escalated_by)
+            # 拒绝单独留一笔能力记录。它已被沙箱处理、不需再拦，
+            # 但"拒绝次数突然变多"本身就是注入尝试的线索 —— 必须可观察。
+            if self.ledger is not None:
+                self.ledger.note_refused(action, call.name, verdict.reason,
+                                         seq=self._next_seq())
             self.bus.emit(EventType.TOOL_OUTPUT, call_id=call_id, tool=call.name,
                           ok=False, text=res.text, error_layer=ERR_TOOL)
             return res

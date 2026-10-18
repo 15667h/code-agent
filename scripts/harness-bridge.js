@@ -212,6 +212,42 @@
             }),
           };
         }
+        // ── 能力账本（CapScope）──
+        // 这里有一条**非常重要的语义**：越界记录不是失败。
+        // policy 已经决定了动作执不执行；账本只回答"任务之外出现了一个新能力"。
+        // 用红色 ✗ 渲染会让人以为动作被拦下了；用绿色 ✓ 又会让人以为没事。
+        // 所以用琥珀警示色 + "不阻断"措辞 —— 它是个信号，不是判决。
+        if (d.scope === "capability") {
+          if (d.out_of_scope) {
+            return {
+              kind: "check", state: "done", tsOffset: tsOffset,
+              title: "能力越界信号（未阻断）",
+              model: "capability ledger",
+              items: [
+                { ok: false, warn: true,
+                  text: d.reason + "［" + (d.code || "") + " · " + (d.severity || "") + "］" },
+              ].concat((d.evidence || []).map(function (t) {
+                return { ok: true, text: t };
+              })),
+            };
+          }
+          // 上限推导事件：把"这次会话被授予了什么"摆出来。
+          // 不做成一条"检查通过"，因为上限本身不是检查结果 —— 它是**前提**。
+          var ceil = d.ceiling || {};
+          return {
+            kind: "check", state: "done", tsOffset: tsOffset,
+            title: "已确定本次会话的能力上限",
+            model: "capability ledger",
+            items: [
+              { ok: true, text: "可写工作区：" + (ceil.allows_write_workspace ? "是" : "否") },
+              { ok: true, text: "可写工作区之外：" + (ceil.allows_write_outside ? "是" : "否") },
+              { ok: true, text: "可使用网络：" + (ceil.allows_network ? "是" : "否") },
+              { ok: true, text: "任务要求只读：" + (ceil.readonly_task ? "是" : "否") },
+            ].concat((ceil.basis || []).map(function (t) {
+              return { ok: true, text: "依据：" + t };
+            })),
+          };
+        }
         // 完成前检查的通过事件（只有提醒、无硬缺口）
         if (d.scope === "preflight" && d.ok) {
           return {

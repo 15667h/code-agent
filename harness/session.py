@@ -152,6 +152,33 @@ class Session:
         with open(self._meta_path, "w", encoding="utf-8") as f:
             json.dump(self.meta.to_json(), f, ensure_ascii=False, indent=2)
 
+    def write_capability(self, report: Dict[str, Any]) -> None:
+        """把能力账本落盘。
+
+        为什么单独落一个文件而不是只留在事件流里：事件流是**流水**，
+        要把 500 条事件里的越界记录捞出来需要重放全部事件；
+        而这份账本是**结论**，审计要的是"这次会话有没有越界"这一眼。
+
+        同时它也满足与哈希链同一条纪律：**不依赖产生它的进程还活着**。
+        """
+        path = os.path.join(self.run_dir, "capability.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+    def note_persist_failure(self, detail: str = "") -> None:
+        """记录一次落盘失败。失败不该终止循环，但必须可被上层检查。
+
+        刻意**不往事件流里补一条事件**：落盘失败的时段里，事件流本身
+        就可能是残缺的，用残缺的通道去记录"通道坏了"不自洽；
+        而且它会与写事件共用同一条可能已失败的路径。
+        记在内存 + 随 summary 暴露，是更可靠的位置。
+        """
+        self._persist_failures = getattr(self, "_persist_failures", 0) + 1
+        if detail:
+            fails = getattr(self, "_persist_failure_notes", [])
+            fails.append(detail)
+            self._persist_failure_notes = fails[-20:]
+
     # ---------- 读取（重放） ----------
     def read_events(self) -> List[Dict[str, Any]]:
         return _read_jsonl(self._events_path)
@@ -165,6 +192,16 @@ class Session:
         kinds: Dict[str, int] = {}
         for e in evs:
             kinds[e["type"]] = kinds.get(e["type"], 0) + 1
+        # 能力账本：优先读落盘结论（进程已重启时仍可用），
+        # 落盘不存在（如能力账本被关掉）则不报假值，直接给 None。
+        cap = None
+        cap_path = os.path.join(self.run_dir, "capability.json")
+        if os.path.isfile(cap_path):
+            try:
+                with open(cap_path, "r", encoding="utf-8") as f:
+                    cap = json.load(f).get("summary")
+            except (OSError, json.JSONDecodeError):
+                cap = None
         return {
             "session_id": self.meta.session_id,
             "run_dir": self.run_dir,
@@ -179,6 +216,7 @@ class Session:
             "chain_errors": self.chain.errors,
             # 变更集状态随摘要暴露：审计信息不该藏在需要额外调用的地方
             "changeset": self.changesets.summary(),
+            "capability": cap,
         }
 
 

@@ -499,6 +499,33 @@ class Handler(BaseHTTPRequestHandler):
                 "history": [c.to_json() for c in cs.history()],
             })
 
+        # ── 能力账本（G-5，CapScope）──
+        # 为什么需要这个端点：能力账本的用途是**审计**——
+        # "这次会话里有没有出现过任务之外的能力"。
+        # 只留在内存里的话，进程一重启就无从查证。
+        # 所以先读内存态（最新），读不到再读落盘（进程已重启）。
+        if path.startswith("/api/run/") and path.endswith("/capability"):
+            rid = path.split("/")[3]
+            st = RUNS.get(rid)
+            if st is not None and getattr(st, "loop", None) is not None \
+                    and st.loop.ledger is not None:
+                return self._json(200, st.loop.ledger.report())
+            run_dir = self._find_run_dir(rid)
+            if run_dir is None:
+                return self._json(404, {"error": "run not found"})
+            cap_path = os.path.join(run_dir, "capability.json")
+            if not os.path.isfile(cap_path):
+                # 不存在 ≠ 空账本。必须区分：前者是"没记录"，
+                # 后者是"记录了且没有越界"。混为一谈会让人以为一切正常。
+                return self._json(404, {
+                    "error": "no capability record",
+                    "detail": "这次运行没有能力账本记录"
+                              "（会话可能在 capability_ledger 关闭时运行）。"
+                              "这**不等于**「没有越权」，而是「无法判断」。",
+                })
+            with open(cap_path, "r", encoding="utf-8") as f:
+                return self._json(200, json.load(f))
+
         # 静态：根路径给前端
         if path in ("/", "/index.html"):
             return self._static("index.html")
@@ -538,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 留出关闭入口，便于排查"是不是这道闸门拦的"。
                 preflight_enabled=bool(body.get("preflight_enabled", True)),
                 preflight_max_rounds=int(body.get("preflight_max_rounds") or 2),
+                capability_ledger=bool(body.get("capability_ledger", True)),
             )
             try:
                 st = create_run(

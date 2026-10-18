@@ -40,8 +40,9 @@
 | `harness/server.py` | 零依赖 HTTP + SSE，同源托管前端 |
 | `harness/errors.py` | **统一错误模板**：出了什么错 + 期望是什么 + 下一步调什么 |
 | `harness/changeset.py` | **变更集与回滚**：改坏了能逐字节还原，不依赖 git |
+| `harness/capability.py` | **能力账本**（CapScope）：从任务文本推导权限上限，越界只观察不阻断 |
 | `harness/retention.py` | **类型化保留**：约束 verbatim 永不进摘要器（防压缩悬崖） |
-| `harness/test_harness.py` | **314 项测试**，每项标注书中出处 |
+| `harness/test_harness.py` | **336 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
 | `docs/harness-research-2026.md` | **2026 前沿调研**：ETCLOVG 七层、架构收敛、ECT、压缩悬崖、CapScope、Self-Harness、AHE |
 | `docs/harness-gap-diagnosis.md` | **差距诊断**：逐层读代码，含两个「空壳」实证 |
@@ -182,7 +183,7 @@ curl -X POST http://127.0.0.1:8787/api/run \
 ## 已验证
 
 **后端**（`python -m harness.test_harness`）
-- **314 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- **336 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
 - 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
   重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
 - 模型接入：地址归一化（中转站四种写法）、api_key 绝不回传明文、掩码可核对、
@@ -197,6 +198,11 @@ curl -X POST http://127.0.0.1:8787/api/run \
   未配置时自动走离线脚本 —— 全通过
 - **目标闸门（真实模型 deepseek-v4.1-flash）**：文件落盘 → `check/scope=goal newly_met`
   → `all_met:true` → `completed`；反向用例（要求创建但指示不动手）正确报 `all_met:false`
+- **能力账本（G-5，CapScope）**：从**任务文本**（可信输入）推导权限上限，
+  对照观察每次调用，把"任务之外出现了一个新能力"记成结构化信号。
+  **只观察不阻断** —— 判定仍归 policy。真实模型三个正常任务零误报；
+  HTTP 端到端：任务只说"读并总结"，一次越界 `curl` 被准确记下
+  `network_not_requested / high`，且**进程重启后仍可从落盘独立查证**
 - **变更集与回滚（G-6）**：agent 改坏文件后可从 run 目录**逐字节还原**，
   不依赖 git（`git checkout --` 在 workspace-write 下被允许，既是恢复手段
   也是破坏手段；且不是每个工作区都有 git）。真实模型/脚本端到端：

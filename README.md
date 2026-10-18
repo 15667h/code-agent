@@ -32,12 +32,13 @@
 | `harness/preflight.py` | **完成前检查**：收尾前对照任务规格核查「要求的动作是否真做过」（LangChain 实测 +13.7pp） |
 | `harness/chain.py` | **事件哈希链**：每条事件带前驱指纹，可离线核验未被篡改（arXiv 2608.23953 点名的行业空白点） |
 | `harness/verify_chain.py` | **离线核验 CLI**：只读、零依赖，不需信任产生记录的进程 |
+| `harness/evaluate.py` | **轨迹诊断**（trace → eval 闭环）：纯规则启发式，不调模型；带 CLI 与退出码可直接接 CI |
 | `harness/correct.py` | 四级故障分类 + 熔断 + 重复指纹 + 看门狗 + 死亡螺旋防护 |
 | `harness/model.py` | **模型接入**：OpenAI 兼容端点（三字段）+ 连通性自检 + 离线 stub |
 | `harness/loop.py` | ReAct 主循环 + 五功能闭环 + 事件发射 |
 | `harness/server.py` | 零依赖 HTTP + SSE，同源托管前端 |
 | `harness/retention.py` | **类型化保留**：约束 verbatim 永不进摘要器（防压缩悬崖） |
-| `harness/test_harness.py` | **229 项测试**，每项标注书中出处 |
+| `harness/test_harness.py` | **255 项测试**，每项标注书中出处 |
 | `docs/book-notes.md` | 《AI Agent Book》Harness 纪律提炼 |
 | `docs/harness-research-2026.md` | **2026 前沿调研**：ETCLOVG 七层、架构收敛、ECT、压缩悬崖、CapScope、Self-Harness、AHE |
 | `docs/harness-gap-diagnosis.md` | **差距诊断**：逐层读代码，含两个「空壳」实证 |
@@ -178,7 +179,7 @@ curl -X POST http://127.0.0.1:8787/api/run \
 ## 已验证
 
 **后端**（`python -m harness.test_harness`）
-- **229 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
+- **255 项测试全部通过**，覆盖架构文档第十一节的待验证清单与实测抓到的缺陷
 - 关键不变式：前缀稳定性、append-only、工具顺序固定、9 格策略、补丁唯一性/越界、
   重复指纹熔断、输出上限、配对完整性、事件 `seq` 单调、闸门挂起与回灌、事件唯一性、shell 跨平台
 - 模型接入：地址归一化（中转站四种写法）、api_key 绝不回传明文、掩码可核对、
@@ -193,6 +194,10 @@ curl -X POST http://127.0.0.1:8787/api/run \
   未配置时自动走离线脚本 —— 全通过
 - **目标闸门（真实模型 deepseek-v4.1-flash）**：文件落盘 → `check/scope=goal newly_met`
   → `all_met:true` → `completed`；反向用例（要求创建但指示不动手）正确报 `all_met:false`
+- **轨迹诊断（trace → eval）**：综述统计「**89% 有 tracing，仅 52% 有 evals**」——
+  我们原本也是那 47%。新增纯规则诊断器：真实失败运行被独立识别为
+  `verdict: flawed`（`false_completion` + `gate_blocked`），
+  12 个历史运行中 10 个正常、2 个真警告、**0 假警报**；CLI 退出码可直接接 CI
 - **事件链可核验**：正常运行 `ok=true`、`problems=[]`、链头与落盘锚点一致；
   改写任一行 → HTTP 与 CLI **都立刻检出**并定位到具体行号；
   **只拷 4 个文件到独立目录**（不含整个项目）仍能独立完成核验 ——

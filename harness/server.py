@@ -464,6 +464,23 @@ class Handler(BaseHTTPRequestHandler):
             runs_root = os.path.join(os.path.realpath(ws), ".crucible", "runs")
             return self._json(200, verify_all(runs_root))
 
+        # ── 轨迹诊断（trace → eval 闭环）──
+        if path.startswith("/api/run/") and path.endswith("/diagnose"):
+            rid = path.split("/")[3]
+            st = RUNS.get(rid)
+            run_dir = (st.session.run_dir if (st and st.session)
+                       else self._find_run_dir(rid))
+            if run_dir is None or not os.path.isdir(run_dir):
+                return self._json(404, {"error": "run not found"})
+            from harness.evaluate import analyze_trace
+            return self._json(200, analyze_trace(run_dir).to_json())
+
+        if path == "/api/diagnose":
+            ws = (q.get("workspace") or [default_workspace()])[0]
+            from harness.evaluate import analyze_workspace
+            flawed_only = (q.get("flawed_only") or ["0"])[0] in ("1", "true", "yes")
+            return self._json(200, analyze_workspace(ws, only_flawed=flawed_only))
+
         # 静态：根路径给前端
         if path in ("/", "/index.html"):
             return self._static("index.html")

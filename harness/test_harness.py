@@ -3250,6 +3250,13 @@ class TestServerStartupModes(unittest.TestCase):
                 self.assertEqual(r.status, 200)
                 body = json.load(r)
             self.assertIn("runs", body, f"端点返回了非预期内容：{body}")
+
+            # 诊断端点同理 —— 它同样在脚本模式下加载了 harness.evaluate
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/diagnose", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                d = json.load(r)
+            self.assertIn("verdicts", d)
         finally:
             proc.terminate()
             try:
@@ -3277,6 +3284,463 @@ class TestServerStartupModes(unittest.TestCase):
             bad, [],
             "路由处理函数内出现相对导入 —— 脚本直跑模式会 ImportError。\n"
             + "\n".join(bad))
+
+
+# ══════════════════════════════════════════════════════════════════
+# 15. 轨迹诊断（`trace` → `eval` 闭环，G-4）
+# ══════════════════════════════════════════════════════════════════
+class TestTraceEvaluation(unittest.TestCase):
+    """综述统计：**89% 有 tracing，仅 52% 有 evals** —— 行业最大缺口。
+
+    我们有完整的 events.jsonl，但原本没有任何代码读它。
+    本模块把它变成结构化诊断报告，**纯规则、不调模型**。
+
+    三条设计纪律，都要有测试护住：
+      1. **没有任务文本就不做"假完成"的硬判定**（会产生大量假警报）
+      2. **判定器必须先能在正常轨迹上干净通过**（本项目吃过两次亏）
+      3. **只判"过程"，不判"结果对不对"**（后者需外部可验证产物）
+    """
+
+    def setUp(self):
+        self.ws = TempWorkspace()
+
+    def tearDown(self):
+        self.ws.cleanup()
+
+    # ---------- 造轨迹的工具 ----------
+    def _run_dir(self, events, task="", chained=None):
+        """写一个合成的运行目录（事件 + 轨迹）。"""
+        d = os.path.join(self.ws.path, f"run-{len(os.listdir(self.ws.path)) if os.path.isdir(self.ws.path) else 0}")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "events.jsonl"), "w", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        traj = []
+        if task:
+            traj.append({"role": "user", "content": task, "seq": 1})
+        # 状态栏消息：诊断器必须跳过它，不能当任务文本
+        traj.append({"role": "user", "content": "[环境状态]\n{}",
+                     "seq": 2, "meta": {"kind": "status"}})
+        with open(os.path.join(d, "trajectory.jsonl"), "w", encoding="utf-8") as f:
+            for t in traj:
+                f.write(json.dumps(t, ensure_ascii=False) + "\n")
+        return d
+
+    def _ev(self, type_, seq, **data):
+        return {"type": type_, "seq": seq, "ts": float(seq),
+                "turn_id": "t", "data": data}
+
+    def _completed(self, seq, status="completed", reason="任务完成。",
+                   iterations=1, tool_calls=0):
+        return self._ev("turn.completed", seq, status=status, reason=reason,
+                        iterations=iterations, tool_calls=tool_calls, usage={})
+
+    def _tool_out(self, seq, tool, ok=True, files=None, exit_code=None):
+        return self._ev("tool.output", seq, call_id=f"c{seq}", tool=tool,
+                        ok=ok, files_changed=files or [], exit_code=exit_code,
+                        verdict="run", text="")
+
+    def _tool_req(self, seq, tool, args=None):
+        return self._ev("tool.requested", seq, call_id=f"c{seq}", tool=tool,
+                        args=args or {}, decision="run", risk="low")
+
+    # ---------- 核心：正常轨迹必须干净通过 ----------
+    def test_clean_read_task_has_no_issue(self):
+        """**最关键的反向用例**：只读任务没有文件改动是**正确**的。
+
+        实测踩到：不看任务文本时，把"没有文件改动"一律判成假完成，
+        于是 12 个演示运行全部误报 —— 假警报会让评估失去可信度。
+        """
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._tool_req(2, "list_dir", {"path": "."}),
+            self._tool_out(2, "list_dir"),
+            self._completed(3),
+        ], task="看看工作区里有什么")
+        r = analyze_trace(d)
+        self.assertEqual(r.verdict, "no_issue",
+                         f"只读任务被误报：{[s.code for s in r.signals]}")
+
+    def test_clean_write_task_with_verification(self):
+        """正常完整的一次改动 + 验证 → 必须干净通过。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._tool_req(2, "apply_patch", {"patch": "x"}),
+            self._tool_out(2, "apply_patch", files=["a.py"]),
+            self._tool_req(3, "shell", {"command": "python -m pytest -q"}),
+            self._tool_out(3, "shell", exit_code=0),
+            self._completed(4, tool_calls=2),
+        ], task="把 a.py 改好并跑通测试")
+        r = analyze_trace(d)
+        self.assertEqual(r.verdict, "no_issue",
+                         f"正常改动+验证被误报：{[s.code for s in r.signals]}")
+
+    # ---------- 假完成 ----------
+    def test_detects_false_completion_on_write_task(self):
+        """任务要求改动但一次写都没有 → **fail**。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._tool_req(2, "read_file", {"path": "a.py"}),
+            self._tool_out(2, "read_file"),
+            self._completed(3),
+        ], task="把 a.py 里的 x 改成 2")
+        r = analyze_trace(d)
+        self.assertEqual(r.verdict, "flawed")
+        self.assertIn("false_completion", [s.code for s in r.fails])
+        # 证据里要能看到任务原文与最终理由，便于复核
+        ev = " ".join(next(s for s in r.fails
+                           if s.code == "false_completion").evidence)
+        self.assertIn("a.py", ev)
+
+    def test_false_completion_requires_task_text(self):
+        """**没有任务文本时不得对"有工具调用但无改动"判 fail**。
+
+        这类轨迹（旧运行可能没存 trajectory）无法区分读类/写类任务，
+        只能降级为提示。把不确定说成确定，就是假警报的来源。
+        """
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._tool_req(2, "list_dir", {"path": "."}),
+            self._tool_out(2, "list_dir"),
+            self._completed(3),
+        ], task="")            # 故意不给任务文本
+        r = analyze_trace(d)
+        self.assertEqual(r.fails, [], "缺任务文本时不得给出 fail 级判定")
+        codes = [s.code for s in r.warns]
+        self.assertIn("false_completion", codes)
+
+    def test_zero_tool_calls_is_fail_without_task_text(self):
+        """**但"一次工具都没调用"不需要任务文本就能判 fail。**
+
+        无论任务是什么，零工具调用都不可能有任何产物 ——
+        连只读任务也得读了才知道答案。这条规律与任务类型无关，
+        所以缺任务文本也能确定。
+        """
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._completed(2),
+        ], task="")
+        r = analyze_trace(d)
+        self.assertEqual(r.verdict, "flawed")
+        self.assertIn("false_completion", [s.code for s in r.fails])
+
+    def test_all_writes_failed_is_fail(self):
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._tool_req(2, "apply_patch", {"patch": "bad"}),
+            self._tool_out(2, "apply_patch", ok=False),
+            self._completed(3),
+        ], task="修改 a.py")
+        r = analyze_trace(d)
+        self.assertEqual(r.verdict, "flawed")
+        fails = [s for s in r.fails if s.code == "false_completion"]
+        self.assertTrue(fails)
+        self.assertIn("补丁", fails[0].detail)
+
+    # ---------- 验证 ----------
+    def test_detects_no_verification(self):
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._tool_req(2, "apply_patch", {"patch": "x"}),
+            self._tool_out(2, "apply_patch", files=["a.py"]),
+            self._completed(3),
+        ], task="改 a.py")
+        r = analyze_trace(d)
+        self.assertIn("no_verification", [s.code for s in r.warns])
+        self.assertEqual(r.verdict, "suspect")
+
+    def test_detects_failing_verification(self):
+        """跑了验证但没过 —— 这条最容易被忽略（有 pytest 日志看着"验证过了"）。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._tool_req(2, "apply_patch", {"patch": "x"}),
+            self._tool_out(2, "apply_patch", files=["a.py"]),
+            self._tool_req(3, "shell", {"command": "pytest -q"}),
+            self._tool_out(3, "shell", ok=False, exit_code=1),
+            self._completed(4),
+        ], task="修好测试")
+        r = analyze_trace(d)
+        self.assertIn("verification_not_passing", [s.code for s in r.warns])
+
+    # ---------- 循环 / 连续失败 / 空转 ----------
+    def test_detects_loop(self):
+        from harness.evaluate import analyze_trace
+        evs = [self._ev("turn.started", 1)]
+        seq = 2
+        for _ in range(5):
+            evs.append(self._tool_req(seq, "list_dir", {"path": "."}))
+            evs.append(self._tool_out(seq, "list_dir"))
+            seq += 1
+        evs.append(self._completed(seq))
+        d = self._run_dir(evs, task="看看")
+        r = analyze_trace(d)
+        self.assertIn("loop", [s.code for s in r.warns])
+
+    def test_detects_consecutive_failures(self):
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._tool_req(2, "read_file", {"path": "a"}), self._tool_out(2, "read_file", ok=False),
+            self._tool_req(3, "read_file", {"path": "a"}), self._tool_out(3, "read_file", ok=False),
+            self._tool_req(4, "read_file", {"path": "a"}), self._tool_out(4, "read_file", ok=False),
+            self._completed(5),
+        ], task="读 a")
+        r = analyze_trace(d)
+        self.assertIn("consecutive_tool_failures", [s.code for s in r.warns])
+
+    def test_detects_idle_spin(self):
+        from harness.evaluate import analyze_trace
+        evs = [self._ev("turn.started", 1)]
+        seq = 2
+        for i in range(15):          # 15 次调用，0 个改动
+            evs.append(self._tool_req(seq, "read_file", {"path": f"f{i}"}))
+            evs.append(self._tool_out(seq, "read_file"))
+            seq += 1
+        evs.append(self._completed(seq, tool_calls=15))
+        d = self._run_dir(evs, task="读一堆文件")
+        r = analyze_trace(d)
+        self.assertIn("idle_spin", [s.code for s in r.warns])
+
+    # ---------- 结束状态 ----------
+    def test_detects_budget_exhausted(self):
+        """撞上限结束**看起来**也是正常结束 —— 必须显式标出。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._completed(2, status="max_iterations",
+                            reason="已达到最大迭代轮数 25。"),
+        ], task="做点事")
+        r = analyze_trace(d)
+        self.assertEqual(r.verdict, "flawed")
+        sig = next(s for s in r.fails if s.code == "budget_exhausted")
+        self.assertIn("max_iterations", sig.detail)
+
+    def test_gate_block_is_info_when_resolved(self):
+        """闸门拦过但最终补齐了 → info（说明纠正机制起作用），不是缺陷。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._ev("error", 2, error_layer="control", cls="preflight_incomplete",
+                     reason="拦下 1 项"),
+            self._tool_req(3, "apply_patch", {"patch": "x"}),
+            self._tool_out(3, "apply_patch", files=["a.py"]),
+            self._completed(4, reason="任务完成。"),
+        ], task="改 a.py")
+        r = analyze_trace(d)
+        sig = next(s for s in r.signals if s.code == "gate_blocked")
+        self.assertEqual(sig.severity, "info")
+
+    def test_gate_block_is_fail_when_unresolved(self):
+        """拦了到最后还没补齐 → fail（这次运行以未完成收尾）。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([
+            self._ev("turn.started", 1),
+            self._ev("error", 2, error_layer="control", cls="preflight_incomplete",
+                     reason="拦下"),
+            self._completed(3, reason="已尝试纠正 2 次仍未补齐…未了结…"),
+        ], task="改 a.py")
+        r = analyze_trace(d)
+        sig = next(s for s in r.signals if s.code == "gate_blocked")
+        self.assertEqual(sig.severity, "fail")
+
+    # ---------- 任务文本抽取 ----------
+    def test_task_text_skips_status_and_tool_results(self):
+        """任务文本抽取必须跳过状态栏与工具结果 —— 它们也是 role=user。"""
+        from harness.evaluate import load_task_text
+        d = os.path.join(self.ws.path, "t")
+        os.makedirs(d, exist_ok=True)
+        rows = [
+            {"role": "user", "content": "[环境状态]\n{}", "meta": {"kind": "status"}},
+            {"role": "user", "content": "[这不是工具结果，是一条纠正指令] …"},
+            {"role": "user", "content": "真正的任务：改 a.py"},
+        ]
+        with open(os.path.join(d, "trajectory.jsonl"), "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        self.assertEqual(load_task_text(d), "真正的任务：改 a.py")
+
+    def test_report_declares_scope_limits(self):
+        """报告必须自述"只判过程不判结果" —— 防止被当成正确性评分。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([self._ev("turn.started", 1),
+                           self._completed(2)], task="看看")
+        js = analyze_trace(d).to_json()
+        self.assertIn("不判断**结果**是否正确", js["disclaimer"])
+
+    def test_verdict_is_categorical_not_numeric(self):
+        """用三档分类而不是分数 —— 分数会让人停止追问"为什么"。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([self._ev("turn.started", 1),
+                           self._completed(2)], task="看看")
+        r = analyze_trace(d)
+        self.assertIn(r.verdict, ("no_issue", "suspect", "flawed"))
+        self.assertNotIsInstance(r.verdict, (int, float))
+
+    def test_corrupt_lines_do_not_break_analysis(self):
+        """损坏的行不能让整个诊断读不出来 —— 崩溃的运行最值得诊断。"""
+        from harness.evaluate import analyze_trace
+        d = self._run_dir([self._ev("turn.started", 1),
+                           self._completed(2)], task="看看")
+        with open(os.path.join(d, "events.jsonl"), "a", encoding="utf-8") as f:
+            f.write("{ 这不是合法 JSON\n")
+        r = analyze_trace(d)         # 不得抛错
+        self.assertEqual(r.stats["events"], 2)
+
+    def test_empty_dir_reports_gracefully(self):
+        from harness.evaluate import analyze_trace
+        d = os.path.join(self.ws.path, "empty")
+        os.makedirs(d, exist_ok=True)
+        r = analyze_trace(d)
+        self.assertEqual(r.stats["events"], 0)
+        self.assertEqual(r.verdict, "no_issue")
+
+    def test_workspace_batch_analysis(self):
+        """批量诊断：这是"这次改动让整体变好还是变坏"的入口。"""
+        from harness.evaluate import analyze_workspace
+        from harness.session import Session
+        from harness.protocol import EventType
+        # 用一个真实的 Session 产出目录结构
+        sess = Session(self.ws.path, "m", "stub", "workspace-write", "on-request")
+        sess.bus.emit(EventType.TURN_STARTED, workspace=self.ws.path)
+        sess.bus.emit(EventType.TURN_COMPLETED, status="completed",
+                      reason="任务完成。", iterations=1, tool_calls=0, usage={})
+        out = analyze_workspace(self.ws.path)
+        self.assertEqual(out["runs"], 1)
+        self.assertIn("verdicts", out)
+        self.assertIn("signal_counts", out)
+
+
+class TestCliEntrypoints(unittest.TestCase):
+    """**所有 `harness/*.py` 都必须能被当脚本直接跑。**
+
+    实测踩到**三次**同一个坑：模块内部用相对导入（`from .x import y`），
+    于是 `python harness/xxx.py` 直接
+    `ImportError: attempted relative import with no known parent package`。
+
+    这类坑必须用**真实启动子进程**的方式钉住 ——
+    静态检查只能看顶层，看不见"函数体里延迟导入"的情况
+    （那正是第三次踩到的形态：`from .preflight import ...` 写在处理函数内）。
+    """
+
+    def _run_script(self, name, args, timeout=25):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        p = subprocess.run([sys.executable, os.path.join("harness", name)] + args,
+                           cwd=root, capture_output=True, text=True, timeout=timeout)
+        return p
+
+    def test_verify_chain_cli_script_mode(self):
+        """核验 CLI 在脚本模式下必须能跑（它要脱离仓库单独用）。"""
+        p = self._run_script("verify_chain.py", ["--help"])
+        self.assertEqual(p.returncode, 0, f"stderr: {p.stderr[-500:]}")
+        self.assertIn("核验", p.stdout)
+
+    def test_evaluate_cli_script_mode(self):
+        """诊断 CLI 在脚本模式下必须能跑。
+
+        它比 verify_chain 更容易踩坑：因为要复用 preflight 的判据，
+        而 preflight 内部有相对导入 —— 按文件路径 exec_module 会让
+        它内部的 `from .protocol import ...` 炸掉。
+        正确解法是「把项目根塞进 sys.path，再用绝对导入」。
+        """
+        p = self._run_script("evaluate.py", ["--help"])
+        self.assertEqual(p.returncode, 0, f"stderr: {p.stderr[-500:]}")
+        self.assertIn("诊断", p.stdout)
+
+    def test_evaluate_on_nonexistent_dir_exits_2(self):
+        """用法错误必须给出明确退出码，不能崩。"""
+        p = self._run_script("evaluate.py", ["no-such-dir-xyz"])
+        self.assertEqual(p.returncode, 2, f"stdout: {p.stdout[-300:]}")
+
+    def test_evaluate_on_real_run_dir(self):
+        """对真实运行目录跑一次，验证端到端可用。
+
+        合成一条**干净**的轨迹（有工具调用、读类任务、无改动）：
+        它必须是 `no_issue` 且退出码 0。
+        """
+        ws = TempWorkspace()
+        try:
+            from harness.session import Session
+            from harness.protocol import EventType
+            sess = Session(ws.path, "m", "stub", "workspace-write", "on-request")
+            sess.bus.emit(EventType.TURN_STARTED, workspace=ws.path)
+            sess.bus.emit(EventType.TOOL_REQUESTED, call_id="c1", tool="list_dir",
+                          args={"path": "."}, decision="run")
+            sess.bus.emit(EventType.TOOL_OUTPUT, call_id="c1", tool="list_dir",
+                          ok=True, files_changed=[], verdict="run")
+            sess.bus.emit(EventType.TURN_COMPLETED, status="completed",
+                          reason="任务完成。", iterations=1, tool_calls=1, usage={})
+            # 轨迹里补一条"只读任务"，否则诊断器没法判定任务类型
+            sess.persist_message(Message.user("看看工作区里有什么"))
+            p = self._run_script("evaluate.py", [sess.run_dir, "--json"])
+            data = json.loads(p.stdout)
+            self.assertIn("verdict", data)
+            self.assertIn("disclaimer", data)
+            self.assertEqual(data["verdict"], "no_issue",
+                             f"干净的只读轨迹被误报：{data['signals']}")
+            self.assertEqual(p.returncode, 0, f"stderr: {p.stderr[-400:]}")
+        finally:
+            ws.cleanup()
+
+    def test_evaluate_detects_flawed_and_exits_1(self):
+        """有明确缺陷时退出码必须是 1（供 CI 直接判定）。"""
+        ws = TempWorkspace()
+        try:
+            from harness.session import Session
+            from harness.protocol import EventType
+            sess = Session(ws.path, "m", "stub", "workspace-write", "on-request")
+            sess.bus.emit(EventType.TURN_STARTED, workspace=ws.path)
+            # 零工具调用却宣布完成 → 铁定 flawed
+            sess.bus.emit(EventType.TURN_COMPLETED, status="completed",
+                          reason="任务完成。", iterations=1, tool_calls=0, usage={})
+            sess.persist_message(Message.user("创建 a.txt 写入 hi"))
+            p = self._run_script("evaluate.py", [sess.run_dir, "--json"])
+            data = json.loads(p.stdout)
+            self.assertEqual(data["verdict"], "flawed")
+            self.assertEqual(p.returncode, 1)
+        finally:
+            ws.cleanup()
+
+    def test_no_module_level_relative_only_imports(self):
+        """静态补充检查：**带 `__main__` 入口的模块**必须有脚本模式兜底。
+
+        判据刻意只覆盖"入口脚本"（文件里有 `if __name__ == "__main__"`）。
+        库模块（context.py / loop.py / model.py …）**不该被当脚本跑**，
+        要求它们也做兜底是错的 —— 那会把正常设计判成缺陷。
+
+        这不是要禁止相对导入（包内用它是对的），
+        而是要求**能被用户直接执行的**那些都做好双模式处理。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        offenders = []
+        checked = []
+        for name in sorted(os.listdir(os.path.join(root, "harness"))):
+            if not name.endswith(".py") or name.startswith("__"):
+                continue
+            path = os.path.join(root, "harness", name)
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            # 只看入口脚本：不带 __main__ 的是纯库模块，不在管辖范围
+            if '__name__ == "__main__"' not in text and "__main__" not in text:
+                continue
+            if "from ." not in text:
+                continue
+            checked.append(name)
+            if not ("except ImportError" in text or "sys.path" in text):
+                offenders.append(name)
+        self.assertTrue(checked, "没有找到任何入口脚本？检查判据是否失效")
+        self.assertEqual(
+            offenders, [],
+            "这些**入口脚本**用相对导入但没有任何脚本模式兜底，"
+            "`python harness/<file>` 时会 ImportError：\n  "
+            + "\n  ".join(offenders))
 
 
 # ══════════════════════════════════════════════════════════════════

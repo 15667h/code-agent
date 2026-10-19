@@ -9,8 +9,20 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<!--
+  字体**不能**用阻塞式 <link rel="stylesheet"> 加载。
+
+  踩过：网络受限时（国内直连 fonts.googleapis.com 经常不通）这个请求会挂到
+  TCP/DNS 超时，而外链 CSS 是 **render-blocking** 的 —— 于是整页白屏，
+  连后面的 <script> 都不执行。headless 探针里实测到 readyState 一直停在
+  "loading"、document.scripts 只解析出第一个，表现完全像"前端写崩了"。
+
+  media="print" 让浏览器不把它当渲染阻塞资源；加载成功后再切回 all。
+  加载失败也没关系 —— tokens.css 里的 font-family 有系统字体兜底，
+  界面只是字形不同，功能一个不少。
+-->
+<link rel="stylesheet" media="print" onload="this.media='all'"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 
 <link rel="stylesheet" href="styles/tokens.css">
 <link rel="stylesheet" href="styles/app.css">
@@ -303,6 +315,13 @@
           <span class="dock__sep" aria-hidden="true"></span>
           <kbd>Esc</kbd> 中断
         </span>
+        <button type="button" class="dock__thread" id="btn-thread" hidden
+                aria-label="当前指令会接上上一轮对话；点击新开一段，不再带上下文"
+                data-tip="接续上文 · 点击新开">
+          <span class="dock__threaddot" aria-hidden="true"></span>
+          <span>接续第 <b id="thread-n">1</b> 轮</span>
+          <span class="dock__threadact" aria-hidden="true">新开</span>
+        </button>
         <button type="button" class="dock__meter" id="btn-meter" aria-label="查看上下文用量详情">
           <span class="dock__meterbar" role="progressbar" aria-label="上下文用量" aria-valuenow="19" aria-valuemin="0" aria-valuemax="100"><span class="dock__meterfill" style="width:19%"></span></span>
           <span class="tabular">38.2k / 200k</span>

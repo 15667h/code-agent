@@ -499,6 +499,345 @@ class TestApplyPatch(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 5.5 参数归一化：模型多包一层时不能把正确的工作丢掉
+# ══════════════════════════════════════════════════════════════════
+class TestArgNormalization(unittest.TestCase):
+    """2026-10-19 的真实事故（一个完整项目因此没做出来）。
+
+    deepseek-v4.1-flash 走文本协议时，把整个 function calling 外壳当成参数发出来：
+
+        apply_patch {"arguments": {"patch": "*** Begin Patch ..."}}
+
+    补丁内容**完全正确**，只是多了一层。旧实现直接 `args.get("patch")`，
+    handler 报「patch 参数为空」—— 这句话没提它收到的是 `arguments`，
+    模型看不出错在结构上，把同一个补丁连发 3 次，被无进展循环拦停，
+    最终 0 个文件落盘。
+
+    两条不变量：
+      1. **无歧义的多包一层要还原** —— 否则是「模型做对了，harness 丢了」。
+      2. **报错必须说出实际收到的参数名与类型** —— 否则模型无法自我纠正，
+         重试次数再多也只是在同一个坑里加深。
+    """
+
+    PATCH = "*** Begin Patch\n*** Add File: ok.txt\n+hello\n*** End Patch"
+
+    def setUp(self):
+        from harness.tools.router import ToolRouter
+        self.ws = TempWorkspace()
+        self.reg, self.shell = build_default_registry(self.ws.path)
+        self.bus = EventBus()
+        self.router = ToolRouter(
+            self.reg,
+            Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST, self.ws.path),
+            self.bus, self.ws.path,
+            approval_handler=lambda req: "approved")
+
+    def tearDown(self):
+        self.shell.close()      # 不留活着的 cmd.exe
+        self.ws.cleanup()
+
+    def _route(self, args):
+        return self.router.route(ToolCall("apply_patch", args))
+
+    # ── 正向：必须能放行 ──
+    def test_single_wrapper_is_unwrapped_and_file_actually_written(self):
+        """多包一层 → 真的落盘。断言查磁盘，不查文案。"""
+        res = self._route({"arguments": {"patch": self.PATCH}})
+        self.assertTrue(res.ok, res.text)
+        self.assertEqual(self.ws.read("ok.txt"), "hello")
+
+    def test_double_wrapper_is_unwrapped(self):
+        res = self._route({"arguments": {"arguments": {"patch": self.PATCH}}})
+        self.assertTrue(res.ok, res.text)
+        self.assertEqual(self.ws.read("ok.txt"), "hello")
+
+    def test_wrapper_value_may_be_json_string(self):
+        """部分端点把 arguments 再序列化一次，壳里是字符串。"""
+        res = self._route({"arguments": json.dumps({"patch": self.PATCH})})
+        self.assertTrue(res.ok, res.text)
+        self.assertEqual(self.ws.read("ok.txt"), "hello")
+
+    def test_unwrap_is_visible_in_event(self):
+        """剥了层要可审计 —— 静默改参数会破坏「模型看到的世界」与
+        「工具操作的世界」之间的一致性（参数保真性）。"""
+        self._route({"arguments": {"patch": self.PATCH}})
+        marks = [e.data.get("args_unwrapped") for e in self.bus.events()
+                 if e.type == EventType.TOOL_REQUESTED]
+        self.assertIn(1, marks, f"事件里必须标出剥了几层，实际 {marks}")
+
+    def test_top_level_args_still_work(self):
+        """不能为了容错把正常形态改坏。"""
+        res = self._route({"patch": self.PATCH})
+        self.assertTrue(res.ok, res.text)
+        self.assertEqual(self.ws.read("ok.txt"), "hello")
+
+    def test_extra_sibling_key_prevents_unwrap(self):
+        """日志里 `read_file {"arguments": true, "path": "game.js"}` 成功过 ——
+        有真参数在场时**不许**剥，否则会把 path 弄丢。"""
+        self.ws.write("a.txt", "hello")
+        res = self.router.route(ToolCall("read_file", {"arguments": True, "path": "a.txt"}))
+        self.assertTrue(res.ok, res.text)
+        self.assertIn("hello", res.text)
+
+    # ── 负向：不能瞎剥 ──
+    def test_tool_declaring_arguments_is_never_unwrapped(self):
+        """硬护栏：工具真声明了名为 arguments 的参数时，一律不剥。"""
+        from harness.tools.registry import Tool
+        t = Tool("fake", "d", {"arguments": {"type": "string"}},
+                 lambda a: None, lambda a: None, required=["arguments"])
+        args, layers, _ = t.normalize_args({"arguments": {"patch": "p"}})
+        self.assertEqual(layers, 0)
+        self.assertIn("arguments", args)
+
+    def test_non_dict_inner_value_is_not_unwrapped(self):
+        """`{"arguments": true}` 是模型写坏的，剥不出东西，必须保持原样。"""
+        args, layers, _ = self.reg.tool("apply_patch").normalize_args({"arguments": True})
+        self.assertEqual(layers, 0)
+        self.assertEqual(args, {"arguments": True})
+
+    def test_error_names_what_was_actually_received(self):
+        """核心：报错要说清「你传的是 arguments（布尔值 true）」。
+
+        只说「patch 参数为空」的话，模型会以为是自己没写 patch，
+        于是把内容正确的补丁再发一遍 —— 实测重复 3 次后熔断。
+        """
+        res = self._route({"arguments": True})
+        self.assertFalse(res.ok)
+        self.assertIn("arguments", res.text, res.text)
+        self.assertIn("布尔", res.text, res.text)
+        self.assertIn("patch", res.text, res.text)
+        # 必须给出正确形状，不能只抱怨
+        self.assertIn("正确形状", res.text, res.text)
+
+    def test_missing_required_does_not_execute(self):
+        """参数不全时**不能**执行 —— 更不能建出半个文件。"""
+        res = self._route({"arguments": True})
+        self.assertFalse(res.ok)
+        self.assertFalse(os.path.exists(os.path.join(self.ws.path, "ok.txt")))
+
+    def test_bare_string_wrapper_maps_to_single_required_param(self):
+        """`{"arguments": "<裸文本>"}`（实测 666 字符的命令）。
+
+        壳里不是 JSON 对象，无法"剥"。但工具只有一个必填参数时，
+        这个值只能是它 —— 这是完全无歧义的映射。
+        实测这条拒绝了 6 次 shell 调用，模型只能反复重试。
+        """
+        res = self.router.route(ToolCall("shell", {"arguments": "echo hi"}))
+        self.assertTrue(res.ok, res.text)
+        self.assertIn("hi", res.text)
+
+    def test_bare_string_wrapper_does_not_hijack_json_payload(self):
+        """壳里是"被再序列化一次的对象"时，必须走 JSON 解析，
+        不能被裸标量分支抢先把整段 JSON 文本当成 patch。"""
+        res = self._route({"arguments": json.dumps({"patch": self.PATCH})})
+        self.assertTrue(res.ok, res.text)
+        self.assertEqual(self.ws.read("ok.txt"), "hello")
+
+
+class TestWriteFile(unittest.TestCase):
+    """write_file：新建大文件的正当入口。
+
+    为什么需要它（2026-10-19 实测）：模型拿不下 V4A 补丁就不再尝试，
+    40 轮里 apply_patch 调用 0 次，改用 shell 里 `node -e` 逐行拼字符串，
+    37 轮只攒出 6 个片段，引号转义还炸了 6 次。
+    它自己的诊断是「这不是代码写不完，而是写代码的路径本身不通」。
+    """
+
+    def setUp(self):
+        from harness.tools.router import ToolRouter
+        self.ws = TempWorkspace()
+        self.reg, self.shell = build_default_registry(self.ws.path)
+        self.bus = EventBus()
+        self.router = ToolRouter(
+            self.reg,
+            Policy(SandboxMode.WORKSPACE_WRITE, ApprovalPolicy.ON_REQUEST, self.ws.path),
+            self.bus, self.ws.path,
+            approval_handler=lambda req: "approved")
+
+    def tearDown(self):
+        self.shell.close()
+        self.ws.cleanup()
+
+    def test_writes_large_new_file_byte_exact(self):
+        """1200 行一次性写入，内容必须逐字节一致（不 trim、不改行尾）。"""
+        body = "\n".join("var line%d = %d;" % (i, i) for i in range(1200))
+        res = self.router.route(ToolCall("write_file", {"path": "big.js", "content": body}))
+        self.assertTrue(res.ok, res.text)
+        self.assertEqual(self.ws.read("big.js"), body)
+        self.assertEqual(len(self.ws.read("big.js").split("\n")), 1200)
+
+    def test_refuses_to_overwrite_by_default(self):
+        """默认不覆盖 —— 覆盖会让"改文件"绕过补丁通道，且悄悄抹掉旧内容。"""
+        self.ws.write("a.js", "original")
+        res = self.router.route(ToolCall("write_file", {"path": "a.js", "content": "new"}))
+        self.assertFalse(res.ok)
+        self.assertIn("apply_patch", res.text, res.text)
+        self.assertEqual(self.ws.read("a.js"), "original", "被拒绝时绝不能动原文件")
+
+    def test_overwrite_needs_explicit_flag(self):
+        self.ws.write("a.js", "original")
+        res = self.router.route(ToolCall(
+            "write_file", {"path": "a.js", "content": "new\n", "overwrite": True}))
+        self.assertTrue(res.ok, res.text)
+        self.assertEqual(self.ws.read("a.js"), "new\n")
+
+    def test_creates_parent_dirs(self):
+        res = self.router.route(ToolCall(
+            "write_file", {"path": "src/deep/a.js", "content": "x"}))
+        self.assertTrue(res.ok, res.text)
+        self.assertTrue(os.path.isfile(os.path.join(self.ws.path, "src", "deep", "a.js")))
+
+    def test_empty_content_makes_empty_file(self):
+        res = self.router.route(ToolCall("write_file", {"path": "e.txt", "content": ""}))
+        self.assertTrue(res.ok, res.text)
+        self.assertEqual(os.path.getsize(os.path.join(self.ws.path, "e.txt")), 0)
+
+    def test_rejects_path_escape(self):
+        for bad in ("../escape.txt", "..\\escape.txt", "C:\\Windows\\x.txt", "/etc/passwd"):
+            res = self.router.route(ToolCall("write_file", {"path": bad, "content": "x"}))
+            self.assertFalse(res.ok, f"{bad} 必须被拒绝")
+
+    def test_rejects_non_string_content(self):
+        res = self.router.route(ToolCall("write_file", {"path": "z.txt", "content": {"a": 1}}))
+        self.assertFalse(res.ok)
+        self.assertFalse(os.path.exists(os.path.join(self.ws.path, "z.txt")))
+
+
+class TestResumeAcrossRuns(unittest.TestCase):
+    """跨回合续做：把上一个 run 的轨迹接进新回合。
+
+    没有它，一次运行结束就等于**全部忘掉**。2026-10-19 实测原话：
+    用户问「做完了吗」，agent 回答「本次会话里还没有任何任务描述」——
+    尽管磁盘上还躺着上一轮写出来的文件。长任务因此永远接不上，
+    「做一个完整项目」就变成了「一次跑完」的赌博。
+    """
+
+    def _make_run(self, msgs):
+        """用**真实的 Message.to_json 序列化**写盘，不手拼 JSON ——
+        手拼最容易把字段名写错，而写错的字段名测不出真实缺陷。"""
+        d = tempfile.mkdtemp(prefix="resume-")
+        with open(os.path.join(d, "trajectory.jsonl"), "w", encoding="utf-8") as f:
+            for m in msgs:
+                f.write(json.dumps(m.to_json(), ensure_ascii=False) + "\n")
+        return d
+
+    def _paired_traj(self):
+        return [
+            Message.user("做一个游戏"),
+            Message.assistant("先建文件。", tool_calls=[ToolCall("write_file",
+                                                              {"path": "a.js", "content": "x"})]),
+            Message.tool_result("", "文件已写入", "write_file"),
+            Message.assistant("建好了。"),
+        ]
+
+    def test_full_trajectory_is_resumed_in_order(self):
+        from harness.server import _restore_history
+        d = self._make_run(self._paired_traj())
+        loop = _FakeLoop()
+        info = _restore_history(loop, d)
+        self.assertIsNone(info["error"])
+        self.assertEqual(info["resumed"], 4)
+        got = loop.context.trajectory()
+        self.assertEqual([m.role for m in got],
+                         ["user", "assistant", "tool", "assistant"])
+        self.assertEqual([m.seq for m in got], [1, 2, 3, 4])
+
+    def test_history_lands_before_the_new_user_message(self):
+        """历史必须排在本次 prompt **之前** —— 否则读起来像
+        「用户先发问、AI 才补上下文」。"""
+        from harness.server import _restore_history
+        d = self._make_run(self._paired_traj())
+        loop = _FakeLoop()
+        _restore_history(loop, d)
+        loop.context.append_user("继续")
+        msgs = loop.context.trajectory()
+        self.assertEqual(msgs[-1].content, "继续")
+        self.assertEqual(msgs[-2].content, "建好了。")
+
+    def test_incomplete_tail_is_trimmed(self):
+        """被拦停时末尾常是「声明调 2 个工具、只回了 1 个」。
+        这种残块接进去，上游会 400 且**第二轮才炸**。"""
+        from harness.server import _restore_history
+        msgs = [
+            Message.user("做"),
+            Message.assistant("", tool_calls=[ToolCall("a", {}), ToolCall("b", {})]),
+            Message.tool_result("", "只回了一个", "a"),
+        ]
+        d = self._make_run(msgs)
+        loop = _FakeLoop()
+        info = _restore_history(loop, d)
+        self.assertGreaterEqual(info["trimmed"], 1)
+        kept = loop.context.trajectory()
+        self.assertEqual(len(kept), 1, "不完整的调用块要整块砍掉")
+        self.assertEqual(kept[0].role, "user")
+
+    def test_stale_status_bar_is_dropped(self):
+        """旧状态栏写的是当时的工作区与改动数。接进新回合等于给模型
+        一份**过期的环境快照**，比不给更糟。"""
+        from harness.server import _restore_history
+        msgs = self._paired_traj()
+        st = Message.user("[环境状态]{\"workspace\": \"旧的\"}")
+        st.meta["kind"] = "status"
+        msgs.insert(1, st)
+        d = self._make_run(msgs)
+        loop = _FakeLoop()
+        info = _restore_history(loop, d)
+        self.assertEqual(info["dropped_status"], 1)
+        self.assertFalse(any("旧的" in m.content for m in loop.context.trajectory()))
+
+    def test_long_tool_output_is_truncated_with_a_marker(self):
+        from harness.server import _restore_history
+        d = self._make_run([
+            Message.user("做"),
+            Message.assistant("", tool_calls=[ToolCall("shell", {"command": "ls"})]),
+            Message.tool_result("", "A" * 9000, "shell"),
+        ])
+        loop = _FakeLoop()
+        info = _restore_history(loop, d)
+        self.assertGreaterEqual(info["truncated"], 1)
+        body = loop.context.trajectory()[-1].content
+        self.assertLess(len(body), 3000)
+        self.assertIn("截断", body)
+
+    def test_missing_source_reports_instead_of_silently_continuing(self):
+        """找不到源 run 时**必须报出来** —— 静默当成"没有历史"会让
+        用户以为续上了，实际是全新开始。"""
+        from harness.server import _restore_history
+        loop = _FakeLoop()
+        info = _restore_history(loop, tempfile.mkdtemp(prefix="empty-"))
+        self.assertIsNotNone(info["error"])
+        self.assertEqual(info["resumed"], 0)
+        self.assertEqual(len(loop.context.trajectory()), 0)
+
+    def test_resumed_messages_are_persisted_with_continuous_seq(self):
+        """恢复的消息**必须同时落盘**。
+
+        只进内存时，新 run 的 trajectory.jsonl 从中间开始（恢复的消息占着
+        seq 1..N 却没写盘），读回时 `assert_seqs()` 判定不连续，
+        `/api/run/<id>/result` 直接 500。实测踩到，而且**单测全绿** ——
+        只有真的轮询一次才会暴露。
+        """
+        from harness.server import _restore_history
+        d = self._make_run(self._paired_traj())
+        loop = _FakeLoop()
+        info = _restore_history(loop, d)
+        self.assertEqual(len(loop.persisted), info["resumed"])
+        self.assertEqual([m.seq for m in loop.persisted], [1, 2, 3, 4])
+
+
+class _FakeLoop:
+    """只提供 _restore_history 需要的字段。"""
+
+    def __init__(self):
+        self.context = ContextBuilder(StaticPrefix("sys", []))
+        self.persisted: List[Message] = []
+        self.session = self
+
+    def persist_message(self, msg):
+        self.persisted.append(msg)
+
+
+# ══════════════════════════════════════════════════════════════════
 # 6. 重复调用指纹熔断（书 §5 检测「模式」）
 # ══════════════════════════════════════════════════════════════════
 class TestLoopDetection(unittest.TestCase):
@@ -1921,6 +2260,37 @@ class TestTextToolCallFallback(unittest.TestCase):
         }]})
         self.assertEqual(len(reply.tool_calls), 1)
         self.assertEqual(reply.tool_calls[0].name, "native_call")
+
+    def test_bare_call_tag_is_recognized(self):
+        """实测（2026-10-19）：模型最后一步输出 `<call>`，不是 `<tool_call>`。
+
+        不认它 → 整块被当成**正文** → 循环视为最终回答收尾 →
+        status=completed，而回答停在「接下来做真正的运行时测试：<call>」。
+        任务没做完，事件流却看起来正常结束。这是本项目最危险的一类失败：
+        模型做对了，harness 把它丢了。
+        """
+        from harness.model import extract_text_tool_calls
+        calls, stripped = extract_text_tool_calls(
+            '接下来做运行时测试：\n<call>{"name": "shell", "arguments": {"command": "node -v"}}</call>')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "shell")
+        self.assertEqual(calls[0].args, {"command": "node -v"})
+        self.assertNotIn("<call>", stripped)
+
+    def test_bare_call_without_json_stays_in_prose(self):
+        """`<call>` 是常见英文词。判据仍然窄：标签后必须紧跟配平的、
+        含 name 的 JSON 对象。纯正文提到它时不许吞掉。"""
+        from harness.model import extract_text_tool_calls
+        text = "这个接口的 <call> 标签用来发起调用，不是给我用的。"
+        calls, stripped = extract_text_tool_calls(text)
+        self.assertEqual(calls, [])
+        self.assertIn("<call>", stripped, "普通正文里的 <call> 不该被当协议痕迹删掉")
+
+    def test_bare_call_with_broken_json_is_not_a_call(self):
+        from harness.model import extract_text_tool_calls
+        calls, stripped = extract_text_tool_calls('<call>{"name": "shell", "arguments": {坏}}</call>')
+        self.assertEqual(calls, [])
+        self.assertIn("坏", stripped, "坏块要留给模型看")
 
 
     def test_text_protocol_calls_replay_as_text_not_native(self):
@@ -5733,10 +6103,16 @@ class TestToolDescriptionNegatives(unittest.TestCase):
                          json.dumps(b, ensure_ascii=False))
 
     def test_registered_order_unchanged(self):
-        """工具注册顺序是缓存不变式，不得因本次改动而变化。"""
+        """工具注册顺序是缓存不变式，不得因本次改动而变化。
+
+        write_file 插在 apply_patch **之前**：按「先读、再搜、后改、最后执行」
+        的工作流，从零建文件是任务的起点，改已有文件在其后。
+        顺序变化会让 prefix_hash 变、历史 run 的 KV 缓存失效 ——
+        所以这里必须是**显式**断言，而不是"反正测试会过"。
+        """
         self.assertEqual(self.reg.names(),
                          ["read_file", "list_dir", "glob", "grep",
-                          "apply_patch", "shell"])
+                          "write_file", "apply_patch", "shell"])
 
 
 # ══════════════════════════════════════════════════════════════════

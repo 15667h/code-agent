@@ -63,6 +63,22 @@
      用于演示：打开页面即自动发起一次运行，便于"亲眼看到"整条链路。
      刻意从 URL 读而不是从 localStorage 读：URL 是**显式**的，
      适合"我这次要在这个目录上干活"这种一次性意图。 */
+  /* URL 上的 `offline` 是字符串，而后端要的是**字符串数组**。
+     直接传字符串会被逐字符迭代 —— 每个字符被当成一个「动词」，
+     于是必然报未知动词，看起来像后端坏了。
+     这里显式解析 JSON；解析不了就当没有，绝不把坏参数塞给后端。 */
+  function parseOfflineParam(raw) {
+    if (!raw) return null;
+    if (Array.isArray(raw)) return raw;
+    try {
+      var v = JSON.parse(raw);
+      return Array.isArray(v) ? v : null;
+    } catch (e) {
+      console.warn("[offline] 不是合法 JSON 数组，已忽略：", raw);
+      return null;
+    }
+  }
+
   var urlParams = (function () {
     var out = {};
     try {
@@ -3095,9 +3111,11 @@
       sandbox: $("[data-sandbox]") ? $("[data-sandbox]").textContent : "workspace-write",
       approval: $("[data-approval]") ? $("[data-approval]").textContent : "on-request",
       workspace: state.workspace,          // null 时由服务端默认工作区决定
-      offline_script: urlParams.offline || persisted.offlineScript,
+      offline_script: parseOfflineParam(urlParams.offline) || persisted.offlineScript,
     }).then(function (info) {
       pending.remove();
+      // 这一轮跑起来了 → 徽标要反映"现在是第几轮"
+      if (window.refreshThreadBadge) window.refreshThreadBadge();
       UI.toast({
         tone: "info", title: "已连接 harness",
         desc: "run_id " + info.run_id + " · 前缀哈希 " + (info.prefix_hash || "—"),
@@ -4248,6 +4266,36 @@
     $("#btn-dock-send").addEventListener("click", function (e) { e.preventDefault(); submit(); });
     $("#btn-dock-send").disabled = true;
 
+    /* ---------- 「接续第 N 轮」 ---------- */
+    /* 追问会自动带上上文（bridge 的 run() 带 resume_from），否则用户问
+       「做完了吗」，agent 只会回答「本次会话里还没有任何任务描述」——
+       尽管磁盘上躺着他刚写的文件。这是最劝退的一种失败：看起来像失忆。
+       但**自动**行为必须可见：否则用户会以为每条指令都是全新开始，
+       反过来又会在想开新任务时莫名其妙带上旧上下文。 */
+    var threadBtn = $("#btn-thread");
+    function refreshThreadBadge() {
+      if (!threadBtn) return;
+      var c = (window.Harness && window.Harness.conversation)
+        ? window.Harness.conversation() : null;
+      var on = !!(c && c.runId);
+      threadBtn.hidden = !on;
+      if (!on) return;
+      var n = $("#thread-n");
+      if (n) n.textContent = String(c.turns || 1);
+    }
+    if (threadBtn) {
+      threadBtn.addEventListener("click", function () {
+        if (!(window.Harness && window.Harness.resetConversation)) return;
+        window.Harness.resetConversation();
+        refreshThreadBadge();
+        UI.toast({
+          tone: "info", title: "已新开一段对话",
+          desc: "下一条指令不会再带上之前的上下文。", duration: 3200,
+        });
+      });
+    }
+    window.refreshThreadBadge = refreshThreadBadge;
+
     function submit() {
       var v = ta.value;
       if (!v.trim()) return;
@@ -5218,6 +5266,12 @@
     /* ── 清掉一切属于旧目录的状态 ──
        不清的后果不是报错，是**显示错的内容**：旧项目的文件树、旧项目的
        标签、旧项目的改动统计，全都看起来像是新目录的。 */
+    // 对话上下文也属于旧目录：换了项目还带着上一个项目的轨迹，
+    // 等于让 agent 在 A 项目的历史里改 B 项目的代码。
+    if (window.Harness && window.Harness.resetConversation) {
+      window.Harness.resetConversation();
+      if (window.refreshThreadBadge) window.refreshThreadBadge();
+    }
     state.tabs = [];
     state.activeTab = null;
     dirtyFile = {};

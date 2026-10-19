@@ -70,6 +70,37 @@ class PersistentShell:
         self._reader: Optional[threading.Thread] = None
 
     # ---------- 生命周期 ----------
+    def close(self) -> None:
+        """关掉常驻会话。
+
+        没有这个方法时，每个 registry 都会留下一个活着的 cmd.exe / sh ——
+        服务进程重启一次就多一个，测试里每建一次 registry 也多一个。
+        句柄泄漏不会报错，只会在任务管理器里慢慢堆积。
+        """
+        p, self._proc = self._proc, None
+        if p is None:
+            return
+        self._lineq.put(None)          # 唤醒可能阻塞在队列上的读循环
+        try:
+            if p.stdin:
+                p.stdin.close()
+        except Exception:
+            pass
+        try:
+            p.terminate()
+            p.wait(timeout=3)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        for s in (p.stdout, p.stderr):
+            try:
+                if s:
+                    s.close()
+            except Exception:
+                pass
+
     def _spawn(self) -> None:
         env = os.environ.copy()
         env.update(self._extra_env)
@@ -521,6 +552,9 @@ class ShellTool:
     def reset(self) -> None:
         self.shell.reset()
 
+    def close(self) -> None:
+        self.shell.close()
+
 
 def describe_shell(args: Dict[str, Any]) -> Action:
     """把 shell 命令翻译成结构化 Action。
@@ -560,7 +594,13 @@ def register_shell_tools(reg: ToolRegistry, workspace: str, shell: ShellTool) ->
             "**即使在最宽松的配置下也需要人工确认**，不会静默放行。\n"
             "· 有副作用的复合命令（含 `|` `>` `&` `;` 等）会被保守地判为需要审批。\n"
             "· 默认 120 秒超时，超时后进程被终止。长任务请拆分。\n"
-            "· 不要用交互式命令（vim、less、read 等），也不要用会等待输入的命令。"
+            "· 不要用交互式命令（vim、less、read 等），也不要用会等待输入的命令。\n"
+            "**不要用它写代码文件**：`node -e \"...\"` / `python -c \"...\"` / `echo ... > f` "
+            "这类拼字符串写入文件的做法，会因为引号、换行、`$`、反引号的层层转义而悄悄写坏内容，"
+            "而且失败信息通常长得像别的问题（实测：代码被 cmd 当成单条命令逐行执行，"
+            "报「'const' 不是内部或外部命令」）。新建或修改文件一律用 apply_patch。\n"
+            "· Windows 下这个会话是 cmd.exe：多行脚本不要直接贴进来 —— "
+            "换行会被当成命令分隔符。要跑脚本就先 apply_patch 落成文件再用 node/python 执行它。"
         ),
         properties={
             "command": {"type": "string", "description": "要执行的命令，例如 `pytest -q tests/`"},

@@ -38,6 +38,7 @@ Codex 的解析器「补丁对不上原文件就拒绝落盘」也是同一条�
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 from dataclasses import dataclass, field
@@ -389,6 +390,121 @@ def apply_patch(workspace: str, args: Dict[str, Any], dry_run: bool = False) -> 
     )
 
 
+# ══════════════════════════════════════════════════════════════════
+# write_file：一次性写入整个文件（新建大文件的正当入口）
+# ══════════════════════════════════════════════════════════════════
+MAX_WRITE_BYTES = 2 * 1024 * 1024
+
+
+def write_file(workspace: str, args: Dict[str, Any], dry_run: bool = False) -> ToolResult:
+    """把 content 原样写成文件。
+
+    与 apply_patch 的分工是**结构性**的，不是偏好：
+      · 新建一个上千行的文件 → 每行都要 `+` 前缀的 V4A 不是模型擅长的形态，
+        实测它会直接放弃补丁通道、改去 shell 里拼字符串（引号转义必炸）。
+      · 改已有文件的几行 → 补丁省 token 且可回滚，仍然是正确选择。
+
+    安全上与 apply_patch 同级：路径必须落在工作区内；默认**不覆盖**
+    （覆盖要显式 overwrite）；变更集照常拍旧内容，所以照样能回滚。
+    """
+    rel_in = str(args.get("path") or "").strip()
+    content = args.get("content")
+    overwrite = bool(args.get("overwrite"))
+
+    if not rel_in:
+        return tool_error("write_file", "bad_args", "缺少 `path`。")
+    if not isinstance(content, str):
+        return tool_error(
+            "write_file", "bad_args",
+            "`content` 必须是字符串（空文件请传空字符串）。",
+            next_step="把要写入的完整文件内容放进 `content`，作为一个字符串传进来。")
+
+    try:
+        full = resolve_within(workspace, rel_in)
+    except ValueError as e:
+        return tool_error("write_file", "bad_path", f"路径 `{rel_in}` 不可用：{e}")
+    rel = to_rel(workspace, full)
+
+    size = len(content.encode("utf-8"))
+    if size > MAX_WRITE_BYTES:
+        return tool_error(
+            "write_file", "too_long",
+            f"内容有 {size // 1024} KB，超过单次 {MAX_WRITE_BYTES // 1024 // 1024} MB 上限。",
+            next_step="拆成几个文件，或分几次写入（先写主文件，再用 apply_patch 追加段落）。")
+
+    if os.path.isdir(full):
+        return tool_error("write_file", "is_dir",
+                          f"`{rel}` 是一个目录，不能当文件写。")
+
+    exists = os.path.exists(full)
+    if exists and not overwrite:
+        return tool_error(
+            "write_file", "exists",
+            f"`{rel}` 已存在，write_file 默认不覆盖（避免把已有内容悄悄抹掉）。",
+            next_step=("改已有文件请用 apply_patch，只传改动的那几行；"
+                       "确实要整体替换才传 overwrite=true。"),
+            path=rel)
+
+    old_lines: List[str] = []
+    if exists:
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                old_lines = f.read().split("\n")
+        except OSError as e:
+            return tool_error("write_file", "io", f"读取 `{rel}` 失败：{e}")
+    else:
+        parent = os.path.dirname(full)
+        if parent and not os.path.isdir(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError as e:
+                return tool_error("write_file", "io", f"创建目录失败：{e}")
+
+    new_lines = content.split("\n")
+    if exists:
+        sm = difflib.SequenceMatcher(None, old_lines, new_lines)
+        adds = sum(j2 - j1 for tag, i1, i2, j1, j2 in sm.get_opcodes()
+                   if tag in ("replace", "insert"))
+        dels = sum(i2 - i1 for tag, i1, i2, j1, j2 in sm.get_opcodes()
+                   if tag in ("replace", "delete"))
+        diff = f"[覆盖] {rel}  (+{adds} −{dels})"
+    else:
+        diff = f"[新增] {rel}  (+{len(new_lines)})"
+
+    if dry_run:
+        return ToolResult(ok=True, text="[预演] 可写入：\n" + diff,
+                          side_effect=False, files_changed=[])
+
+    try:
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+    except OSError as e:
+        return tool_error("write_file", "io", f"写入 `{rel}` 失败：{e}")
+
+    return ToolResult(
+        ok=True,
+        text="文件已写入：\n" + diff,
+        side_effect=True,
+        files_changed=[rel],
+        meta={"diff": diff, "diffs": [diff]},
+    )
+
+
+def describe_write(args: Dict[str, Any]) -> Action:
+    """write_file 的 Action：写单一路径。
+
+    刻意与 describe_patch 一样只提取路径 —— policy 不看内容语义，
+    只看「这次动作要碰哪些文件」。
+    """
+    p = str(args.get("path") or "").strip()
+    return Action(
+        kind=ActionKind.WRITE,
+        paths=[p] if p else [],
+        side_effect=True,
+        summary="write_file " + (p or "(未给路径)"),
+    )
+
+
 def describe_patch(args: Dict[str, Any]) -> Action:
     """把补丁翻译成结构化 Action。
 
@@ -412,6 +528,55 @@ def describe_patch(args: Dict[str, Any]) -> Action:
 
 
 def register_patch_tools(reg: ToolRegistry, workspace: str) -> None:
+    # ── write_file：一次性写入整个文件 ──
+    # 为什么在有了 apply_patch 之后还要这个工具：
+    # 2026-10-19 实测，模型拿不下 V4A 补丁格式就不再尝试它 —— 40 轮里
+    # `apply_patch` 调用 0 次，改用 `shell` 里的 `node -e` 逐行 push 拼字符串。
+    # 结果 37 轮只攒出 6 个几百字节的片段，引号转义还炸了 6 次。
+    # 它最后的自述很准确：「这不是代码写不完，而是写代码的路径本身不通」。
+    #
+    # 补丁格式省 token、可回滚，**改写**已有文件时它仍是最好的选择。
+    # 但从零写一个上千行的新文件，V4A 要求每一行都带 `+` 前缀 ——
+    # 这不是模型擅长的形态，而 harness 的职责是适配模型能力，不是反过来。
+    reg.register(Tool(
+        name="write_file",
+        description=(
+            "一次性写入一个**新**文件的完整内容。\n"
+            "什么时候用：从零创建一个文件（尤其是几百行以上的新文件）。"
+            "把完整内容放在 `content` 里，一次调用就落盘 —— "
+            "不要先建空文件再补，也不要用 shell 拼字符串。\n"
+            "分工：**新建**文件用 write_file；**修改已有**文件用 apply_patch"
+            "（只传改动部分，省 token 且留下可回滚的补丁记录）。\n"
+            "边界：\n"
+            "· **默认拒绝覆盖已存在的文件**。确实要整体替换时才传 `overwrite: true`，"
+            "而绝大多数情况下你其实应该用 apply_patch。\n"
+            "· 内容**原样写入**，不 trim、不改换行 —— 你给什么就是什么。\n"
+            "· 父目录不存在时会自动创建。\n"
+            "· 只接受工作区内的相对路径；命中禁改清单会被拒绝。\n"
+            "· 单次内容上限 2 MB。\n"
+            "**不要用它来做这些**：\n"
+            "· 想改文件里的几行 → 用 apply_patch（整体重写一个大文件既费 token "
+            "又容易把别处改坏）\n"
+            "· 想追加内容 → 先 read_file 读到全文，改写后再 overwrite "
+            "—— 但这通常说明你该用 apply_patch\n"
+            "· 想建空文件 → content 传空字符串即可，但请想清楚是否真的需要它"
+        ),
+        properties={
+            "path": {"type": "string", "description": "相对于工作区的路径，例如 `game.js` 或 `src/main.py`"},
+            "content": {"type": "string", "description": "文件的完整内容，原样写入"},
+            "overwrite": {"type": "boolean", "description": "为 true 时允许覆盖已存在的文件，默认 false"},
+        },
+        required=["path", "content"],
+        examples=[
+            {"path": "index.html", "content": "<!DOCTYPE html>\n<html>...</html>\n"},
+            {"path": "src/util.js", "content": "export const TAU = 6.283;\n"},
+        ],
+        handler=lambda a: write_file(workspace, a),
+        describe_action=describe_write,
+        supports_parallel=False,      # 同路径并发写会互相覆盖
+        category="执行工具",
+    ))
+
     reg.register(Tool(
         name="apply_patch",
         description=(
@@ -430,19 +595,24 @@ def register_patch_tools(reg: ToolRegistry, workspace: str) -> None:
             f"  {END}\n"
             "内容行必须以 `+`（新增）、`-`（删除）或空格（上下文）开头。\n"
             "边界：\n"
+            "· **新建文件就用 Add File，写多少行都可以**。从零写一个几百行的新文件，"
+            "是 Add File 最正当的用法，用不着先建空文件再补内容，"
+            "更不要改用 shell 里的 `node -e` / `echo` 拼字符串 —— 那样引号转义会毁掉代码，"
+            "而且失败信息通常长得像别的问题。\n"
             "· **上下文必须能唯一定位**。文件里有多处相同文本时，工具会**拒绝执行**"
             "并告诉你匹配到几处、在哪几行 —— 请补更多前后文或写更贴切的 `@@` 锚点，"
             "不要在同一个补丁上反复重试。\n"
             "· 补丁是**原子**的：任一文件无法应用，则整个补丁都不落盘。\n"
             "· 只接受工作区内的相对路径；命中禁改清单（.git/、node_modules/、.env、*.pem 等）会被拒绝。\n"
-            "· 改文件前请先用 read_file 确认当前内容。\n"
+            "· 改**已有**文件前请先用 read_file 确认当前内容。\n"
+            "· 参数名就是 `patch`，贴在参数最外层，**不要再套一层 arguments**。\n"
             "**不要用它来做这些**：\n"
             "· 只是想看看文件现在写了什么 → 用 read_file（补丁是**写**操作，"
             "发出去就会改盘，不要用补丁去『试探』内容）\n"
             "· 想新建一个**空**文件 → 用 Add File 并显式写一行 `+`；"
             "不要发一个没有任何内容行的 Add File\n"
-            "· 想整体重写一个文件 → 若改动超过文件大半，说明你可能读错了基础版本，"
-            "先 read_file 核对，而不是用超大补丁覆盖\n"
+            "· 想**改**一个已有文件且改动超过文件大半 → 说明你可能读错了基础版本，"
+            "先 read_file 核对，而不是用超大补丁覆盖（这条只管改写，不适用于新建）\n"
             "· 想确认某个路径存不存在 → 用 read_file 或 list_dir，"
             "补丁会因为路径不存在而整份失败"
         ),

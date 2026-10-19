@@ -349,6 +349,18 @@ _DSML_JSON_CALL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 工具调用标签的各种写法。实测出现过的：`<tool_call>`、`<call>`。
+# 不包含 `invoke` —— 那是 DSML 的标签，上面已经先处理并整块移除了，
+# 把它放进来只会重复消费。
+_CALL_TAG_RE = re.compile(
+    r"<\s*(?:tool[_\s]?calls?|function[_\s]?calls?|tool_use|call)\s*[^<>]{0,300}>",
+    re.IGNORECASE,
+)
+_CALL_CLOSE_RE = re.compile(
+    r"</\s*(?:tool[_\s]?calls?|function[_\s]?calls?|tool_use|call)\s*>",
+    re.IGNORECASE,
+)
+
 
 def extract_text_tool_calls(content: str) -> "tuple[List[ToolCall], str]":
     """从正文里抽出文本形式的工具调用。
@@ -445,24 +457,33 @@ def extract_text_tool_calls(content: str) -> "tuple[List[ToolCall], str]":
             stripped = stripped[:m.start()] + stripped[end + 1:]
             pos = 0        # 位置已变，重新扫一遍
 
-    # ── 2. 通用 <tool_call>{json} 格式 ──
+    # ── 2. 通用 `<工具标签>{json}` 格式 ──
     # 关键点：**不能**用 `\{.*?\}` 去做这件事 ——
     # 模型常把两种格式混写：`<tool_call>{...}` 后面紧跟残缺的
     # `</｜｜DSML｜｜ parameter>` 而没有 `</tool_call>`，
     # 非贪婪正则会一路吞到文本结尾，JSON 解析必然失败，
     # 于是"看起来解析过了"其实什么都没解析出来。
     # 改成**花括号配平扫描**：从 `{` 起数括号，配平即止。
-    if "<tool_call" in stripped.lower():
+    #
+    # ## 标签名不能只认 `<tool_call>`
+    #
+    # 实测（2026-10-19）：模型在最后一步输出了 `<call>` 而不是 `<tool_call>`。
+    # 解析器不认 → 整块被当成**正文** → 循环把它视为最终回答收尾 →
+    # 运行状态 `completed`，回答停在「接下来做真正的运行时测试：<call>」。
+    # 任务其实没做完，但事件流看起来是正常结束 —— 又一种「看上去毫无破绽的失败」。
+    #
+    # 放宽标签名，但**判据仍然窄**：标签后必须紧跟一个配平的 JSON 对象，
+    # 且对象里必须有非空的 `name`。缺任何一条都不认，绝不把普通正文吞掉。
+    m2 = _CALL_TAG_RE.search(stripped)
+    if m2:
         consumed: List[str] = []
-        low = stripped.lower()
         pos = 0
         while True:
-            i = low.find("<tool_call", pos)
-            if i < 0:
+            m2 = _CALL_TAG_RE.search(stripped, pos)
+            if not m2:
                 break
-            gt = stripped.find(">", i)
-            if gt < 0:
-                break
+            gt = m2.end() - 1                      # 标签的 `>` 位置
+            i = m2.start()
             brace = stripped.find("{", gt)
             if brace < 0:
                 break
@@ -484,8 +505,8 @@ def extract_text_tool_calls(content: str) -> "tuple[List[ToolCall], str]":
                         args = {"__malformed__": args}
                     calls.append(ToolCall(name.strip(), args))
                     # 闭合标签有就一起吃掉，没有也不影响
-                    tail = stripped.find("</tool_call>", end)
-                    stop = (tail + len("</tool_call>")) if 0 <= tail - end < 40 else end + 1
+                    tail = _CALL_CLOSE_RE.search(stripped, end)
+                    stop = tail.end() if (tail and tail.start() - end < 40) else end + 1
                     consumed.append(stripped[i:stop])
                     pos = stop
                     continue
@@ -493,9 +514,15 @@ def extract_text_tool_calls(content: str) -> "tuple[List[ToolCall], str]":
         for chunk in consumed:
             stripped = stripped.replace(chunk, "")
 
-    # ── 3. 清掉残标签（两种格式的都要清）──
+    # ── 3. 清掉残标签 ──
+    # 只清**不可能是普通英文正文**的标签名。裸 `<call>` 刻意不清：
+    # 它是常见词，模型完全可能在正文里讨论它；识别失败时保留原文，
+    # 下一轮模型才看得见自己写坏了什么（与「坏块保留」同一条纪律）。
     stripped = _DSML_tag_strip(stripped)
-    stripped = re.sub(r"</?tool_call>", "", stripped, flags=re.IGNORECASE)
+    stripped = _CALL_CLOSE_RE.sub("", stripped)
+    stripped = re.sub(
+        r"<\s*(?:tool[_\s]?calls?|function[_\s]?calls?|tool_use)\s*[^<>]{0,300}>",
+        "", stripped, flags=re.IGNORECASE)
     return calls, stripped.strip()
 
 

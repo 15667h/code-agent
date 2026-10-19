@@ -116,6 +116,36 @@ class ToolRouter:
                           ok=False, text=res.text, error_layer=ERR_TOOL)
             return res
 
+        # ── 1.5 参数归一化 + 必填检查 ──
+        # 模型（尤其文本协议端点）会把整个 OpenAI function calling 外壳
+        # 当成参数发出来：{"arguments": {"patch": "..."}}。语义对、结构多一层。
+        # 这里统一剥壳，并让**下游每个环节**都看到同一份参数 ——
+        # describe_action / handler / 事件 / 变更集全都读 call.args，
+        # 只改一处不改另一处会得到"审批看到 A、执行用了 B"。
+        args, unwrapped, arg_note = tool.normalize_args(call.args)
+        if unwrapped or args is not call.args:
+            call = ToolCall(call.name, args)
+
+        # 一个必填都没给 → 立刻报，且**说清它到底收到了什么**。
+        # 旧文案只说「patch 参数为空」，模型看不出错在结构上，只能盲目重试
+        # （实测把内容正确的补丁连发 3 次，最后被循环拦停）。
+        missing = tool.missing_required(args)
+        if missing:
+            shape_keys = list(tool.examples[0].keys()) if tool.examples else tool.required
+            shape = ", ".join(f'"{k}": ...' for k in shape_keys)
+            text = (f"缺少必填参数 {'、'.join(f'`{m}`' for m in missing)}。"
+                    f"{tool.describe_received_args(args)}\n"
+                    f"正确形状：{{{shape}}} —— 外层不要再包一层 arguments。")
+            if arg_note:
+                text += f"\n（{arg_note}）"
+            res = tool_error(
+                call.name, "bad_args", text,
+                next_step=(f"按工具定义重发一次，参数直接写在最外层。"
+                           f"本次调用没有执行，工作区未做任何改动。"))
+            self.bus.emit(EventType.TOOL_OUTPUT, call_id=call_id, tool=call.name,
+                          ok=False, text=res.text, error_layer=ERR_TOOL)
+            return res
+
         # ── 2. 解析成结构化 Action ──
         try:
             action = tool.describe_action(call.args)
@@ -147,7 +177,11 @@ class ToolRouter:
                       call_id=call_id, tool=call.name, args=call.args,
                       action=action.kind.value, paths=action.paths,
                       decision=verdict.decision.value, risk=verdict.risk,
-                      reason=verdict.reason, escalated_by=verdict.escalated_by)
+                      reason=verdict.reason, escalated_by=verdict.escalated_by,
+                      # 剥了几层要可审计：参数被改了却不可见，会让"模型看到的世界"
+                      # 与"工具操作的世界"出现偏差（参数保真性）。
+                      args_unwrapped=unwrapped)
+
 
         if verdict.decision is Decision.REFUSE:
             # 拒绝也作为**结构化工具结果**喂回模型（书 §5：错误变成模型的输入）

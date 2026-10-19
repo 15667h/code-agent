@@ -41,7 +41,8 @@ if __package__ in (None, ""):
                                error_reply, load_config, mask_key, normalize_base_url,
                                resolve_endpoint, save_config, tool_call_reply, final_reply)
     from harness.policy import ApprovalPolicy, Policy, SandboxMode
-    from harness.protocol import Event, EventBus, EventType
+    from harness.protocol import (Event, EventBus, EventType, Message, Trajectory,
+                                  ROLE_ASSISTANT, ROLE_TOOL)
     from harness.session import Session, list_runs
     from harness.tools.shell import ShellTool
     from harness.index import (build_index, load_index, save_index,
@@ -55,7 +56,8 @@ else:
                         error_reply, load_config, mask_key, normalize_base_url,
                         resolve_endpoint, save_config, tool_call_reply, final_reply)
     from .policy import ApprovalPolicy, Policy, SandboxMode
-    from .protocol import Event, EventBus, EventType
+    from .protocol import (Event, EventBus, EventType, Message, Trajectory,
+                           ROLE_ASSISTANT, ROLE_TOOL)
     from .session import Session, list_runs
     from .tools.shell import ShellTool
     from .index import (build_index, load_index, save_index,
@@ -82,6 +84,8 @@ class RunState:
         self.error: Optional[str] = None
         # 这次运行实际用的是哪个端点（供前端回显"真的在调谁"）
         self.endpoint: Optional[EndpointConfig] = None
+        # 续做信息（从哪个 run 接了多少条历史）。None 表示这是一次全新任务。
+        self.resumed: Optional[Dict[str, Any]] = None
 
         # ── 审批闸门的阻塞/唤醒机制 ──
         # 设计：工具调用线程在 await_approval() 上**阻塞**，直到
@@ -156,6 +160,118 @@ _INDEX_CACHE: Dict[str, Any] = {}
 # ══════════════════════════════════════════════════════════════════
 # 运行装配
 # ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# 续做：把上一个 run 的轨迹接进新回合
+# ══════════════════════════════════════════════════════════════════
+def _trim_to_complete(msgs: List[Message]) -> "tuple[List[Message], int]":
+    """砍掉尾部**不完整**的工具调用块，返回 (消息, 砍掉几条)。
+
+    为什么必须砍：被拦停（escalated）时，末尾常常是「assistant 声明要调 N 个工具、
+    实际只回了 M 个」。这种残块接进新上下文，上游会直接 400
+    （`tool calls and tool results do not match`）—— 而且**第一轮不炸、第二轮才炸**，
+    现场看起来像配置错了。
+    """
+    out = list(msgs)
+    cut = 0
+    while out:
+        last = out[-1]
+        if last.role != ROLE_TOOL:
+            if last.role == ROLE_ASSISTANT and last.tool_calls:
+                cut += 1
+                out.pop()
+                continue
+            break
+        i = len(out) - 1
+        while i >= 0 and out[i].role == ROLE_TOOL:
+            i -= 1
+        if i < 0 or out[i].role != ROLE_ASSISTANT or not out[i].tool_calls:
+            cut += len(out) - i - 1          # 孤立工具结果，整段丢掉
+            out = out[:i + 1]
+            continue
+        want = len(out[i].tool_calls)
+        got = len(out) - i - 1
+        if got >= want:
+            break                             # 完整块
+        cut += len(out) - i
+        out = out[:i]
+    return out, cut
+
+
+def _restore_history(loop, src_dir: str, max_messages: int = 60,
+                     tool_cap: int = 2000, content_cap: int = 6000) -> Dict[str, Any]:
+    """把 `src_dir` 这个 run 的轨迹接进新上下文。
+
+    没有它，一次运行结束就等于**全部忘掉**：用户问「做完了吗」，agent 会回答
+    「本次会话还没有任何任务描述」（2026-10-19 实测原话），尽管磁盘上还躺着
+    上一轮写的文件。长任务因此永远接不上，只能一次跑完 —— 而完整项目做不到。
+
+    三条纪律：
+      1. 只续到**完整处**（见 `_trim_to_complete`）
+      2. **丢掉旧状态栏** —— 它写的是当时的工作区与改动数，接进新回合
+         等于给模型一份过期的环境快照，比不给更糟
+      3. 截断 + **报数** —— 续了多少、砍了多少、截了多少都说出去，
+         不静默改历史
+    """
+    info: Dict[str, Any] = {"source": src_dir, "resumed": 0, "trimmed": 0,
+                            "truncated": 0, "dropped_status": 0, "error": None}
+    path = os.path.join(src_dir, "trajectory.jsonl")
+    if not os.path.isfile(path):
+        info["error"] = "源轨迹不存在"
+        return info
+    try:
+        rows = []
+        with open(path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    rows.append(json.loads(ln))
+        traj = Trajectory.from_json(rows)
+    except Exception as e:                       # noqa: BLE001
+        info["error"] = f"读取源轨迹失败：{type(e).__name__}: {e}"
+        return info
+
+    kept: List[Message] = []
+    for m in traj.messages():
+        if (m.meta or {}).get("kind") == "status":
+            info["dropped_status"] += 1
+            continue
+        kept.append(m)
+
+    kept, cut = _trim_to_complete(kept)
+    info["trimmed"] = cut
+
+    for m in kept:
+        cap = tool_cap if m.role == ROLE_TOOL else content_cap
+        if m.content and len(m.content) > cap:
+            m.content = (m.content[:cap]
+                         + f"\n…（此处截断，原文 {len(m.content)} 字符）")
+            info["truncated"] += 1
+
+    if len(kept) > max_messages:
+        kept = kept[-max_messages:]
+        while kept and kept[0].role == ROLE_TOOL:      # 开头的孤儿结果
+            kept.pop(0)
+
+    for m in kept:
+        loop.context.append(m)
+        # **必须同时落盘**。只进内存会让新 run 的 trajectory.jsonl 从中间开始：
+        # 恢复的消息占着 seq 1..N 却没写盘，磁盘上第一条就是 seq N+1，
+        # 读回时 `assert_seqs()` 判定不连续 → `/api/run/<id>/result` 直接 500。
+        # 实测踩到，而且**单测全绿**：只有真的轮询一次才会暴露。
+        sess = getattr(loop, "session", None)
+        if sess is not None:
+            sess.persist_message(m)
+    info["resumed"] = len(kept)
+    return info
+
+
+def _resolve_run_dir_simple(run_id: str, workspace: str) -> Optional[str]:
+    for r in list_runs(workspace):
+        if r.get("run_id") == run_id or r.get("session_id") == run_id:
+            return r.get("run_dir")
+    return None
+
+
 def create_run(workspace: str, prompt: str,
                sandbox: str = "workspace-write",
                approval: str = "on-request",
@@ -164,6 +280,7 @@ def create_run(workspace: str, prompt: str,
                offline_script: Optional[List[str]] = None,
                goal_conditions: Optional[List[str]] = None,
                approval_timeout_s: float = 300.0,
+               resume_from: Optional[str] = None,
                config: Optional[LoopConfig] = None) -> RunState:
     """装配一次运行。
 
@@ -214,10 +331,35 @@ def create_run(workspace: str, prompt: str,
     # 让状态栏能反映 shell 的真实 cwd
     loop.router.shell_cwd = shell.shell.current_cwd()
 
+    # ── 续做：把指定 run 的轨迹接进来 ──
+    # 必须赶在 start_run 之前：run() 的第一件事是 append 本次的 user 消息，
+    # 历史一旦晚到，就会排在用户这句话后面，读起来像「用户先发问、AI 才补上下文」。
+    if resume_from:
+        src_dir = _resolve_run_dir_simple(str(resume_from), workspace)
+        if src_dir is None:
+            raise ValueError(
+                f"要续做的运行 `{resume_from}` 在 `{workspace}` 下找不到。"
+                "请确认 run_id 与工作区是否对应（不同工作区的 run 互不可见）。")
+        st.resumed = _restore_history(loop, src_dir)
+
     st.loop = loop
     st.session = session
     st.endpoint = ep
     session.bus.subscribe(st.on_event)
+
+    # 续做结果必须**在订阅之后**发，否则前端收不到这条 ——
+    # 而"模型为什么知道这些"恰恰是最需要被解释的一件事。
+    if st.resumed is not None:
+        ok = st.resumed.get("error") is None
+        if ok:
+            note = (f"已接入上一个运行的 {st.resumed['resumed']} 条历史消息"
+                    f"（裁掉 {st.resumed['trimmed']} 条不完整片段，"
+                    f"截断 {st.resumed['truncated']} 条超长内容，"
+                    f"丢弃 {st.resumed['dropped_status']} 条过期状态）。")
+        else:
+            note = f"续做失败：{st.resumed['error']}"
+        session.bus.emit(EventType.CHECK, scope="resume", ok=ok, reason=note,
+                         **{k: v for k, v in st.resumed.items() if k != "error"})
 
     with RUNS_LOCK:
         RUNS[run_id] = st
@@ -1071,6 +1213,10 @@ class Handler(BaseHTTPRequestHandler):
                     offline_script=body.get("offline_script"),
                     goal_conditions=body.get("goal_conditions"),
                     approval_timeout_s=float(body.get("approval_timeout_s") or 300.0),
+                    # 续做：传上一个 run 的 id，把它的历史接进这次任务。
+                    # 不传 = 全新任务（默认），绝不"自动接着上次" ——
+                    # 那会让用户以为新任务是干净开始的。
+                    resume_from=body.get("resume_from"),
                     config=cfg,
                 )
             except ValueError as e:
@@ -1082,6 +1228,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "tool_order": st.session.meta.tool_order,
                                     "model": st.session.meta.model,
                                     "provider": st.session.meta.provider,
+                                    "resumed": st.resumed,
                                     "live": bool(st.endpoint and st.endpoint.configured)})
 
         # ── 工作区写操作（只有"新建"，且只建空的）──

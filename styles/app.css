@@ -1838,6 +1838,41 @@ body.is-col-resizing { cursor: col-resize; user-select: none; }
   color: var(--text-faint);
 }
 .dock__hint { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
+
+/* 「接续第 N 轮」—— 追问会带上上文，这件事必须让人看得见。
+   看不见的隐式行为等于没有：用户会以为每条指令都是全新开始。 */
+.dock__thread {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-left: auto; margin-right: var(--sp-2);
+  /* 不许被 .dock__hint 挤扁：默认 flex-shrink:1 会让「接续第 1 轮」折成两行，
+     同一个控件在 480px 是 28px 高、在 320px 反而是 17px 高 —— 窄的那档更正常，
+     说明宽的那档是被挤的。让 hint 去折行，徽标保持单行。 */
+  flex: none;
+  white-space: nowrap;
+  padding: 2px 7px 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  cursor: pointer;
+  transition: color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+.dock__thread[hidden] { display: none; }
+.dock__thread:hover { color: var(--text); border-color: var(--border-strong); }
+.dock__thread:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.dock__thread b { color: var(--text); font-weight: 600; }
+.dock__threaddot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--brass); flex: none;
+}
+.dock__threadact {
+  color: var(--brass-dim);
+  border-left: 1px solid var(--border);
+  padding-left: 6px;
+  margin-left: 1px;
+}
 .dock__sep {
   width: 1px;
   height: 10px;

@@ -17,9 +17,25 @@
   "use strict";
 
   var API = "";                 // 同源托管，空串即可
+
+  /* 把任意值变成能显示的文字。
+     踩过的坑：验证器的 items 是 {name, ok, detail}，而这里原来只找
+     `it.text || it.reason || String(it)` —— 前两个都不存在，于是
+     String(对象) 得到 "[object Object]"，四条检查全变成这四个字母。
+     它不是"显示得难看"：用户会以为检查根本没跑，而实际上跑过了。
+     对象一律走 JSON，绝不让 String(obj) 出现在用户可见位置。 */
+  function asText(v) {
+    if (v === null || v === undefined) return "";
+    if (typeof v === "string") return v;
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    if (Array.isArray(v)) return v.map(asText).join("、");
+    try { return JSON.stringify(v); } catch (e) { return String(v); }
+  }
   var state = {
     live: false,                // 是否已探测到 harness 后端
     runId: null,
+    lastRunId: null,            // 上一轮的 run_id：追问时带上去，模型才记得
+    turnIndex: 0,               // 本段对话已经跑了几轮
     es: null,                   // EventSource
     startedAt: 0,
     seq: 0,
@@ -274,8 +290,8 @@
             title: "完成前检查通过（有提醒）",
             model: "preflight",
             items: (d.warnings || []).map(function (f) {
-              return { ok: true, warn: true, text: f.detail + " → " + f.remedy };
-            }).concat([{ ok: true, text: d.reason || "" }]),
+              return { ok: true, warn: true, text: asText(f.detail) + " → " + asText(f.remedy) };
+            }).concat([{ ok: true, text: asText(d.reason) }]),
           };
         }
         return {
@@ -284,12 +300,20 @@
           model: goalScope ? "goal evaluator" : "verifier",
           items: (d.items || []).map(function (it) {
             var st = it.status;
+            // 后端两种形状都要吃得下：
+            //   验证器   {name, ok, detail, severity}
+            //   目标判定 {text, ok, status, evidence}
+            var label = asText(it.text || it.name || it.reason);
+            var why = asText(it.detail);
+            var body = (label && why && why !== label)
+              ? label + "：" + why
+              : (label || why || "");
             return {
               ok: !!it.ok,
               // unmatched 用"未知"语气，不能用"失败"语气
               warn: st === "unmatched" || st === "pending",
-              text: (it.text || it.reason || String(it))
-                + (it.evidence ? " · 证据：" + it.evidence : "")
+              text: body
+                + (it.evidence ? " · 证据：" + asText(it.evidence) : "")
                 + (st === "unmatched" ? " · 无法自动判定" : "")
                 + (st === "pending" ? " · 尚无证据" : ""),
             };
@@ -336,8 +360,8 @@
             items: d.findings.map(function (f) {
               return {
                 ok: false,
-                text: f.detail + " → 要做的：" + f.remedy
-                  + ((f.evidence || []).length ? "（依据：" + f.evidence.join("；") + "）" : ""),
+                text: asText(f.detail) + " → 要做的：" + asText(f.remedy)
+                  + ((f.evidence || []).length ? "（依据：" + (f.evidence || []).map(asText).join("；") + "）" : ""),
               };
             }),
           };
@@ -353,8 +377,8 @@
             items: d.problems.map(function (p) {
               return {
                 ok: false, warn: true,
-                text: "[" + (p.code || "") + "] " + (p.detail || "")
-                    + (p.remedy ? " → " + p.remedy : ""),
+                text: "[" + asText(p.code) + "] " + asText(p.detail)
+                    + (p.remedy ? " → " + asText(p.remedy) : ""),
               };
             }),
           };
@@ -560,9 +584,16 @@
     state.pendingGate = null;
     state.startedAt = Date.now();
 
+    // 同一段对话里的追问要**接上上文**。
+    // 不接的话，用户问「做完了吗」，agent 会回答「本次会话里还没有任何任务描述」，
+    // 尽管磁盘上躺着他刚写的文件 —— 这是最劝退的一种失败：看起来像失忆。
+    // 传 `resume_from: null` 可以显式要求全新开始（「新开」按钮走这条路）。
+    var resumeFrom = (opts.resume_from !== undefined) ? opts.resume_from : state.lastRunId;
+
     return post("/api/run", {
       prompt: prompt,
       workspace: opts.workspace,
+      resume_from: resumeFrom || undefined,
       // 不再有 `provider` 字段：模型接入已收敛为三字段端点，
       // 未配置时服务端自动走离线脚本。这里只保留一个显式的离线脚本入口。
       sandbox: opts.sandbox || "workspace-write",
@@ -575,9 +606,22 @@
         throw new Error(msg);
       }
       state.runId = r.body.run_id;
+      state.lastRunId = r.body.run_id;
+      state.turnIndex += 1;
       openStream(state.runId);
       return r.body;
     });
+  }
+
+  /** 当前这段对话已经有了几轮、上一轮是哪个 run。 */
+  function conversation() {
+    return { runId: state.lastRunId, turns: state.turnIndex };
+  }
+
+  /** 新开一段对话：下一条指令不再带上之前的上下文。 */
+  function resetConversation() {
+    state.lastRunId = null;
+    state.turnIndex = 0;
   }
 
   function openStream(rid) {
@@ -1032,6 +1076,9 @@
     probe: probe,
     run: run,
     approve: approve,
+    // 对话是连续的：追问要带上上文，用户才有"它在接着做"的体感
+    conversation: conversation,
+    resetConversation: resetConversation,
     feed: feed,                     // 给自测用：可直接灌一条 harness 事件
     translate: translate,           // 纯函数，便于单测
     getConfig: getConfig,
